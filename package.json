@@ -1,0 +1,39 @@
+{
+  "name": "lauren",
+  "version": "0.1.0",
+  "description": "Queue-driven plan/vibe lifecycle runner",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "lauren": "dist/bin/lauren.js",
+    "vibe": "dist/bin/vibe.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/bin/lauren.js dist/bin/vibe.js",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "format": "biome format --write",
+    "lint": "biome lint",
+    "check": "biome check --write"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ink": "^5.1.0",
+    "ink-spinner": "^5.0.0",
+    "proper-lockfile": "^4.1.2",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.14",
+    "@types/node": "^22.10.5",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/react": "^18.3.18",
+    "typescript": "^5.7.3"
+  }
+}

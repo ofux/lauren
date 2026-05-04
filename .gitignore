@@ -1,0 +1,16 @@
+# lauren artifacts
+.lauren/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
