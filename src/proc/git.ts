@@ -8,27 +8,27 @@ interface RunResult {
   stderr: string;
 }
 
-function runSync(cmd: string[]): RunResult {
+function runSync(cmd: string[], cwd: string = REPO): RunResult {
   const [program, ...args] = cmd;
   if (!program) throw new Error('empty git command');
   const r = spawnSync(program, args, {
-    cwd: REPO,
+    cwd,
     encoding: 'utf8',
   });
   if (r.error) throw r.error;
   return { code: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
-export function workingTreeDirty(): boolean {
-  const r = runSync(['git', 'status', '--porcelain']);
+export function workingTreeDirty(cwd: string = REPO): boolean {
+  const r = runSync(['git', 'status', '--porcelain'], cwd);
   if (r.code !== 0) {
     throw new Error(`git status --porcelain exited ${r.code}: ${r.stderr.trim()}`);
   }
   return r.stdout.trim().length > 0;
 }
 
-export function gitLogSubjects(): string[] {
-  const r = runSync(['git', 'log', '--pretty=%s']);
+export function gitLogSubjects(cwd: string = REPO): string[] {
+  const r = runSync(['git', 'log', '--pretty=%s'], cwd);
   if (r.code !== 0) {
     throw new Error(`git log --pretty=%s exited ${r.code}: ${r.stderr.trim()}`);
   }

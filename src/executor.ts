@@ -69,16 +69,19 @@ export function parsePrs(text: string): PR[] {
   return out;
 }
 
-export function alreadyDone(plan: Plan): Set<string> {
-  const done = new Set<string>();
-  const subjects = gitLogSubjects();
-  const slugEsc = plan.slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export function parseDoneIds(subjects: string[], slug: string): Set<string> {
+  const slugEsc = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`^${slugEsc}: PR (\\d+\\.\\d+) — `);
+  const done = new Set<string>();
   for (const line of subjects) {
     const m = re.exec(line);
     if (m?.[1]) done.add(m[1]);
   }
   return done;
+}
+
+export function alreadyDone(plan: Plan, cwd?: string): Set<string> {
+  return parseDoneIds(gitLogSubjects(cwd), plan.slug);
 }
 
 function prLogDir(parentLogDir: string, pr: PR): string {

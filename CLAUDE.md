@@ -5,15 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-npm run build     # tsc → dist/, then chmod +x bin entrypoints
-npm run watch     # tsc --watch
-npm run clean     # remove dist/
-npm run check     # biome check --write (lint + format + organize-imports)
-npm run lint      # biome lint only
-npm run format    # biome format --write
+npm run build       # tsc → dist/, then chmod +x bin entrypoints
+npm run watch       # tsc --watch
+npm run clean       # remove dist/
+npm run check       # biome check --write (lint + format + organize-imports)
+npm run lint        # biome lint only
+npm run format      # biome format --write
+npm test            # vitest run (one-shot)
+npm run test:watch  # vitest in watch mode
 ```
 
-There is no test suite. Verify changes by `npm run build && npm run check`. Manual smoke test: from a throwaway repo, run `vibe --dry-run` to print the queue, and `lauren todo list` to inspect state.
+Tests live next to source as `*.test.ts` (Vitest, ESM, Node `>=20`). Verify changes by `npm run build && npm run check && npm test`. Manual smoke test: from a throwaway repo, run `vibe --dry-run` to print the queue, and `lauren todo list` to inspect state.
 
 ## External binaries
 
