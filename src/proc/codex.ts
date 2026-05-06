@@ -15,6 +15,7 @@ export async function runCodexReview(args: {
   outputPath: string;
   logPath: string;
   sink?: StreamSink;
+  signal?: AbortSignal;
 }): Promise<{ code: number; reviewText: string }> {
   // Wipe any prior -o output so we don't read stale content if codex fails.
   await fs.rm(args.outputPath, { force: true });
@@ -25,6 +26,7 @@ export async function runCodexReview(args: {
     cmd,
     logPath: args.logPath,
     ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
+    ...(args.signal !== undefined ? { signal: args.signal } : {}),
   });
 
   let reviewText = '';

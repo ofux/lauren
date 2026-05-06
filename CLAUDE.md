@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```sh
-npm run build       # tsc → dist/, then chmod +x bin entrypoints
+npm run build       # tsc → dist/, then chmod +x the lauren bin
 npm run watch       # tsc --watch
 npm run clean       # remove dist/
 npm run check       # biome check --write (lint + format + organize-imports)
@@ -15,7 +15,7 @@ npm test            # vitest run (one-shot)
 npm run test:watch  # vitest in watch mode
 ```
 
-Tests live next to source as `*.test.ts` (Vitest, ESM, Node `>=20`). Verify changes by `npm run build && npm run check && npm test`. Manual smoke test: from a throwaway repo, run `vibe --dry-run` to print the queue, and `lauren todo list` to inspect state.
+Tests live next to source as `*.test.ts` (Vitest, ESM, Node `>=20`). Verify changes by `npm run build && npm run check && npm test`. Manual smoke test: from a throwaway repo, run `lauren vibe --dry-run` to print the queue, and `lauren todo --list` to inspect state (plain table; omit `--list` for the interactive TUI).
 
 ## External binaries
 
@@ -23,15 +23,15 @@ The runtime shells out to two CLIs that must be on `$PATH`:
 - `claude` — used both interactively (planning, spec) and one-shot with `--output-format stream-json` (implement, fix, brain JSON decisions).
 - `codex` — invoked as `codex exec review -o <file> <prompt>` for the review step.
 
-If either is missing, `vibe` will fail at the corresponding step.
+If either is missing, `lauren vibe` will fail at the corresponding step.
 
 ## Architecture
 
 Lauren is a two-process system that drains a plan queue end-to-end without further human input.
 
-**`lauren` CLI (`src/bin/lauren.ts`)** — the *brain* side. Subcommands write/queue/organize plan files. `lauren plan` spawns interactive `claude` with `PLAN_SYSTEM_PROMPT`; that claude session writes `.lauren/plans/<slug>.md` and re-invokes the CLI as `lauren _register <slug> --path ... --title ...` (a hidden subcommand) to enqueue. After registration the *brain* (`brainPlacePlan` in `src/brain.ts`) runs a one-shot claude call to decide insert-position vs. merge-into-existing-plan, then mutates the queue accordingly. `lauren organize` does the same for the whole pending queue.
+**`lauren` CLI (`src/bin/lauren.ts`)** — the single public executable. Subcommands write/queue/organize plan files. `lauren plan` spawns interactive `claude` with `PLAN_SYSTEM_PROMPT`; that claude session writes `.lauren/plans/<slug>.md` and re-invokes the CLI as `lauren _register <slug> --path ... --title ...` (a hidden subcommand) to enqueue. `lauren organize` is the long-running daemon that drains the inbox: for each `enqueued` plan it marks the row `preparing`, then *brain* (`brainPlacePlan` in `src/brain.ts`) runs a one-shot claude call to decide insert-position vs. merge-into-existing-plan; on success the row lands in the todo as `ready`. `lauren organize --all` runs the same brain over the whole `ready` queue. `lauren todo` is an interactive Ink TUI (`src/tui/TodoApp.tsx`) showing inbox + todo rows merged; selecting a row dispatches to `cancelPlan` (`src/cancel.ts`) which routes by status (see *Cancellation* below). `lauren vibe` is the executor daemon.
 
-**`vibe` CLI (`src/bin/vibe.ts`)** — the *executor* daemon. Polls `.lauren/todo.json` every 3s. For each pending plan it claims (status → `in_progress`), runs the 4-step pipeline in `src/executor.ts`, then marks `done` (or `failed`). Renders progress via Ink (`src/tui/App.tsx` + `runtime.ts`). On Ctrl-C it demotes the in-flight plan back to `pending` so it can resume cleanly.
+**`lauren vibe` (`src/vibe-command.ts`)** — the *executor* subcommand. Polls `.lauren/todo.json` every 3s. For each `ready` plan it claims (status → `implementing`), runs the 4-step pipeline in `src/executor.ts`, then marks `done` (or `failed`). Renders progress via Ink (`src/tui/App.tsx` + `runtime.ts`). On Ctrl-C it demotes the in-flight plan back to `ready` so it can resume cleanly.
 
 ### The 4-step pipeline (`src/executor.ts`)
 
@@ -46,15 +46,34 @@ For each work unit (a whole plan, or a single PR section within a plan):
 
 A plan file is **multi-PR** if it contains lines matching `^### PR (\d+\.\d+) — (.+)$` (parsed by `parsePrs`). Each match becomes one PR run with its own commit. Otherwise the entire plan is a **single unit** with one commit (`runPlanSingleUnit`).
 
-**Resume semantics** (multi-PR only): `alreadyDone()` greps `git log --pretty=%s` for `<slug>: PR X.Y — ` subjects and skips matching PRs. This is how `vibe retry <slug>` after a partial failure picks up where it left off.
+**Resume semantics** (multi-PR only): `alreadyDone()` greps `git log --pretty=%s` for `<slug>: PR X.Y — ` subjects and skips matching PRs. This is how `lauren vibe retry <slug>` after a partial failure picks up where it left off.
 
 ### State and concurrency
 
-State lives in `.lauren/todo.json` (schema versioned, see `core/types.ts`). All mutations go through `TodoStore` (`src/core/store.ts`), which serializes via `proper-lockfile` on `.lauren/todo.json.lock`. Status machine: `pending → in_progress → done | failed`.
+Two stores hold the queue:
 
-Critical invariant: while a plan is `in_progress`, only the executor (passing `allowInProgress: true`) may mutate it. `lauren` brain operations and user commands like `vibe rm` will throw `InProgressLocked`. This prevents the planner side from mid-flight clobbering a running plan.
+- `.lauren/inbox.json` (via `InboxStore`) — incoming registrations awaiting brain placement. Statuses there: `enqueued`, `preparing`.
+- `.lauren/todo.json` (via `TodoStore`) — placed plans the executor consumes. Statuses there: `ready`, `implementing`, `failed`, `done`, `cancelled`.
 
-`vibe` refuses to start if (a) the working tree is dirty, or (b) any plan is already `in_progress` (likely a crashed prior run — user must clean up and `vibe retry <slug>`).
+Both files are schema-versioned; legacy values are migrated on read by `migratePlanRecord` (`core/types.ts`): inbox `pending` → `enqueued`; todo `pending` → `ready`, `in_progress` → `implementing`. All mutations serialize via `proper-lockfile` on the matching `*.lock`.
+
+Status machine: `enqueued → preparing → ready → implementing → done | failed | cancelled`.
+
+Locking invariants: while a plan is `implementing`, only the executor (passing `allowImplementing: true`) may mutate the todo row. `lauren` brain operations throw `ImplementingLocked` otherwise. The same protection applies to `preparing` rows in the inbox (`PreparingLocked`); only `lauren organize` may mutate them.
+
+`lauren vibe` refuses to start if (a) the working tree is dirty, or (b) any plan is already `implementing` (likely a crashed prior run — user must clean up and `lauren vibe retry <slug>`).
+
+### Cancellation (`src/cancel.ts`)
+
+`lauren todo`'s TUI dispatches per-status cancellation:
+
+- `enqueued` → remove from inbox + delete the plan `.md`.
+- `preparing` → set `cancel_requested=true` on the inbox row, send `SIGUSR2` to the brain via `.lauren/brain.pid`. The brain's claude subprocess is aborted (AbortSignal plumbed through `runClaudeOneshotJson`) and the row + `.md` are dropped.
+- `ready` → set status to `cancelled` directly.
+- `implementing` → set `cancel_requested=true` on the todo row, send `SIGUSR2` to vibe via `.lauren/vibe.pid`. Vibe aborts the in-flight subprocess, runs `revertWorkingTree` (`git checkout -- … && git clean -fd …` excluding `.lauren/`), and finalizes the row to `cancelled`.
+- `failed | done | cancelled` → no-op.
+
+Each daemon writes its PID on startup (`src/proc/pid.ts`) and removes it on clean shutdown. If the daemon isn't running, the `cancel_requested` flag persists and is honored on the daemon's next start.
 
 ### Subprocess streaming (`src/proc/`)
 

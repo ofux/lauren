@@ -4,7 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import type { Plan } from './core/types.js';
-import { alreadyDone } from './executor.js';
+import {
+  alreadyDone,
+  alreadyDoneInRepos,
+  singleUnitDone,
+  singleUnitDoneInRepos,
+} from './executor.js';
+import { planCommitMessage } from './executor-prompts.js';
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync('git', args, {
@@ -29,7 +35,9 @@ function makePlan(slug: string): Plan {
     slug,
     title: `${slug} title`,
     path: `.lauren/plans/${slug}.md`,
-    status: 'pending',
+    target_repos: [],
+    status: 'ready',
+    cancel_requested: false,
     created_at: '2026-05-08T12:00:00Z',
     started_at: null,
     finished_at: null,
@@ -55,6 +63,10 @@ describe('alreadyDone() — real git integration', () => {
     expect(alreadyDone(makePlan('feature-x'), repoDir).size).toBe(0);
   });
 
+  test('repo with no commits returns an empty set', () => {
+    expect(alreadyDone(makePlan('feature-x'), repoDir).size).toBe(0);
+  });
+
   test('matching PR commits are picked up', () => {
     commit(repoDir, 'feature-x: PR 1.1 — First');
     commit(repoDir, 'feature-x: PR 1.2 — Second');
@@ -77,5 +89,57 @@ describe('alreadyDone() — real git integration', () => {
   test('a Plan: <title> commit is not matched as a PR', () => {
     commit(repoDir, 'Plan: a single-unit plan');
     expect(alreadyDone(makePlan('a-single-unit-plan'), repoDir).size).toBe(0);
+  });
+
+  test('single-unit commits are detected by slugged subject', () => {
+    const plan = makePlan('single-plan');
+    commit(repoDir, planCommitMessage(plan));
+    expect(singleUnitDone(plan, repoDir)).toBe(true);
+  });
+
+  test('legacy single-unit commits are still detected by title', () => {
+    const plan = makePlan('single-plan');
+    commit(repoDir, `Plan: ${plan.title}`);
+    expect(singleUnitDone(plan, repoDir)).toBe(true);
+  });
+
+  test('multi-repo PR resume treats an id as done if any target repo has it', async () => {
+    const firstRepo = repoDir;
+    const secondRepo = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-git-peer-'));
+    try {
+      git(secondRepo, 'init', '-q', '-b', 'main');
+      const repos = [
+        { name: 'first', path: 'first', root: firstRepo },
+        { name: 'second', path: 'second', root: secondRepo },
+      ];
+      expect(alreadyDoneInRepos(makePlan('feature-x'), repos)).toEqual(new Set());
+
+      commit(firstRepo, 'feature-x: PR 1.1 — First');
+      expect(alreadyDoneInRepos(makePlan('feature-x'), repos)).toEqual(new Set(['1.1']));
+
+      commit(secondRepo, 'feature-x: PR 1.2 — Second');
+      expect(alreadyDoneInRepos(makePlan('feature-x'), repos)).toEqual(new Set(['1.1', '1.2']));
+    } finally {
+      await fs.rm(secondRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('multi-repo single-unit resume succeeds when any target repo has the marker', async () => {
+    const plan = makePlan('single-plan');
+    const firstRepo = repoDir;
+    const secondRepo = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-git-peer-'));
+    try {
+      git(secondRepo, 'init', '-q', '-b', 'main');
+      const repos = [
+        { name: 'first', path: 'first', root: firstRepo },
+        { name: 'second', path: 'second', root: secondRepo },
+      ];
+      expect(singleUnitDoneInRepos(plan, repos)).toBe(false);
+
+      commit(firstRepo, planCommitMessage(plan));
+      expect(singleUnitDoneInRepos(plan, repos)).toBe(true);
+    } finally {
+      await fs.rm(secondRepo, { recursive: true, force: true });
+    }
   });
 });

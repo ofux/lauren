@@ -2,7 +2,8 @@ import { Box, Text } from 'ink';
 import type React from 'react';
 
 import { fmtAge, fmtDuration, monotonicSeconds } from '../core/time.js';
-import type { PLAN_STATUSES, Plan } from '../core/types.js';
+import type { Plan, PlanStatus } from '../core/types.js';
+
 import { PlanProgress } from './PlanProgress.js';
 import type { WatcherRuntime } from './runtime.js';
 import { Spinner } from './Spinner.js';
@@ -19,7 +20,7 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         ✓{' '}
       </Text>
     );
-  else if (plan.status === 'in_progress')
+  else if (plan.status === 'implementing')
     icon = (
       <>
         <Spinner />
@@ -32,12 +33,13 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         ✗{' '}
       </Text>
     );
+  else if (plan.status === 'cancelled') icon = <Text dimColor>⊘ </Text>;
   else icon = <Text dimColor>· </Text>;
 
   const titleProps: { bold?: boolean; color?: string; dimColor?: boolean } = {};
-  if (plan.status === 'in_progress') titleProps.bold = true;
+  if (plan.status === 'implementing') titleProps.bold = true;
   else if (plan.status === 'failed') titleProps.color = 'red';
-  else if (plan.status === 'done') titleProps.dimColor = true;
+  else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
   const age = fmtAge(plan.created_at);
   return (
@@ -74,11 +76,14 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     );
   }
 
-  const counts: Record<(typeof PLAN_STATUSES)[number], number> = {
-    pending: 0,
-    in_progress: 0,
+  const counts: Record<PlanStatus, number> = {
+    enqueued: 0,
+    preparing: 0,
+    ready: 0,
+    implementing: 0,
     done: 0,
     failed: 0,
+    cancelled: 0,
   };
   for (const p of plans) counts[p.status] += 1;
   const total = plans.length;
@@ -96,9 +101,12 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
       ))}
       <Box marginTop={1}>
         <Text bold>{`${counts.done}/${total} done`}</Text>
-        {counts.in_progress > 0 && <Text color="cyan">{`  ·  ${counts.in_progress} running`}</Text>}
-        {counts.pending > 0 && <Text>{`  ·  ${counts.pending} pending`}</Text>}
+        {counts.implementing > 0 && (
+          <Text color="cyan">{`  ·  ${counts.implementing} running`}</Text>
+        )}
+        {counts.ready > 0 && <Text>{`  ·  ${counts.ready} ready`}</Text>}
         {counts.failed > 0 && <Text color="red" bold>{`  ·  ${counts.failed} failed`}</Text>}
+        {counts.cancelled > 0 && <Text dimColor>{`  ·  ${counts.cancelled} cancelled`}</Text>}
         <Text dimColor>{`  ·  uptime ${fmtDuration(elapsed)}`}</Text>
       </Box>
     </Box>

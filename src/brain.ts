@@ -1,42 +1,77 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { TodoStore } from './core/store.js';
-import { InProgressLocked, type Plan, PlanNotFound, planFilePath } from './core/types.js';
+import {
+  ImplementingLocked,
+  type Plan,
+  PlanNotFound,
+  PlanNotReady,
+  PlanSelfMerge,
+  planFilePath,
+} from './core/types.js';
 import { BRAIN_ORGANIZE_PROMPT, BRAIN_PLACE_PROMPT } from './lauren-prompts.js';
 import { runClaudeOneshotJson } from './proc/claude.js';
 
-interface PendingWithBody {
+interface ReadyWithBody {
   plan: Plan;
   body: string;
 }
 
-interface PlaceDecision {
-  decision?: 'insert' | 'merge';
-  position?: unknown;
-  merge_into?: unknown;
-  merged_title?: unknown;
-  merged_markdown?: unknown;
-  reasoning?: unknown;
+interface PlaceInsertDecision {
+  kind: 'insert';
+  position: number;
+  reasoning: string;
 }
 
-interface OrganizeOp {
-  op?: 'merge' | 'reorder';
-  into?: unknown;
-  from?: unknown;
-  merged_title?: unknown;
-  merged_markdown?: unknown;
-  order?: unknown;
+interface PlaceMergeDecision {
+  kind: 'merge';
+  targetSlug: string;
+  mergedTitle: string;
+  mergedMarkdown: string;
+  reasoning: string;
 }
+
+interface InvalidPlaceDecision {
+  kind: 'invalid';
+  message: string;
+}
+
+type PlaceDecision = PlaceInsertDecision | PlaceMergeDecision | InvalidPlaceDecision;
+
+interface OrganizeMergeOp {
+  kind: 'merge';
+  into: string;
+  fromSlug: string;
+  mergedTitle: string;
+  mergedMarkdown: string;
+}
+
+interface OrganizeReorderOp {
+  kind: 'reorder';
+  order: string[];
+}
+
+interface InvalidOrganizeOp {
+  kind: 'invalid';
+  op: string;
+  message: string;
+}
+
+type OrganizeDecisionOp = OrganizeMergeOp | OrganizeReorderOp | InvalidOrganizeOp;
 
 interface OrganizeDecision {
-  operations?: OrganizeOp[];
-  reasoning?: unknown;
+  operations: OrganizeDecisionOp[];
+  reasoning: string;
 }
 
-async function readPendingWithBodies(store: TodoStore): Promise<PendingWithBody[]> {
-  const out: PendingWithBody[] = [];
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+async function readReadyWithBodies(store: TodoStore): Promise<ReadyWithBody[]> {
+  const out: ReadyWithBody[] = [];
   for (const p of await store.read()) {
-    if (p.status !== 'pending') continue;
+    if (p.status !== 'ready') continue;
     let body: string;
     try {
       body = await fs.readFile(planFilePath(p), 'utf8');
@@ -52,175 +87,332 @@ async function readPendingWithBodies(store: TodoStore): Promise<PendingWithBody[
   return out;
 }
 
-function formatPendingForBrain(pending: PendingWithBody[]): string {
-  if (pending.length === 0) return '(queue is empty)';
-  return pending
+function formatReadyForBrain(ready: ReadyWithBody[]): string {
+  if (ready.length === 0) return '(queue is empty)';
+  return ready
     .map(
       ({ plan, body }, i) =>
-        `### Pending plan #${i} — slug: \`${plan.slug}\` — title: ${plan.title}\n\n${body}`,
+        `### Ready plan #${i} — slug: \`${plan.slug}\` — title: ${plan.title}\n\n${body}`,
     )
     .join('\n\n---\n\n');
+}
+
+async function replacePlanFileWithRollback(
+  targetPath: string,
+  body: string,
+): Promise<{ rollback: () => Promise<void>; finalize: () => Promise<void> }> {
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  const suffix = `${process.pid}.${Date.now()}`;
+  const tmpPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${suffix}.tmp`,
+  );
+  const backupPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.${suffix}.bak`,
+  );
+  let hasBackup = false;
+  let replaced = false;
+
+  try {
+    await fs.writeFile(tmpPath, body, 'utf8');
+    try {
+      await fs.rename(targetPath, backupPath);
+      hasBackup = true;
+    } catch (err) {
+      if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
+    }
+    await fs.rename(tmpPath, targetPath);
+    replaced = true;
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+    if (hasBackup && !replaced) {
+      await fs.rename(backupPath, targetPath).catch(() => undefined);
+    }
+    throw err;
+  }
+
+  return {
+    rollback: async () => {
+      await fs.rm(targetPath, { force: true });
+      if (hasBackup) await fs.rename(backupPath, targetPath);
+    },
+    finalize: async () => {
+      await fs.rm(backupPath, { force: true });
+    },
+  };
 }
 
 export async function brainPlacePlan(
   store: TodoStore,
   newPlan: Plan,
   newBody: string,
+  signal?: AbortSignal,
 ): Promise<PlaceDecision> {
-  const pending = await readPendingWithBodies(store);
-  const others = pending.filter((p) => p.plan.slug !== newPlan.slug);
+  const ready = await readReadyWithBodies(store);
+  const others = ready.filter((p) => p.plan.slug !== newPlan.slug);
   const userPrompt =
-    `## Current queue (pending only, in order)\n\n` +
-    `${formatPendingForBrain(others)}\n\n` +
+    `## Current queue (ready only, in order)\n\n` +
+    `${formatReadyForBrain(others)}\n\n` +
     `---\n\n` +
     `## New plan just registered (slug: \`${newPlan.slug}\`, title: ${newPlan.title})\n\n` +
     `${newBody}\n\n` +
-    `Decide: insert at a position among the ${others.length} pending plan(s), ` +
+    `Decide: insert at a position among the ${others.length} ready plan(s), ` +
     `or merge into one of them. Return the JSON object.`;
   const result = await runClaudeOneshotJson({
     systemPrompt: BRAIN_PLACE_PROMPT,
     userPrompt,
+    ...(signal !== undefined ? { signal } : {}),
   });
-  return result as PlaceDecision;
+  return parsePlaceDecision(result);
 }
 
 export async function brainOrganizeQueue(
   store: TodoStore,
-): Promise<{ decision: OrganizeDecision; pending: PendingWithBody[] }> {
-  const pending = await readPendingWithBodies(store);
+  signal?: AbortSignal,
+): Promise<{ decision: OrganizeDecision; ready: ReadyWithBody[] }> {
+  const ready = await readReadyWithBodies(store);
   const userPrompt =
-    `## Pending queue (in order)\n\n` +
-    `${formatPendingForBrain(pending)}\n\n` +
+    `## Ready queue (in order)\n\n` +
+    `${formatReadyForBrain(ready)}\n\n` +
     `Re-think the queue and return the JSON object.`;
   const result = await runClaudeOneshotJson({
     systemPrompt: BRAIN_ORGANIZE_PROMPT,
     userPrompt,
+    ...(signal !== undefined ? { signal } : {}),
   });
-  return { decision: result as OrganizeDecision, pending };
+  return { decision: parseOrganizeDecision(result), ready };
 }
 
 async function fallbackPlaceAtBack(store: TodoStore, newPlan: Plan, msg: string): Promise<string> {
   try {
     await store.move(newPlan.slug, { toBack: true });
   } catch (err) {
-    if (!(err instanceof PlanNotFound) && !(err instanceof InProgressLocked)) {
+    if (!(err instanceof PlanNotFound) && !(err instanceof ImplementingLocked)) {
       throw err;
     }
   }
   return msg;
 }
 
+function parseInsertPosition(rawPos: unknown): number | null {
+  const n =
+    typeof rawPos === 'number'
+      ? rawPos
+      : typeof rawPos === 'string' && rawPos.trim() !== ''
+        ? Number(rawPos)
+        : NaN;
+  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) return null;
+  return n;
+}
+
+function stringField(obj: Record<string, unknown>, key: string): string {
+  const value = obj[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function parsePlaceDecision(raw: unknown): PlaceDecision {
+  if (!isRecord(raw)) {
+    return { kind: 'invalid', message: 'unknown brain decision' };
+  }
+  if (raw.kind === 'merge') {
+    const targetSlug = stringField(raw, 'targetSlug');
+    const mergedTitle = stringField(raw, 'mergedTitle');
+    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
+    const reasoning = stringField(raw, 'reasoning');
+    if (targetSlug && mergedTitle && mergedMarkdown) {
+      return { kind: 'merge', targetSlug, mergedTitle, mergedMarkdown, reasoning };
+    }
+  }
+  if (raw.kind === 'insert') {
+    const position = parseInsertPosition(raw.position);
+    if (position === null) {
+      return { kind: 'invalid', message: 'insert decision missing valid position' };
+    }
+    return { kind: 'insert', position, reasoning: stringField(raw, 'reasoning') };
+  }
+  if (raw.kind === 'invalid') {
+    return { kind: 'invalid', message: stringField(raw, 'message') || 'unknown brain decision' };
+  }
+  const reasoning = stringField(raw, 'reasoning');
+  if (raw.decision === 'merge') {
+    const targetSlug = stringField(raw, 'merge_into');
+    const mergedMarkdown = typeof raw.merged_markdown === 'string' ? raw.merged_markdown : '';
+    const mergedTitle = stringField(raw, 'merged_title');
+    if (!targetSlug || !mergedMarkdown || !mergedTitle) {
+      return { kind: 'invalid', message: 'merge decision missing fields' };
+    }
+    return { kind: 'merge', targetSlug, mergedTitle, mergedMarkdown, reasoning };
+  }
+  if (raw.decision === 'insert') {
+    const position = parseInsertPosition(raw.position);
+    if (position === null) {
+      return { kind: 'invalid', message: 'insert decision missing valid position' };
+    }
+    return { kind: 'insert', position, reasoning };
+  }
+  return { kind: 'invalid', message: 'unknown brain decision' };
+}
+
+function parseOrganizeOp(raw: unknown): OrganizeDecisionOp {
+  if (!isRecord(raw)) {
+    return { kind: 'invalid', op: 'unknown', message: `skip unknown op: ${String(raw)}` };
+  }
+  if (raw.kind === 'merge') {
+    const into = stringField(raw, 'into');
+    const fromSlug = stringField(raw, 'fromSlug');
+    const mergedTitle = stringField(raw, 'mergedTitle');
+    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
+    if (into && fromSlug && mergedTitle && mergedMarkdown) {
+      return { kind: 'merge', into, fromSlug, mergedTitle, mergedMarkdown };
+    }
+  }
+  if (raw.kind === 'reorder') {
+    const order = Array.isArray(raw.order) ? raw.order.map(String) : [];
+    return { kind: 'reorder', order };
+  }
+  if (raw.kind === 'invalid') {
+    return {
+      kind: 'invalid',
+      op: stringField(raw, 'op') || 'unknown',
+      message: stringField(raw, 'message') || 'skip unknown op: undefined',
+    };
+  }
+  if (raw.op === 'merge') {
+    const into = stringField(raw, 'into');
+    const fromSlug = stringField(raw, 'from');
+    const mergedMarkdown = typeof raw.merged_markdown === 'string' ? raw.merged_markdown : '';
+    const mergedTitle = stringField(raw, 'merged_title');
+    if (!into || !fromSlug || !mergedMarkdown || !mergedTitle) {
+      return {
+        kind: 'invalid',
+        op: 'merge',
+        message: `skip merge (missing fields): ${JSON.stringify(raw)}`,
+      };
+    }
+    return { kind: 'merge', into, fromSlug, mergedTitle, mergedMarkdown };
+  }
+  if (raw.op === 'reorder') {
+    const order = Array.isArray(raw.order) ? raw.order.map(String) : [];
+    return { kind: 'reorder', order };
+  }
+  return { kind: 'invalid', op: String(raw.op), message: `skip unknown op: ${String(raw.op)}` };
+}
+
+function parseOrganizeDecision(raw: unknown): OrganizeDecision {
+  if (!isRecord(raw)) {
+    return {
+      operations: [{ kind: 'invalid', op: 'unknown', message: 'skip unknown op: undefined' }],
+      reasoning: '',
+    };
+  }
+  const operations = Array.isArray(raw.operations) ? raw.operations.map(parseOrganizeOp) : [];
+  return { operations, reasoning: stringField(raw, 'reasoning') };
+}
+
 export async function applyPlaceDecision(
   store: TodoStore,
   newPlan: Plan,
-  decision: PlaceDecision,
+  rawDecision: unknown,
 ): Promise<string> {
-  const reasoning = typeof decision.reasoning === 'string' ? decision.reasoning.trim() : '';
+  const decision = parsePlaceDecision(rawDecision);
 
-  if (decision.decision === 'merge') {
-    const targetSlug = typeof decision.merge_into === 'string' ? decision.merge_into : '';
-    const mergedMd = typeof decision.merged_markdown === 'string' ? decision.merged_markdown : '';
-    const mergedTitle = typeof decision.merged_title === 'string' ? decision.merged_title : '';
-    if (!targetSlug || !mergedMd || !mergedTitle) {
-      return fallbackPlaceAtBack(
-        store,
-        newPlan,
-        `merge decision missing fields; left '${newPlan.slug}' at end of queue`,
-      );
-    }
-    const target = await store.find(targetSlug);
-    if (target === null) {
-      return fallbackPlaceAtBack(
-        store,
-        newPlan,
-        `merge target '${targetSlug}' not found; left '${newPlan.slug}' at end of queue`,
-      );
-    }
-    if (target.status !== 'pending') {
-      return fallbackPlaceAtBack(
-        store,
-        newPlan,
-        `merge target '${targetSlug}' is ${target.status}; left '${newPlan.slug}' at end of queue`,
-      );
-    }
-    const targetPath = planFilePath(target);
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
-    await fs.writeFile(targetPath, mergedMd, 'utf8');
+  if (decision.kind === 'invalid') {
+    return fallbackPlaceAtBack(
+      store,
+      newPlan,
+      `${decision.message}; left '${newPlan.slug}' at end of queue`,
+    );
+  }
+
+  if (decision.kind === 'merge') {
+    let mergedFromPath: string | null = null;
     try {
-      await store.update(targetSlug, { title: mergedTitle });
+      const { from } = await store.atomicMerge({
+        targetSlug: decision.targetSlug,
+        fromSlug: newPlan.slug,
+        newTitle: decision.mergedTitle,
+        bodyWriter: async (target) => {
+          const targetPath = planFilePath(target);
+          return replacePlanFileWithRollback(targetPath, decision.mergedMarkdown);
+        },
+      });
+      mergedFromPath = planFilePath(from);
     } catch (err) {
-      if (err instanceof InProgressLocked) {
+      if (err instanceof PlanNotFound) {
         return fallbackPlaceAtBack(
           store,
           newPlan,
-          `merge target '${targetSlug}' became in_progress; left '${newPlan.slug}' at end of queue`,
+          `merge target '${decision.targetSlug}' not found; left '${newPlan.slug}' at end of queue`,
+        );
+      }
+      if (err instanceof PlanNotReady) {
+        return fallbackPlaceAtBack(
+          store,
+          newPlan,
+          `merge target '${decision.targetSlug}' became ${err.status}; left '${newPlan.slug}' at end of queue`,
+        );
+      }
+      if (err instanceof PlanSelfMerge) {
+        return fallbackPlaceAtBack(
+          store,
+          newPlan,
+          `merge target '${decision.targetSlug}' matched new plan; left '${newPlan.slug}' at end of queue`,
         );
       }
       throw err;
     }
     try {
-      const removed = await store.remove(newPlan.slug);
-      try {
-        await fs.unlink(planFilePath(removed));
-      } catch (err) {
-        if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw err;
-        }
-      }
+      await fs.unlink(mergedFromPath);
     } catch (err) {
-      if (!(err instanceof PlanNotFound) && !(err instanceof InProgressLocked)) {
+      if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw err;
       }
     }
-    return `merged '${newPlan.slug}' into '${targetSlug}'${reasoning ? `: ${reasoning}` : ''}`;
-  }
-
-  // decision == insert (or unknown — treat as insert)
-  let position = 0;
-  const rawPos = decision.position;
-  if (typeof rawPos === 'number' && Number.isFinite(rawPos)) {
-    position = Math.max(0, Math.floor(rawPos));
-  } else if (typeof rawPos === 'string') {
-    const n = Number.parseInt(rawPos, 10);
-    if (Number.isFinite(n)) position = Math.max(0, n);
+    return (
+      `merged '${newPlan.slug}' into '${decision.targetSlug}'` +
+      `${decision.reasoning ? `: ${decision.reasoning}` : ''}`
+    );
   }
 
   const plans = await store.read();
-  const pendingOthers = plans.filter((p) => p.status === 'pending' && p.slug !== newPlan.slug);
+  const readyOthers = plans.filter((p) => p.status === 'ready' && p.slug !== newPlan.slug);
   let where: string;
   try {
-    if (position >= pendingOthers.length) {
+    if (decision.position >= readyOthers.length) {
       await store.move(newPlan.slug, { toBack: true });
       where = 'end of queue';
     } else {
-      const beforeSlug = pendingOthers[position]!.slug;
+      const beforeSlug = readyOthers[decision.position]!.slug;
       await store.move(newPlan.slug, { before: beforeSlug });
-      where = `position ${position} (before '${beforeSlug}')`;
+      where = `position ${decision.position} (before '${beforeSlug}')`;
     }
   } catch (err) {
-    if (!(err instanceof PlanNotFound) && !(err instanceof InProgressLocked)) {
+    if (!(err instanceof PlanNotFound) && !(err instanceof ImplementingLocked)) {
       throw err;
     }
     where = 'end of queue (move failed)';
   }
-  return `placed '${newPlan.slug}' at ${where}${reasoning ? `: ${reasoning}` : ''}`;
+  return `placed '${newPlan.slug}' at ${where}${decision.reasoning ? `: ${decision.reasoning}` : ''}`;
 }
 
-export function summarizeOrganizeDecision(decision: OrganizeDecision): string[] {
+export function summarizeOrganizeDecision(rawDecision: unknown): string[] {
+  const decision = parseOrganizeDecision(rawDecision);
   const ops = decision.operations ?? [];
   if (ops.length === 0) return ['(no operations — queue is fine as-is)'];
   const out: string[] = [];
   for (const op of ops) {
-    if (op.op === 'merge') {
+    if (op.kind === 'merge') {
       out.push(
-        `merge: '${String(op.from)}' → '${String(op.into)}' ` +
-          `(new title: ${JSON.stringify(op.merged_title)})`,
+        `merge: '${op.fromSlug}' → '${op.into}' ` +
+          `(new title: ${JSON.stringify(op.mergedTitle)})`,
       );
-    } else if (op.op === 'reorder') {
-      const order = Array.isArray(op.order) ? (op.order as unknown[]).map(String) : [];
-      out.push(`reorder: ${order.join(' → ')}`);
+    } else if (op.kind === 'reorder') {
+      out.push(`reorder: ${op.order.join(' → ')}`);
     } else {
-      out.push(`unknown op: ${JSON.stringify(op)}`);
+      out.push(op.message.replace(/^skip /, ''));
     }
   }
   return out;
@@ -228,57 +420,59 @@ export function summarizeOrganizeDecision(decision: OrganizeDecision): string[] 
 
 export async function applyOrganizeDecision(
   store: TodoStore,
-  decision: OrganizeDecision,
+  rawDecision: unknown,
 ): Promise<string[]> {
+  const decision = parseOrganizeDecision(rawDecision);
   const summary: string[] = [];
-  for (const op of decision.operations ?? []) {
-    if (op.op === 'merge') {
-      const into = typeof op.into === 'string' ? op.into : '';
-      const fromSlug = typeof op.from === 'string' ? op.from : '';
-      const mergedMd = typeof op.merged_markdown === 'string' ? op.merged_markdown : '';
-      const mergedTitle = typeof op.merged_title === 'string' ? op.merged_title : '';
-      if (!into || !fromSlug || !mergedMd || !mergedTitle) {
-        summary.push(`  skip merge (missing fields): ${JSON.stringify(op)}`);
-        continue;
-      }
-      const target = await store.find(into);
-      const fromPlan = await store.find(fromSlug);
-      if (target === null || fromPlan === null) {
-        summary.push(`  skip merge ${fromSlug} → ${into}: slug not found`);
-        continue;
-      }
-      if (target.status !== 'pending' || fromPlan.status !== 'pending') {
-        summary.push(`  skip merge ${fromSlug} → ${into}: not both pending`);
-        continue;
-      }
-      const targetPath = planFilePath(target);
-      await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.writeFile(targetPath, mergedMd, 'utf8');
+  const ops = decision.operations;
+  const orderedOps = [
+    ...ops.filter((op) => op.kind === 'merge'),
+    ...ops.filter((op) => op.kind === 'reorder'),
+    ...ops.filter((op) => op.kind !== 'merge' && op.kind !== 'reorder'),
+  ];
+  for (const op of orderedOps) {
+    if (op.kind === 'merge') {
+      let mergedFromPath: string | null = null;
       try {
-        await store.update(into, { title: mergedTitle });
-        await store.remove(fromSlug);
-        try {
-          await fs.unlink(planFilePath(fromPlan));
-        } catch (err) {
-          if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            throw err;
-          }
-        }
-        summary.push(`  merged '${fromSlug}' → '${into}'`);
+        const { from } = await store.atomicMerge({
+          targetSlug: op.into,
+          fromSlug: op.fromSlug,
+          newTitle: op.mergedTitle,
+          bodyWriter: async (target) => {
+            const targetPath = planFilePath(target);
+            return replacePlanFileWithRollback(targetPath, op.mergedMarkdown);
+          },
+        });
+        mergedFromPath = planFilePath(from);
+        summary.push(`  merged '${op.fromSlug}' → '${op.into}'`);
       } catch (err) {
-        if (err instanceof InProgressLocked) {
-          summary.push(`  skip merge ${fromSlug} → ${into}: lock changed mid-apply`);
-        } else {
+        if (err instanceof PlanNotFound) {
+          summary.push(`  skip merge ${op.fromSlug} → ${op.into}: slug not found`);
+          continue;
+        }
+        if (err instanceof PlanNotReady) {
+          summary.push(`  skip merge ${op.fromSlug} → ${op.into}: ${err.slug} is ${err.status}`);
+          continue;
+        }
+        if (err instanceof PlanSelfMerge) {
+          summary.push(`  skip merge ${op.fromSlug} → ${op.into}: cannot merge a plan into itself`);
+          continue;
+        }
+        throw err;
+      }
+      try {
+        await fs.unlink(mergedFromPath);
+      } catch (err) {
+        if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== 'ENOENT') {
           throw err;
         }
       }
-    } else if (op.op === 'reorder') {
-      const order = Array.isArray(op.order) ? (op.order as unknown[]).map(String) : [];
+    } else if (op.kind === 'reorder') {
       try {
-        await store.reorderPending(order);
-        summary.push(`  reordered ${order.length} pending plan(s)`);
+        await store.reorderReady(op.order);
+        summary.push(`  reordered ${op.order.length} ready plan(s)`);
       } catch (err) {
-        if (err instanceof InProgressLocked) {
+        if (err instanceof ImplementingLocked) {
           summary.push(`  skip reorder: ${err.message}`);
         } else if (err instanceof Error) {
           summary.push(`  skip reorder: ${err.message}`);
@@ -287,7 +481,7 @@ export async function applyOrganizeDecision(
         }
       }
     } else {
-      summary.push(`  skip unknown op: ${String(op.op)}`);
+      summary.push(`  ${op.message}`);
     }
   }
   return summary;

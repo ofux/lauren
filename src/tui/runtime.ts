@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+
 import { monotonicSeconds } from '../core/time.js';
 import type { Plan } from '../core/types.js';
 import {
@@ -63,6 +65,13 @@ export function newPlanRuntimeState(args: {
   };
 }
 
+function failureMessageHasCommitRecovery(message: string, slug: string): boolean {
+  return (
+    message.toLowerCase().includes('commit manually') &&
+    message.includes(`lauren vibe retry ${slug}`)
+  );
+}
+
 /**
  * Mutable runtime state for the vibe watcher. Acts as the {@link ProgressSink}
  * passed into the executor: every method mutates state then notifies
@@ -78,6 +87,11 @@ export class WatcherRuntime implements ProgressSink {
   planProgress: PlanRuntimeState | null = null;
   idleState: RuntimeIdleState = 'idle';
   idleMessage = 'starting…';
+
+  /** Slug of the failed plan we most recently transitioned-into-paused for.
+   *  Used to dedup notification beeps when setPaused fires repeatedly while
+   *  the watcher polls. Reset when we leave the paused state. */
+  private pausedSlug: string | null = null;
 
   private listeners = new Set<() => void>();
 
@@ -100,6 +114,7 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = plan;
     this.planProgress = progress;
     this.idleState = 'running';
+    this.pausedSlug = null;
     this.notify();
   }
 
@@ -108,26 +123,38 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.planProgress = null;
     this.idleState = 'idle';
+    this.pausedSlug = null;
     this.idleMessage =
       'waiting for plans…\n' + '  Run `lauren plan` (in another terminal) to add work.';
     this.notify();
   }
 
   setPaused(plans: Plan[], failedPlan: Plan): void {
+    const isNewPause = this.pausedSlug !== failedPlan.slug;
     this.plans = plans;
     this.currentPlan = null;
     this.planProgress = null;
     this.idleState = 'paused';
+    this.pausedSlug = failedPlan.slug;
     const f = failedPlan.failure;
     const step = f ? f.step : '?';
     const msg = f ? f.message : '(no message)';
-    const pending = plans.filter((p) => p.status === 'pending').length;
-    this.idleMessage =
-      `PAUSED: plan '${failedPlan.slug}' failed at ${step}.\n` +
-      `  ${msg}\n` +
-      `  ${pending} plan(s) queued behind it.\n` +
-      `  Run \`vibe retry ${failedPlan.slug}\` to resume, or ` +
-      `\`vibe rm ${failedPlan.slug}\` to drop it.`;
+    const ready = plans.filter((p) => p.status === 'ready').length;
+    const indentedMsg = msg
+      .split('\n')
+      .map((l) => `  ${l}`)
+      .join('\n');
+    // Git commit failures already explain the manual-fix path including the
+    // retry command. Other commit-step failures still need the generic hint.
+    const hasRecoveryHint =
+      step === 'commit' && failureMessageHasCommitRecovery(msg, failedPlan.slug);
+    const trailer = hasRecoveryHint
+      ? `  ${ready} plan(s) queued behind it.`
+      : `  ${ready} plan(s) queued behind it.\n` +
+        `  Run \`lauren vibe retry ${failedPlan.slug}\` to resume, or ` +
+        `\`lauren todo\` and cancel it.`;
+    this.idleMessage = `PAUSED: plan '${failedPlan.slug}' failed at ${step}.\n${indentedMsg}\n${trailer}`;
+    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -233,4 +260,35 @@ export function getItemElapsed(
   const finishedAt = state.itemFinished.get(itemId);
   if (finishedAt === undefined) return null;
   return finishedAt - startedAt;
+}
+
+/**
+ * Best-effort notification when vibe transitions into the paused state.
+ * Always emits the terminal BEL (works in any TTY); on macOS additionally
+ * spawns `afplay` for an audible cue. Every step is wrapped in try/catch
+ * because failure to play a sound must never crash the watcher.
+ *
+ * Set LAUREN_NO_SOUND=1 to silence both.
+ */
+export function playPauseNotification(): void {
+  if (process.env.LAUREN_NO_SOUND === '1') return;
+  try {
+    process.stdout.write('\x07');
+  } catch {
+    // Writing BEL can fail if stdout was closed — ignore.
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const child = spawn('afplay', ['/System/Library/Sounds/Glass.aiff'], {
+        stdio: 'ignore',
+        detached: true,
+      });
+      child.on('error', () => {
+        // afplay missing or failed; the BEL already fired.
+      });
+      child.unref();
+    } catch {
+      // spawn itself can throw (e.g. EMFILE) — ignore.
+    }
+  }
 }

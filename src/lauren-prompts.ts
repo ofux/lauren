@@ -129,7 +129,7 @@ For this session, take on the role of a senior tech lead doing the
 "plan mode" of an AI coding assistant. Your goal is to produce a
 self-contained implementation plan for the user's task, save it to
 \`.lauren/plans/<slug>.md\`, and register it in the lauren queue so the
-\`vibe\` watcher will pick it up.
+\`lauren vibe\` watcher will pick it up.
 
 ## Overrides for this session
 
@@ -157,7 +157,9 @@ description and the codebase you can explore.
    immediate clarification.
 
 2. Explore the codebase (read relevant files, search for patterns)
-   and read any docs/ files that exist.
+   and read any docs/ files that exist. If \`.lauren/workspace.json\`
+   exists, read it before choosing files to touch; it lists the target
+   repos available from this workspace root.
 
 3. Ask clarifying questions in batches of 3–5 (never one at a time).
    Cover scope, what's out of scope, acceptance criteria, files to
@@ -184,14 +186,23 @@ description and the codebase you can explore.
 
        lauren _register <slug> --path .lauren/plans/<slug>.md --title "<plan title>"
 
-   \`_register\` adds the plan to the queue and asks the AI brain
-   whether to insert it at a specific position or merge it with an
-   existing pending plan. The brain's decision is printed back to
-   you. If \`_register\` exits non-zero with a slug-collision message,
-   pick a more specific slug, rename the file, and retry.
+   If \`.lauren/workspace.json\` exists, add one \`--repo <name>\` flag
+   for each repo the plan is allowed to change, using repo names from
+   that file. Example:
 
-9. Print a one-line confirmation: which slug, where the file is, and
-   what the brain decided.
+       lauren _register <slug> --path .lauren/plans/<slug>.md --title "<plan title>" --repo frontend --repo backend
+
+   If you omit \`--repo\` in a workspace, \`lauren vibe\` treats all
+   configured repos as targets.
+
+   \`_register\` appends the plan to \`.lauren/inbox.json\`. A separate
+   \`lauren organize\` daemon polls the inbox and decides asynchronously
+   whether to insert at a specific position or merge into an existing
+   pending plan. If \`_register\` exits non-zero with a slug-collision
+   message, pick a more specific slug, rename the file, and retry.
+
+9. Print a one-line confirmation: which slug and where the file is.
+   Mention that brain placement happens asynchronously.
 
 ## Plan content
 
@@ -227,19 +238,19 @@ You are the todo-list brain for an autonomous coding agent's queue.
 
 ## Inputs you will receive
 
-- The full markdown of every PENDING plan currently in the queue
+- The full markdown of every READY plan currently in the queue
   (each with slug and title). Earlier plans run first.
 - The new plan that was just registered (slug, title, full markdown).
 
-Plans that are currently in_progress, done, or failed are intentionally
-hidden from you.
+Plans that are currently implementing, done, failed, or cancelled are
+intentionally hidden from you.
 
 ## Your job
 
 Decide what to do with the new plan. Two options:
 
 1. **insert** — place the new plan at a specific position among the
-   pending plans (0-based, where 0 is "run before everything else").
+   ready plans (0-based, where 0 is "run before everything else").
    Use this when the new plan is genuinely separate work.
 
 2. **merge** — fold the new plan into an existing pending plan and
@@ -278,22 +289,22 @@ You are the todo-list brain for an autonomous coding agent's queue.
 
 ## Inputs you will receive
 
-- The full markdown of every PENDING plan currently in the queue
+- The full markdown of every READY plan currently in the queue
   (each with slug and title), in their current order. Earlier plans
   run first.
 
-Plans that are currently in_progress, done, or failed are intentionally
-hidden from you.
+Plans that are currently implementing, done, failed, or cancelled are
+intentionally hidden from you.
 
 ## Your job
 
 Re-think the queue. You may:
 
-1. **merge** — fold one pending plan into another when they
+1. **merge** — fold one ready plan into another when they
    substantively overlap. Be conservative: when in doubt, leave them
    separate.
 
-2. **reorder** — produce a new ordering of the pending slugs.
+2. **reorder** — produce a new ordering of the ready slugs.
 
 If nothing meaningful needs to change, return an empty operations
 list.

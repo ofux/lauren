@@ -4,6 +4,11 @@ import path from 'node:path';
 import { displayPath, REPO } from './core/paths.js';
 import { type Plan, planFilePath, planLogDir } from './core/types.js';
 import {
+  type ResolvedWorkspaceRepo,
+  resolveWorkspaceRepos,
+  WorkspaceConfigError,
+} from './core/workspace.js';
+import {
   fixPlanPrompt,
   fixPrompt,
   implementPlanPrompt,
@@ -15,7 +20,13 @@ import {
   reviewPrompt,
 } from './executor-prompts.js';
 import { runCodexReview } from './proc/codex.js';
-import { gitAddAll, gitCommit, gitLogSubjects, workingTreeDirty } from './proc/git.js';
+import {
+  type GitCommitResult,
+  gitAddAll,
+  gitCommit,
+  gitLogSubjects,
+  workingTreeDirty,
+} from './proc/git.js';
 import { streamSubprocess } from './proc/stream.js';
 import { formatClaudeStreamLine } from './util/streamJson.js';
 
@@ -30,17 +41,20 @@ export const PR_STEPS: readonly StepName[] = ['implement', 'review', 'fix', 'com
 export class RunFailure extends Error {
   readonly step: StepName | 'unknown';
   readonly prId: string | null;
+  /** The original message, without the `${step}: ` prefix added to Error.message. */
+  readonly rawMessage: string;
   constructor(step: StepName | 'unknown', message: string, prId: string | null = null) {
     super(`${step}: ${message}`);
     this.name = 'RunFailure';
     this.step = step;
     this.prId = prId;
+    this.rawMessage = message;
   }
 }
 
 /**
  * Sink that observes runner progress. Implementations: a TUI bridge in
- * vibe.ts, or undefined (the runner falls back to plain stdout banners).
+ * vibe-command.ts, or undefined (the runner falls back to plain stdout banners).
  */
 export interface ProgressSink {
   appendLog(line: string): void;
@@ -84,6 +98,41 @@ export function alreadyDone(plan: Plan, cwd?: string): Set<string> {
   return parseDoneIds(gitLogSubjects(cwd), plan.slug);
 }
 
+/**
+ * Resume detection across a workspace. A PR id is considered done if *any*
+ * target repo has the marker commit for it. We don't require markers in
+ * every target repo because we no longer create empty placeholders — peers
+ * that had no real changes during the original run simply have no marker.
+ */
+export function alreadyDoneInRepos(
+  plan: Plan,
+  repos: readonly ResolvedWorkspaceRepo[],
+): Set<string> {
+  const done = new Set<string>();
+  for (const repo of repos) {
+    for (const id of alreadyDone(plan, repo.root)) done.add(id);
+  }
+  return done;
+}
+
+function legacyPlanCommitMessage(plan: Plan): string {
+  return `Plan: ${plan.title}`;
+}
+
+export function singleUnitDone(plan: Plan, cwd?: string): boolean {
+  const subjects = gitLogSubjects(cwd);
+  return (
+    subjects.includes(planCommitMessage(plan)) || subjects.includes(legacyPlanCommitMessage(plan))
+  );
+}
+
+export function singleUnitDoneInRepos(
+  plan: Plan,
+  repos: readonly ResolvedWorkspaceRepo[],
+): boolean {
+  return repos.some((repo) => singleUnitDone(plan, repo.root));
+}
+
 function prLogDir(parentLogDir: string, pr: PR): string {
   return path.join(parentLogDir, `PR-${pr.id}`);
 }
@@ -98,227 +147,188 @@ export interface RunPrOptions {
   plan: Plan;
   planPath: string;
   parentLogDir: string;
+  targetRepos: readonly ResolvedWorkspaceRepo[];
   dryRun: boolean;
   progress?: ProgressSink;
-}
-
-export async function runPr(opts: RunPrOptions): Promise<void> {
-  const { pr, plan, planPath, parentLogDir, dryRun, progress } = opts;
-  const logDir = prLogDir(parentLogDir, pr);
-  await fs.mkdir(logDir, { recursive: true });
-  if (!progress) banner(`PR ${pr.id} — ${pr.title}`);
-
-  if (workingTreeDirty()) {
-    throw new RunFailure(
-      'implement',
-      'working tree is dirty before starting; commit or stash changes first.',
-      pr.id,
-    );
-  }
-
-  // Step 1 — implement
-  const implementCmd = [
-    'claude',
-    '-p',
-    '--output-format',
-    'stream-json',
-    '--verbose',
-    implementPrompt(pr, planPath),
-  ];
-  if (progress) {
-    progress.beginStep(pr.id, 'implement', `claude · implement · PR ${pr.id}`);
-  } else {
-    process.stdout.write(`\n→ [1/4] claude implementing PR ${pr.id}\n`);
-  }
-  if (dryRun) {
-    process.stdout.write(`  (dry-run) ${implementCmd.map((a) => JSON.stringify(a)).join(' ')}\n`);
-  } else {
-    const sinkArg = progress ?? undefined;
-    const rc = await streamSubprocess({
-      cmd: implementCmd,
-      logPath: path.join(logDir, '1-implement.log'),
-      ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
-      transformer: formatClaudeStreamLine,
-    });
-    if (rc !== 0) {
-      progress?.endStep(pr.id, 'implement', 'failed');
-      throw new RunFailure('implement', `claude exited ${rc}`, pr.id);
-    }
-    if (!workingTreeDirty()) {
-      progress?.endStep(pr.id, 'implement', 'failed');
-      throw new RunFailure(
-        'implement',
-        `claude produced no changes (see ${displayPath(path.join(logDir, '1-implement.log'))})`,
-        pr.id,
-      );
-    }
-    progress?.endStep(pr.id, 'implement', 'done');
-  }
-
-  // Step 2 — review via codex
-  const reviewMessagePath = path.join(logDir, '2-review.message.txt');
-  if (progress) {
-    progress.beginStep(pr.id, 'review', `codex · review · PR ${pr.id}`);
-  } else {
-    process.stdout.write(`\n→ [2/4] codex reviewing uncommitted changes for PR ${pr.id}\n`);
-  }
-  let reviewText = '';
-  if (dryRun) {
-    process.stdout.write(`  (dry-run) codex exec review -o ${reviewMessagePath} <review-prompt>\n`);
-  } else {
-    const sinkArg = progress ?? undefined;
-    const { code, reviewText: text } = await runCodexReview({
-      prompt: reviewPrompt(pr, planPath),
-      outputPath: reviewMessagePath,
-      logPath: path.join(logDir, '2-review.log'),
-      ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
-    });
-    if (code !== 0) {
-      progress?.endStep(pr.id, 'review', 'failed');
-      throw new RunFailure('review', `codex exited ${code}`, pr.id);
-    }
-    reviewText = text;
-    if (progress) {
-      progress.endStep(pr.id, 'review', 'done');
-    } else if (reviewText.trim().length === 0) {
-      process.stdout.write('  (warning) codex returned an empty review; skipping fix step.\n');
-    }
-  }
-
-  // Step 3 — fix
-  if (dryRun) {
-    process.stdout.write(`\n→ [3/4] (dry-run) claude addressing review for PR ${pr.id}\n`);
-  } else if (reviewText.trim().length > 0) {
-    const fixCmd = [
-      'claude',
-      '-p',
-      '--output-format',
-      'stream-json',
-      '--verbose',
-      fixPrompt(pr, reviewText),
-    ];
-    if (progress) {
-      progress.beginStep(pr.id, 'fix', `claude · fix · PR ${pr.id}`);
-    } else {
-      process.stdout.write(`\n→ [3/4] claude addressing review for PR ${pr.id}\n`);
-    }
-    const sinkArg = progress ?? undefined;
-    const rc = await streamSubprocess({
-      cmd: fixCmd,
-      logPath: path.join(logDir, '3-fix.log'),
-      ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
-      transformer: formatClaudeStreamLine,
-    });
-    if (rc !== 0) {
-      progress?.endStep(pr.id, 'fix', 'failed');
-      throw new RunFailure('fix', `claude exited ${rc}`, pr.id);
-    }
-    progress?.endStep(pr.id, 'fix', 'done');
-  } else {
-    progress?.endStep(pr.id, 'fix', 'skipped');
-  }
-
-  // Step 4 — commit
-  if (progress) {
-    progress.beginStep(pr.id, 'commit', `git · commit · PR ${pr.id}`);
-  } else {
-    process.stdout.write(`\n→ [4/4] committing PR ${pr.id}\n`);
-  }
-  const message = prCommitMessage(plan, pr);
-  if (dryRun) {
-    process.stdout.write(`  (dry-run) git add -A && git commit -m "${message}"\n`);
-    return;
-  }
-  gitAddAll();
-  const commit = gitCommit(message, { capture: progress !== undefined });
-  if (commit.code !== 0) {
-    progress?.endStep(pr.id, 'commit', 'failed');
-    let detail = '';
-    if (progress) {
-      const captured = (commit.stderr ?? '') + (commit.stdout ?? '');
-      const tail = captured
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-      if (tail.length > 0) detail = `: ${tail[tail.length - 1]}`;
-    }
-    throw new RunFailure('commit', `git commit exited ${commit.code}${detail}`, pr.id);
-  }
-  progress?.endStep(pr.id, 'commit', 'done');
+  signal?: AbortSignal;
 }
 
 export interface RunPlanSingleUnitOptions {
   plan: Plan;
   planText: string;
   parentLogDir: string;
+  targetRepos: readonly ResolvedWorkspaceRepo[];
   dryRun: boolean;
   progress?: ProgressSink;
+  signal?: AbortSignal;
 }
 
-export async function runPlanSingleUnit(opts: RunPlanSingleUnitOptions): Promise<void> {
-  const { plan, planText, parentLogDir, dryRun, progress } = opts;
-  const logDir = parentLogDir;
-  await fs.mkdir(logDir, { recursive: true });
-  const itemId = plan.slug;
+interface ExecutionUnit {
+  itemId: string;
+  prId: string | null;
+  slug: string;
+  banner: string;
+  implementConsole: string;
+  reviewConsole: string;
+  fixConsole: string;
+  commitConsole: string;
+  implementLabel: string;
+  reviewLabel: string;
+  fixLabel: string;
+  commitLabel: string;
+  implementPrompt: string;
+  reviewPrompt: string;
+  fixPrompt: (reviewText: string) => string;
+  commitMessage: string;
+  logDir: string;
+  dryRunImplementArgs?: string[];
+}
 
-  if (workingTreeDirty()) {
+function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceRepo[] {
+  return repos.filter((repo) => workingTreeDirty(repo.root));
+}
+
+function formatRepos(repos: readonly ResolvedWorkspaceRepo[]): string {
+  return repos.map((repo) => `${repo.name} (${repo.path})`).join(', ');
+}
+
+function claudePrintCommand(prompt: string): string[] {
+  return ['claude', '-p', '--output-format', 'stream-json', '--verbose', prompt];
+}
+
+function lastNonEmptyLine(text: string): string {
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  return lines.length > 0 ? (lines[lines.length - 1] ?? '') : '';
+}
+
+function commitGitTail(commit: { stdout?: string; stderr?: string }): string {
+  return lastNonEmptyLine((commit.stderr ?? '') + (commit.stdout ?? ''));
+}
+
+/**
+ * Human-readable message stored on `failure.message` (and surfaced in the TUI's
+ * paused panel) when one of the per-repo commits fails mid-multi-repo. The
+ * message has to stand on its own — there's no separate "what to do" UI — so it
+ * names the repo, quotes the exact commit subject, and tells the user how to
+ * resume after committing manually. Exported for unit testing.
+ */
+export function formatCommitFailureMessage(args: {
+  repoName: string;
+  repoPath: string;
+  commitSubject: string;
+  slug: string;
+  exitCode: number;
+  gitTail: string;
+}): string {
+  const { repoName, repoPath, commitSubject, slug, exitCode, gitTail } = args;
+  const tailPart = gitTail.length > 0 ? `: ${gitTail}` : '';
+  return [
+    `failed to commit changes in repo '${repoName}' (${repoPath}). ` +
+      `git exited ${exitCode}${tailPart}`,
+    'Pausing vibe until you fix it. Inspect the staged changes, address the error,',
+    'then commit manually with this subject (so resume detects it):',
+    `  ${commitSubject}`,
+    `Then run \`lauren vibe retry ${slug}\` (or restart \`lauren vibe\`).`,
+  ].join('\n');
+}
+
+/**
+ * Stage and commit each dirty target repo with the same subject. Only repos
+ * that actually have changes get a commit — we never create empty marker
+ * commits in peer repos.
+ *
+ * Partial-failure recovery: if commit succeeds in repo A and then fails in
+ * repo B, A's commit is permanent (we don't rewrite history). The caller
+ * throws RunFailure with a message that names B and quotes the exact commit
+ * subject; the watcher pauses and the user fixes B manually using that
+ * subject. On retry, `alreadyDone` sees the marker in both repos and
+ * correctly skips this PR. (If the user commits B with a different subject,
+ * resume will re-run the PR — still pick scopes that minimize cross-repo
+ * coupling to keep recovery cheap.)
+ */
+function commitAllTargetRepos(
+  dirtyTargets: readonly ResolvedWorkspaceRepo[],
+  message: string,
+  progress?: ProgressSink,
+): { repo: ResolvedWorkspaceRepo; commit: GitCommitResult } | null {
+  for (const repo of dirtyTargets) {
+    gitAddAll(repo.root);
+    const commit = gitCommit(message, {
+      capture: progress !== undefined,
+      cwd: repo.root,
+    });
+    if (commit.code !== 0) {
+      return { repo, commit };
+    }
+  }
+  return null;
+}
+
+async function runExecutionUnit(args: {
+  unit: ExecutionUnit;
+  targetRepos: readonly ResolvedWorkspaceRepo[];
+  dryRun: boolean;
+  progress?: ProgressSink;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { unit, targetRepos, dryRun, progress, signal } = args;
+  await fs.mkdir(unit.logDir, { recursive: true });
+  if (!progress) banner(unit.banner);
+
+  const dirtyBeforeStart = dirtyRepos(targetRepos);
+  if (dirtyBeforeStart.length > 0) {
     throw new RunFailure(
       'implement',
-      'working tree is dirty before starting; commit or stash changes first.',
+      `target repo(s) are dirty before starting: ${formatRepos(
+        dirtyBeforeStart,
+      )}; commit or stash changes first.`,
+      unit.prId,
     );
   }
 
-  if (!progress) banner(`plan ${plan.slug} — ${plan.title}`);
-
-  // Step 1 — implement
-  const implementCmd = [
-    'claude',
-    '-p',
-    '--output-format',
-    'stream-json',
-    '--verbose',
-    implementPlanPrompt(plan, planText),
-  ];
+  const implementCmd = claudePrintCommand(unit.implementPrompt);
   if (progress) {
-    progress.beginStep(itemId, 'implement', `claude · implement · ${plan.slug}`);
+    progress.beginStep(unit.itemId, 'implement', unit.implementLabel);
   } else {
-    process.stdout.write(`\n→ [1/4] claude implementing ${plan.slug}\n`);
+    process.stdout.write(`\n→ [1/4] ${unit.implementConsole}\n`);
   }
   if (dryRun) {
-    process.stdout.write(
-      `  (dry-run) ${implementCmd
-        .slice(0, 5)
-        .map((a) => JSON.stringify(a))
-        .join(' ')} <plan-prompt>\n`,
-    );
+    const displayArgs = unit.dryRunImplementArgs ?? implementCmd;
+    process.stdout.write(`  (dry-run) ${displayArgs.map((a) => JSON.stringify(a)).join(' ')}\n`);
   } else {
     const sinkArg = progress ?? undefined;
+    const logPath = path.join(unit.logDir, '1-implement.log');
     const rc = await streamSubprocess({
       cmd: implementCmd,
-      logPath: path.join(logDir, '1-implement.log'),
+      logPath,
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
+      ...(signal !== undefined ? { signal } : {}),
       transformer: formatClaudeStreamLine,
     });
     if (rc !== 0) {
-      progress?.endStep(itemId, 'implement', 'failed');
-      throw new RunFailure('implement', `claude exited ${rc}`);
+      progress?.endStep(unit.itemId, 'implement', 'failed');
+      throw new RunFailure('implement', `claude exited ${rc}`, unit.prId);
     }
-    if (!workingTreeDirty()) {
-      progress?.endStep(itemId, 'implement', 'failed');
+    if (dirtyRepos(targetRepos).length === 0) {
+      progress?.endStep(unit.itemId, 'implement', 'failed');
       throw new RunFailure(
         'implement',
-        `claude produced no changes (see ${displayPath(path.join(logDir, '1-implement.log'))})`,
+        `claude produced no changes in target repo(s) ${formatRepos(targetRepos)} ` +
+          `(see ${displayPath(logPath)})`,
+        unit.prId,
       );
     }
-    progress?.endStep(itemId, 'implement', 'done');
+    progress?.endStep(unit.itemId, 'implement', 'done');
   }
 
-  // Step 2 — review
-  const reviewMessagePath = path.join(logDir, '2-review.message.txt');
+  const reviewMessagePath = path.join(unit.logDir, '2-review.message.txt');
   if (progress) {
-    progress.beginStep(itemId, 'review', `codex · review · ${plan.slug}`);
+    progress.beginStep(unit.itemId, 'review', unit.reviewLabel);
   } else {
-    process.stdout.write(`\n→ [2/4] codex reviewing uncommitted changes for ${plan.slug}\n`);
+    process.stdout.write(`\n→ [2/4] ${unit.reviewConsole}\n`);
   }
   let reviewText = '';
   if (dryRun) {
@@ -326,110 +336,212 @@ export async function runPlanSingleUnit(opts: RunPlanSingleUnitOptions): Promise
   } else {
     const sinkArg = progress ?? undefined;
     const { code, reviewText: text } = await runCodexReview({
-      prompt: reviewPlanPrompt(plan),
+      prompt: unit.reviewPrompt,
       outputPath: reviewMessagePath,
-      logPath: path.join(logDir, '2-review.log'),
+      logPath: path.join(unit.logDir, '2-review.log'),
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
+      ...(signal !== undefined ? { signal } : {}),
     });
     if (code !== 0) {
-      progress?.endStep(itemId, 'review', 'failed');
-      throw new RunFailure('review', `codex exited ${code}`);
+      progress?.endStep(unit.itemId, 'review', 'failed');
+      throw new RunFailure('review', `codex exited ${code}`, unit.prId);
     }
     reviewText = text;
     if (progress) {
-      progress.endStep(itemId, 'review', 'done');
+      progress.endStep(unit.itemId, 'review', 'done');
     } else if (reviewText.trim().length === 0) {
       process.stdout.write('  (warning) codex returned an empty review; skipping fix step.\n');
     }
   }
 
-  // Step 3 — fix
   if (dryRun) {
-    process.stdout.write(`\n→ [3/4] (dry-run) claude addressing review for ${plan.slug}\n`);
+    process.stdout.write(`\n→ [3/4] (dry-run) ${unit.fixConsole}\n`);
   } else if (reviewText.trim().length > 0) {
-    const fixCmd = [
-      'claude',
-      '-p',
-      '--output-format',
-      'stream-json',
-      '--verbose',
-      fixPlanPrompt(plan, reviewText),
-    ];
+    const fixCmd = claudePrintCommand(unit.fixPrompt(reviewText));
     if (progress) {
-      progress.beginStep(itemId, 'fix', `claude · fix · ${plan.slug}`);
+      progress.beginStep(unit.itemId, 'fix', unit.fixLabel);
     } else {
-      process.stdout.write(`\n→ [3/4] claude addressing review for ${plan.slug}\n`);
+      process.stdout.write(`\n→ [3/4] ${unit.fixConsole}\n`);
     }
     const sinkArg = progress ?? undefined;
     const rc = await streamSubprocess({
       cmd: fixCmd,
-      logPath: path.join(logDir, '3-fix.log'),
+      logPath: path.join(unit.logDir, '3-fix.log'),
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
+      ...(signal !== undefined ? { signal } : {}),
       transformer: formatClaudeStreamLine,
     });
     if (rc !== 0) {
-      progress?.endStep(itemId, 'fix', 'failed');
-      throw new RunFailure('fix', `claude exited ${rc}`);
+      progress?.endStep(unit.itemId, 'fix', 'failed');
+      throw new RunFailure('fix', `claude exited ${rc}`, unit.prId);
     }
-    progress?.endStep(itemId, 'fix', 'done');
+    progress?.endStep(unit.itemId, 'fix', 'done');
   } else {
-    progress?.endStep(itemId, 'fix', 'skipped');
+    progress?.endStep(unit.itemId, 'fix', 'skipped');
   }
 
-  // Step 4 — commit
-  const message = planCommitMessage(plan);
   if (progress) {
-    progress.beginStep(itemId, 'commit', `git · commit · ${plan.slug}`);
+    progress.beginStep(unit.itemId, 'commit', unit.commitLabel);
   } else {
-    process.stdout.write(`\n→ [4/4] committing ${plan.slug}\n`);
+    process.stdout.write(`\n→ [4/4] ${unit.commitConsole}\n`);
   }
   if (dryRun) {
-    process.stdout.write(`  (dry-run) git add -A && git commit -m "${message}"\n`);
+    for (const repo of targetRepos) {
+      process.stdout.write(
+        `  (dry-run) git -C ${repo.path} add -A && ` +
+          `git -C ${repo.path} commit -m "${unit.commitMessage}"\n`,
+      );
+    }
     return;
   }
-  gitAddAll();
-  const commit = gitCommit(message, { capture: progress !== undefined });
-  if (commit.code !== 0) {
-    progress?.endStep(itemId, 'commit', 'failed');
-    let detail = '';
-    if (progress) {
-      const captured = (commit.stderr ?? '') + (commit.stdout ?? '');
-      const tail = captured
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-      if (tail.length > 0) detail = `: ${tail[tail.length - 1]}`;
-    }
-    throw new RunFailure('commit', `git commit exited ${commit.code}${detail}`);
+  const dirtyTargets = dirtyRepos(targetRepos);
+  if (dirtyTargets.length === 0) {
+    progress?.endStep(unit.itemId, 'commit', 'failed');
+    throw new RunFailure('commit', 'no target repo has changes to commit', unit.prId);
   }
-  progress?.endStep(itemId, 'commit', 'done');
+  const failure = commitAllTargetRepos(dirtyTargets, unit.commitMessage, progress);
+  if (failure !== null) {
+    progress?.endStep(unit.itemId, 'commit', 'failed');
+    throw new RunFailure(
+      'commit',
+      formatCommitFailureMessage({
+        repoName: failure.repo.name,
+        repoPath: failure.repo.path,
+        commitSubject: unit.commitMessage,
+        slug: unit.slug,
+        exitCode: failure.commit.code,
+        gitTail: commitGitTail(failure.commit),
+      }),
+      unit.prId,
+    );
+  }
+  progress?.endStep(unit.itemId, 'commit', 'done');
+}
+
+export async function runPr(opts: RunPrOptions): Promise<void> {
+  const { pr, plan, planPath, parentLogDir, targetRepos, dryRun, progress, signal } = opts;
+  const repoPaths = targetRepos.map((repo) => repo.path);
+  await runExecutionUnit({
+    unit: {
+      itemId: pr.id,
+      prId: pr.id,
+      slug: plan.slug,
+      banner: `PR ${pr.id} — ${pr.title}`,
+      implementConsole: `claude implementing PR ${pr.id}`,
+      reviewConsole: `codex reviewing uncommitted changes for PR ${pr.id}`,
+      fixConsole: `claude addressing review for PR ${pr.id}`,
+      commitConsole: `committing PR ${pr.id}`,
+      implementLabel: `claude · implement · PR ${pr.id}`,
+      reviewLabel: `codex · review · PR ${pr.id}`,
+      fixLabel: `claude · fix · PR ${pr.id}`,
+      commitLabel: `git · commit · PR ${pr.id}`,
+      implementPrompt: implementPrompt(pr, planPath, repoPaths),
+      reviewPrompt: reviewPrompt(pr, planPath, repoPaths),
+      fixPrompt: (reviewText) => fixPrompt(pr, reviewText),
+      commitMessage: prCommitMessage(plan, pr),
+      logDir: prLogDir(parentLogDir, pr),
+    },
+    targetRepos,
+    dryRun,
+    ...(progress !== undefined ? { progress } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+}
+
+export async function runPlanSingleUnit(opts: RunPlanSingleUnitOptions): Promise<void> {
+  const { plan, planText, parentLogDir, targetRepos, dryRun, progress, signal } = opts;
+  const repoPaths = targetRepos.map((repo) => repo.path);
+  const implementText = implementPlanPrompt(plan, planText, repoPaths);
+  await runExecutionUnit({
+    unit: {
+      itemId: plan.slug,
+      prId: null,
+      slug: plan.slug,
+      banner: `plan ${plan.slug} — ${plan.title}`,
+      implementConsole: `claude implementing ${plan.slug}`,
+      reviewConsole: `codex reviewing uncommitted changes for ${plan.slug}`,
+      fixConsole: `claude addressing review for ${plan.slug}`,
+      commitConsole: `committing ${plan.slug}`,
+      implementLabel: `claude · implement · ${plan.slug}`,
+      reviewLabel: `codex · review · ${plan.slug}`,
+      fixLabel: `claude · fix · ${plan.slug}`,
+      commitLabel: `git · commit · ${plan.slug}`,
+      implementPrompt: implementText,
+      reviewPrompt: reviewPlanPrompt(plan, repoPaths),
+      fixPrompt: (reviewText) => fixPlanPrompt(plan, reviewText),
+      commitMessage: planCommitMessage(plan),
+      logDir: parentLogDir,
+      dryRunImplementArgs: [
+        'claude',
+        '-p',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '<plan-prompt>',
+      ],
+    },
+    targetRepos,
+    dryRun,
+    ...(progress !== undefined ? { progress } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  });
 }
 
 export interface RunPlanOptions {
   plan: Plan;
   dryRun: boolean;
+  targetRepos?: readonly ResolvedWorkspaceRepo[];
   progress?: ProgressSink;
+  signal?: AbortSignal;
+}
+
+async function resolvePlanRepos(plan: Plan): Promise<ResolvedWorkspaceRepo[]> {
+  try {
+    return await resolveWorkspaceRepos(plan.target_repos);
+  } catch (err) {
+    if (err instanceof WorkspaceConfigError) {
+      const targets = plan.target_repos.length === 0 ? '(all)' : plan.target_repos.join(', ');
+      throw new WorkspaceConfigError(
+        `plan '${plan.slug}' target_repos [${targets}]: ${err.message}`,
+      );
+    }
+    throw err;
+  }
 }
 
 export async function runPlan(opts: RunPlanOptions): Promise<void> {
-  const { plan, dryRun, progress } = opts;
+  const { plan, dryRun, progress, signal } = opts;
+  const targetRepos = opts.targetRepos ?? (await resolvePlanRepos(plan));
   const planText = await fs.readFile(planFilePath(plan), 'utf8');
   const prs = parsePrs(planText);
   const parentLogDir = planLogDir(plan);
   await fs.mkdir(parentLogDir, { recursive: true });
 
   if (prs.length === 0) {
-    await runPlanSingleUnit({
-      plan,
-      planText,
-      parentLogDir,
-      dryRun,
-      ...(progress !== undefined ? { progress } : {}),
-    });
+    if (singleUnitDoneInRepos(plan, targetRepos)) {
+      progress?.markItemDone(plan.slug);
+      return;
+    }
+    progress?.beginItem(plan.slug);
+    try {
+      await runPlanSingleUnit({
+        plan,
+        planText,
+        parentLogDir,
+        targetRepos,
+        dryRun,
+        ...(progress !== undefined ? { progress } : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      });
+    } catch (err) {
+      progress?.endItem(plan.slug, 'failed');
+      throw err;
+    }
+    progress?.endItem(plan.slug, 'done');
     return;
   }
 
-  const done = alreadyDone(plan);
+  const done = alreadyDoneInRepos(plan, targetRepos);
   if (progress) {
     for (const pr of prs) {
       if (done.has(pr.id)) progress.markItemDone(pr.id);
@@ -445,13 +557,13 @@ export async function runPlan(opts: RunPlanOptions): Promise<void> {
         plan,
         planPath: plan.path,
         parentLogDir,
+        targetRepos,
         dryRun,
         ...(progress !== undefined ? { progress } : {}),
+        ...(signal !== undefined ? { signal } : {}),
       });
     } catch (err) {
-      if (err instanceof RunFailure) {
-        progress?.endItem(pr.id, 'failed');
-      }
+      progress?.endItem(pr.id, 'failed');
       throw err;
     }
     progress?.endItem(pr.id, 'done');

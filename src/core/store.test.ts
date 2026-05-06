@@ -2,15 +2,23 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { TodoStore } from './store.js';
-import { InProgressLocked, type Plan, PlanNotFound, SlugCollision } from './types.js';
+import { TodoStore, TodoStoreFormatError } from './store.js';
+import {
+  ImplementingLocked,
+  type Plan,
+  PlanNotFound,
+  PlanSelfMerge,
+  SlugCollision,
+} from './types.js';
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
   return {
     slug: 'demo-plan',
     title: 'Demo plan',
     path: '.lauren/plans/demo-plan.md',
-    status: 'pending',
+    target_repos: [],
+    status: 'ready',
+    cancel_requested: false,
     created_at: '2026-05-08T12:00:00Z',
     started_at: null,
     finished_at: null,
@@ -39,6 +47,45 @@ describe('TodoStore', () => {
     expect(await store.read()).toEqual([]);
   });
 
+  test('read() throws a typed error for malformed JSON', async () => {
+    await fs.writeFile(path.join(tmpDir, 'todo.json'), '{', 'utf8');
+    await expect(store.read()).rejects.toBeInstanceOf(TodoStoreFormatError);
+    await expect(store.read()).rejects.toThrow(/malformed JSON/);
+  });
+
+  test('read() throws a typed error for unsupported schema versions', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'todo.json'),
+      JSON.stringify({ version: 999, plans: [] }),
+      'utf8',
+    );
+    await expect(store.read()).rejects.toBeInstanceOf(TodoStoreFormatError);
+    await expect(store.read()).rejects.toThrow(/schema version 999 not supported/);
+  });
+
+  test('read() migrates legacy todo statuses (pending → ready, in_progress → implementing)', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'todo.json'),
+      JSON.stringify({
+        version: 1,
+        plans: [
+          { slug: 'a', title: 'A', path: '.lauren/plans/a.md', status: 'pending' },
+          { slug: 'b', title: 'B', path: '.lauren/plans/b.md', status: 'in_progress' },
+          { slug: 'c', title: 'C', path: '.lauren/plans/c.md', status: 'done' },
+        ],
+      }),
+      'utf8',
+    );
+    const plans = await store.read();
+    expect(plans.map((p) => [p.slug, p.status])).toEqual([
+      ['a', 'ready'],
+      ['b', 'implementing'],
+      ['c', 'done'],
+    ]);
+    // cancel_requested defaults to false when missing.
+    expect(plans.every((p) => p.cancel_requested === false)).toBe(true);
+  });
+
   test('add() persists a plan and read() returns it', async () => {
     const plan = makePlan();
     await store.add(plan);
@@ -63,15 +110,15 @@ describe('TodoStore', () => {
     await expect(store.remove('ghost')).rejects.toBeInstanceOf(PlanNotFound);
   });
 
-  test('remove() throws InProgressLocked when in_progress and allowInProgress is unset', async () => {
-    await store.add(makePlan({ slug: 'running', status: 'in_progress' }));
-    await expect(store.remove('running')).rejects.toBeInstanceOf(InProgressLocked);
+  test('remove() throws ImplementingLocked when implementing and allowImplementing is unset', async () => {
+    await store.add(makePlan({ slug: 'running', status: 'implementing' }));
+    await expect(store.remove('running')).rejects.toBeInstanceOf(ImplementingLocked);
     expect(await store.read()).toHaveLength(1);
   });
 
-  test('remove({allowInProgress: true}) succeeds for an in_progress plan', async () => {
-    await store.add(makePlan({ slug: 'running', status: 'in_progress' }));
-    const removed = await store.remove('running', { allowInProgress: true });
+  test('remove({allowImplementing: true}) succeeds for an implementing plan', async () => {
+    await store.add(makePlan({ slug: 'running', status: 'implementing' }));
+    const removed = await store.remove('running', { allowImplementing: true });
     expect(removed.slug).toBe('running');
     expect(await store.read()).toEqual([]);
   });
@@ -89,13 +136,13 @@ describe('TodoStore', () => {
     expect(updated.status).toBe('done');
   });
 
-  test('update() honors the in_progress lock identically to remove', async () => {
-    await store.add(makePlan({ slug: 'running', status: 'in_progress' }));
+  test('update() honors the implementing lock identically to remove', async () => {
+    await store.add(makePlan({ slug: 'running', status: 'implementing' }));
     await expect(store.update('running', { title: 'Nope' })).rejects.toBeInstanceOf(
-      InProgressLocked,
+      ImplementingLocked,
     );
     await expect(
-      store.update('running', { title: 'Yes' }, { allowInProgress: true }),
+      store.update('running', { title: 'Yes' }, { allowImplementing: true }),
     ).resolves.toMatchObject({ title: 'Yes' });
   });
 
@@ -127,37 +174,93 @@ describe('TodoStore', () => {
       expect((await store.read()).map((p) => p.slug)).toEqual(before);
     });
 
-    test('move() of an in_progress plan respects the lock', async () => {
-      await store.update('b', { status: 'in_progress' });
-      await expect(store.move('b', { toFront: true })).rejects.toBeInstanceOf(InProgressLocked);
+    test('move() of an implementing plan respects the lock', async () => {
+      await store.update('b', { status: 'implementing' });
+      await expect(store.move('b', { toFront: true })).rejects.toBeInstanceOf(ImplementingLocked);
     });
   });
 
-  describe('reorderPending()', () => {
-    test('accepts an exact permutation of pending slugs', async () => {
+  describe('reorderReady()', () => {
+    test('accepts an exact permutation of ready slugs', async () => {
       await store.add(makePlan({ slug: 'a' }));
       await store.add(makePlan({ slug: 'b' }));
       await store.add(makePlan({ slug: 'c' }));
-      await store.reorderPending(['c', 'a', 'b']);
+      await store.reorderReady(['c', 'a', 'b']);
       expect((await store.read()).map((p) => p.slug)).toEqual(['c', 'a', 'b']);
     });
 
     test('throws when slugs are missing or extra', async () => {
       await store.add(makePlan({ slug: 'a' }));
       await store.add(makePlan({ slug: 'b' }));
-      await expect(store.reorderPending(['a'])).rejects.toThrow(/reorder mismatch/);
-      await expect(store.reorderPending(['a', 'b', 'c'])).rejects.toThrow(/reorder mismatch/);
+      await expect(store.reorderReady(['a'])).rejects.toThrow(/reorder mismatch/);
+      await expect(store.reorderReady(['a', 'b', 'c'])).rejects.toThrow(/reorder mismatch/);
     });
 
-    test('preserves the position of non-pending plans', async () => {
+    test('preserves the position of non-ready plans', async () => {
       await store.add(makePlan({ slug: 'a' }));
       await store.add(makePlan({ slug: 'done1', status: 'done' }));
       await store.add(makePlan({ slug: 'b' }));
       await store.add(makePlan({ slug: 'c' }));
-      await store.reorderPending(['c', 'b', 'a']);
-      // Pending slots are filled in encounter order with the new permutation;
+      await store.reorderReady(['c', 'b', 'a']);
+      // Ready slots are filled in encounter order with the new permutation;
       // the 'done1' plan stays in its slot (index 1).
       expect((await store.read()).map((p) => p.slug)).toEqual(['c', 'done1', 'b', 'a']);
+    });
+  });
+
+  describe('atomicMerge()', () => {
+    test('rejects self-merges before mutating the queue or files', async () => {
+      await store.add(makePlan({ slug: 'a', title: 'A' }));
+
+      await expect(
+        store.atomicMerge({
+          targetSlug: 'a',
+          fromSlug: 'a',
+          newTitle: 'Merged',
+          bodyWriter: async () => {
+            throw new Error('body writer should not run');
+          },
+        }),
+      ).rejects.toBeInstanceOf(PlanSelfMerge);
+
+      expect(await store.read()).toMatchObject([{ slug: 'a', title: 'A' }]);
+    });
+
+    test('rolls back body writes when the queue write fails', async () => {
+      const stateDir = path.join(tmpDir, 'readonly-state');
+      await fs.mkdir(stateDir);
+      const failingStore = new TodoStore({
+        path: path.join(stateDir, 'todo.json'),
+        lockPath: path.join(tmpDir, 'todo.json.lock'),
+      });
+      await failingStore.add(makePlan({ slug: 'a', title: 'A' }));
+      await failingStore.add(makePlan({ slug: 'b', title: 'B' }));
+
+      const targetFile = path.join(tmpDir, 'target.md');
+      await fs.writeFile(targetFile, 'original\n', 'utf8');
+      await fs.chmod(stateDir, 0o555);
+      try {
+        await expect(
+          failingStore.atomicMerge({
+            targetSlug: 'a',
+            fromSlug: 'b',
+            newTitle: 'Merged',
+            bodyWriter: async () => {
+              await fs.writeFile(targetFile, 'merged\n', 'utf8');
+              return {
+                rollback: async () => {
+                  await fs.writeFile(targetFile, 'original\n', 'utf8');
+                },
+              };
+            },
+          }),
+        ).rejects.toThrow();
+      } finally {
+        await fs.chmod(stateDir, 0o755);
+      }
+
+      expect(await fs.readFile(targetFile, 'utf8')).toBe('original\n');
+      expect((await failingStore.read()).map((p) => p.slug)).toEqual(['a', 'b']);
     });
   });
 });

@@ -2,11 +2,14 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
-import { LOCK_PATH, TODO_PATH } from './paths.js';
+import { DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
 import {
-  InProgressLocked,
+  ImplementingLocked,
+  migratePlanRecord,
   type Plan,
   PlanNotFound,
+  PlanNotReady,
+  PlanSelfMerge,
   SCHEMA_VERSION,
   SlugCollision,
   type TodoFile,
@@ -16,7 +19,27 @@ interface MoveOptions {
   before?: string;
   toFront?: boolean;
   toBack?: boolean;
-  allowInProgress?: boolean;
+  allowImplementing?: boolean;
+}
+
+interface MergeBodyWrite {
+  rollback?: () => Promise<void>;
+  finalize?: () => Promise<void>;
+}
+
+function mergeTargetRepos(a: readonly string[], b: readonly string[]): string[] {
+  if (a.length === 0 || b.length === 0) return [];
+  return [...new Set([...a, ...b])];
+}
+
+export class TodoStoreFormatError extends Error {
+  readonly path: string;
+
+  constructor(filePath: string, message: string) {
+    super(`${filePath}: ${message}`);
+    this.name = 'TodoStoreFormatError';
+    this.path = filePath;
+  }
 }
 
 async function ensureLockFile(lockPath: string): Promise<void> {
@@ -29,9 +52,10 @@ export class TodoStore {
   readonly path: string;
   readonly lockPath: string;
 
-  constructor(opts: { path?: string; lockPath?: string } = {}) {
-    this.path = opts.path ?? TODO_PATH;
-    this.lockPath = opts.lockPath ?? LOCK_PATH;
+  constructor(opts: { path?: string; lockPath?: string; context?: LaurenContext } = {}) {
+    const context = opts.context ?? DEFAULT_CONTEXT;
+    this.path = opts.path ?? context.todoPath;
+    this.lockPath = opts.lockPath ?? context.lockPath;
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -63,16 +87,15 @@ export class TodoStore {
       data = JSON.parse(raw) as TodoFile;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`error: ${this.path} is malformed JSON: ${msg}\n`);
-      process.exit(1);
+      throw new TodoStoreFormatError(this.path, `malformed JSON: ${msg}`);
     }
     if (data.version !== SCHEMA_VERSION) {
-      process.stderr.write(
-        `error: ${this.path} schema version ${JSON.stringify(data.version)} not supported (expected ${SCHEMA_VERSION})\n`,
+      throw new TodoStoreFormatError(
+        this.path,
+        `schema version ${JSON.stringify(data.version)} not supported (expected ${SCHEMA_VERSION})`,
       );
-      process.exit(1);
     }
-    return Array.isArray(data.plans) ? data.plans : [];
+    return Array.isArray(data.plans) ? data.plans.map((p) => migratePlanRecord(p, 'todo')) : [];
   }
 
   private async writeUnlocked(plans: Plan[]): Promise<void> {
@@ -106,14 +129,14 @@ export class TodoStore {
     });
   }
 
-  async remove(slug: string, opts: { allowInProgress?: boolean } = {}): Promise<Plan> {
+  async remove(slug: string, opts: { allowImplementing?: boolean } = {}): Promise<Plan> {
     return this.withLock(async () => {
       const plans = await this.readUnlocked();
       const idx = plans.findIndex((p) => p.slug === slug);
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
-      if (plan.status === 'in_progress' && !opts.allowInProgress) {
-        throw new InProgressLocked(slug);
+      if (plan.status === 'implementing' && !opts.allowImplementing) {
+        throw new ImplementingLocked(slug);
       }
       plans.splice(idx, 1);
       await this.writeUnlocked(plans);
@@ -124,15 +147,15 @@ export class TodoStore {
   async update(
     slug: string,
     fields: Partial<Omit<Plan, 'slug'>>,
-    opts: { allowInProgress?: boolean } = {},
+    opts: { allowImplementing?: boolean } = {},
   ): Promise<Plan> {
     return this.withLock(async () => {
       const plans = await this.readUnlocked();
       const idx = plans.findIndex((p) => p.slug === slug);
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
-      if (plan.status === 'in_progress' && !opts.allowInProgress) {
-        throw new InProgressLocked(slug);
+      if (plan.status === 'implementing' && !opts.allowImplementing) {
+        throw new ImplementingLocked(slug);
       }
       const updated: Plan = { ...plan, ...fields, slug: plan.slug };
       plans[idx] = updated;
@@ -141,28 +164,32 @@ export class TodoStore {
     });
   }
 
-  async reorderPending(order: string[]): Promise<void> {
+  /**
+   * Reorder plans currently in `ready` status. Other statuses keep their
+   * positions. Called by the brain when the AI returns an organize decision.
+   */
+  async reorderReady(order: string[]): Promise<void> {
     await this.withLock(async () => {
       const plans = await this.readUnlocked();
-      const pendingSlugs = plans.filter((p) => p.status === 'pending').map((p) => p.slug);
+      const readySlugs = plans.filter((p) => p.status === 'ready').map((p) => p.slug);
       const orderSet = new Set(order);
-      const pendingSet = new Set(pendingSlugs);
-      const missing = pendingSlugs.filter((s) => !orderSet.has(s)).sort();
-      const extra = order.filter((s) => !pendingSet.has(s)).sort();
-      if (missing.length !== 0 || extra.length !== 0 || order.length !== pendingSlugs.length) {
+      const readySet = new Set(readySlugs);
+      const missing = readySlugs.filter((s) => !orderSet.has(s)).sort();
+      const extra = order.filter((s) => !readySet.has(s)).sort();
+      if (missing.length !== 0 || extra.length !== 0 || order.length !== readySlugs.length) {
         throw new Error(
           `reorder mismatch: missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`,
         );
       }
       const slugToPlan = new Map<string, Plan>();
       for (const p of plans) {
-        if (p.status === 'pending') slugToPlan.set(p.slug, p);
+        if (p.status === 'ready') slugToPlan.set(p.slug, p);
       }
       const queue = order.map((s) => slugToPlan.get(s)!);
       const result: Plan[] = [];
       let i = 0;
       for (const p of plans) {
-        if (p.status === 'pending') {
+        if (p.status === 'ready') {
           result.push(queue[i++]!);
         } else {
           result.push(p);
@@ -172,14 +199,64 @@ export class TodoStore {
     });
   }
 
+  /**
+   * Atomically merge `fromSlug` into `targetSlug`: both must be ready at
+   * lock acquisition. Inside the lock, the caller's `bodyWriter` runs (it
+   * typically rewrites the target's plan file on disk), the target's title
+   * is updated, and the from-plan is removed from the queue. The on-disk
+   * .md for the from-plan is the caller's responsibility to clean up.
+   */
+  async atomicMerge(args: {
+    targetSlug: string;
+    fromSlug: string;
+    newTitle: string;
+    bodyWriter: (target: Plan) => Promise<MergeBodyWrite | undefined>;
+  }): Promise<{ target: Plan; from: Plan }> {
+    if (args.targetSlug === args.fromSlug) {
+      throw new PlanSelfMerge(args.targetSlug);
+    }
+    return this.withLock(async () => {
+      const plans = await this.readUnlocked();
+      const tIdx = plans.findIndex((p) => p.slug === args.targetSlug);
+      if (tIdx === -1) throw new PlanNotFound(args.targetSlug);
+      const target = plans[tIdx]!;
+      if (target.status !== 'ready') throw new PlanNotReady(target.slug, target.status);
+
+      const fIdx = plans.findIndex((p) => p.slug === args.fromSlug);
+      if (fIdx === -1) throw new PlanNotFound(args.fromSlug);
+      const from = plans[fIdx]!;
+      if (from.status !== 'ready') throw new PlanNotReady(from.slug, from.status);
+
+      const bodyWrite = await args.bodyWriter(target);
+      const updatedTarget: Plan = {
+        ...target,
+        title: args.newTitle,
+        target_repos: mergeTargetRepos(target.target_repos, from.target_repos),
+      };
+      try {
+        plans[tIdx] = updatedTarget;
+        // Recompute fromIdx in case it shifted (it can't here, since neither
+        // splice has happened yet, but be explicit).
+        const fIdx2 = plans.findIndex((p) => p.slug === args.fromSlug);
+        plans.splice(fIdx2, 1);
+        await this.writeUnlocked(plans);
+      } catch (err) {
+        await bodyWrite?.rollback?.().catch(() => undefined);
+        throw err;
+      }
+      await bodyWrite?.finalize?.();
+      return { target: updatedTarget, from };
+    });
+  }
+
   async move(slug: string, opts: MoveOptions = {}): Promise<void> {
     await this.withLock(async () => {
       const plans = await this.readUnlocked();
       const idx = plans.findIndex((p) => p.slug === slug);
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
-      if (plan.status === 'in_progress' && !opts.allowInProgress) {
-        throw new InProgressLocked(slug);
+      if (plan.status === 'implementing' && !opts.allowImplementing) {
+        throw new ImplementingLocked(slug);
       }
       plans.splice(idx, 1);
       if (opts.toFront) {
@@ -189,7 +266,6 @@ export class TodoStore {
       } else if (opts.before !== undefined) {
         const target = plans.findIndex((p) => p.slug === opts.before);
         if (target === -1) {
-          plans.splice(idx, 0, plan);
           throw new PlanNotFound(opts.before);
         }
         plans.splice(target, 0, plan);

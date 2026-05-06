@@ -8,17 +8,19 @@
     "node": ">=20"
   },
   "bin": {
-    "lauren": "dist/bin/lauren.js",
-    "vibe": "dist/bin/vibe.js"
+    "lauren": "dist/bin/lauren.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/bin/vibe.js",
+    "!dist/bin/vibe.js.map"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/bin/lauren.js dist/bin/vibe.js",
+    "build": "tsc && chmod +x dist/bin/lauren.js",
     "watch": "tsc --watch",
     "clean": "rm -rf dist",
     "format": "biome format --write",
+    "format:check": "biome format",
     "lint": "biome lint",
     "check": "biome check --write",
     "test": "vitest run",
