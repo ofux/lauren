@@ -246,18 +246,42 @@ implementations, etc.).
 
 Plans live in `.lauren/plans/`.
 
+Every plan starts with a YAML frontmatter block. `lauren organize` reads only
+this block to decide where to insert the plan or whether to merge it into an
+existing one — the brain reaches for the full body only when descriptions are
+not enough. `name` MUST equal the slug; `description` is a 3–4 line `|` block
+scalar covering what the plan does, why, and what files/areas it touches.
+`lauren _register` rejects plans whose frontmatter is missing or whose `name`
+does not match the slug.
+
 A normal plan is one execution unit and produces one commit:
 
 ```md
+---
+name: add-password-reset
+description: |
+  Adds password reset flow with token model, email-based reset
+  endpoint, and reset form UI.
+  Touches src/auth/, src/email/, src/components/auth/.
+---
+
 # Add password reset
 
 ...
 ```
 
-A multi-PR plan is split into separate commits by headings that match this exact
-format:
+A multi-PR plan keeps the same frontmatter and is split into separate commits
+by headings that match this exact format:
 
 ```md
+---
+name: password-reset-suite
+description: |
+  Ships password reset across three commits: token model,
+  request endpoint, and the reset form UI.
+  Touches src/auth/, src/email/, src/components/auth/.
+---
+
 ### PR 1.1 — Add reset token model
 
 ### PR 1.2 — Add reset request endpoint

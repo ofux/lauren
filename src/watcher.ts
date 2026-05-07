@@ -3,6 +3,7 @@ import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
 import { BRAIN_LOCK_PATH, VIBE_LOCK_PATH } from './core/paths.js';
+import { materializePrs, type PrEntry } from './core/prs.js';
 import type { TodoStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
@@ -12,7 +13,7 @@ import {
   PlanNotFound,
   planFilePath,
 } from './core/types.js';
-import { parsePrs, RunFailure, runPlan } from './executor.js';
+import { RunFailure, runPlan } from './executor.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 
 export const IDLE_POLL_SECONDS = 3.0;
@@ -69,11 +70,13 @@ export async function tryAcquireBrainLock(): Promise<(() => Promise<void>) | nul
   }
 }
 
-function runtimeItemsForPlan(plan: Plan, planText: string): PlanItem[] {
-  const prs = parsePrs(planText);
-  return prs.length > 0
-    ? prs.map((pr) => ({ id: pr.id, title: pr.title }))
-    : [{ id: plan.slug, title: plan.title }];
+function runtimeItemsForPlan(plan: Plan): PlanItem[] {
+  if (plan.prs && plan.prs.length > 0) {
+    return plan.prs
+      .filter((pr) => pr.status !== 'orphaned')
+      .map((pr) => ({ id: pr.id, title: pr.title }));
+  }
+  return [{ id: plan.slug, title: plan.title }];
 }
 
 function failureFromError(err: unknown): PlanFailure {
@@ -203,6 +206,22 @@ export async function watcherLoop(
       continue;
     }
 
+    let planText: string;
+    try {
+      planText = await fs.readFile(planFilePath(next), 'utf8');
+    } catch (err) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        await markPlanMissing(store, next);
+        continue;
+      }
+      throw err;
+    }
+
+    // Re-parse PRs from the (possibly-edited) plan file and reconcile with
+    // stored state. This is the only place per-PR state is materialized at
+    // execution time — everything downstream trusts `claimed.prs`.
+    const reconciledPrs = materializePrs(planText, next.prs);
+
     let claimed: Plan;
     try {
       claimed = await store.update(next.slug, {
@@ -210,6 +229,7 @@ export async function watcherLoop(
         started_at: nowIso(),
         finished_at: null,
         failure: null,
+        prs: reconciledPrs,
       });
     } catch (err) {
       if (err instanceof ImplementingLocked || err instanceof PlanNotFound) {
@@ -236,13 +256,27 @@ export async function watcherLoop(
     if (cancelController.signal.aborted) merged.abort();
 
     try {
-      const planText = await fs.readFile(planFilePath(claimed), 'utf8');
       const planProgress = newPlanRuntimeState({
-        items: runtimeItemsForPlan(claimed, planText),
+        items: runtimeItemsForPlan(claimed),
         planTitle: claimed.title,
       });
       runtime.setRunning(await store.read(), claimed, planProgress);
-      await runPlan({ plan: claimed, dryRun: false, progress: runtime, signal: merged.signal });
+      const onPrUpdate = async (prs: PrEntry[]): Promise<void> => {
+        try {
+          await store.update(claimed.slug, { prs }, { allowImplementing: true });
+        } catch (err) {
+          if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+            throw err;
+          }
+        }
+      };
+      await runPlan({
+        plan: claimed,
+        dryRun: false,
+        progress: runtime,
+        signal: merged.signal,
+        onPrUpdate,
+      });
     } catch (err) {
       signal.removeEventListener('abort', onOuter);
       cancelController.signal.removeEventListener('abort', onCancel);

@@ -17,6 +17,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     started_at: null,
     finished_at: null,
     failure: null,
+    prs: null,
     ...overrides,
   };
 }

@@ -1,3 +1,4 @@
+import { promises as fs } from 'node:fs';
 import { Box, Text, useApp, useInput } from 'ink';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -6,7 +7,8 @@ import { type CancelOutcome, cancelPlan, isCancellable } from '../cancel.js';
 import type { InboxStore } from '../core/inbox.js';
 import type { TodoStore } from '../core/store.js';
 import { fmtAge } from '../core/time.js';
-import type { Plan, PlanStatus } from '../core/types.js';
+import { type Plan, type PlanStatus, planFilePath } from '../core/types.js';
+import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
 import { Spinner } from './Spinner.js';
 
 const POLL_INTERVAL_MS = 500;
@@ -98,6 +100,68 @@ function PlanTable({
           </Box>
         );
       })}
+    </Box>
+  );
+}
+
+type DescriptionState =
+  | { kind: 'loading' }
+  | { kind: 'ok'; text: string }
+  | { kind: 'fallback'; text: string };
+
+function DescriptionPanel({ plan }: { plan: Plan }): React.ReactElement {
+  const [state, setState] = useState<DescriptionState>({ kind: 'loading' });
+  const filePath = planFilePath(plan);
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ kind: 'loading' });
+    void (async () => {
+      let raw: string;
+      try {
+        raw = await fs.readFile(filePath, 'utf8');
+      } catch (err: unknown) {
+        if (cancelled) return;
+        if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+          setState({ kind: 'fallback', text: '(plan file missing)' });
+        } else {
+          const msg = err instanceof Error ? err.message : String(err);
+          setState({ kind: 'fallback', text: `(failed to read plan: ${msg})` });
+        }
+        return;
+      }
+      if (cancelled) return;
+      const { frontmatter } = parsePlanFrontmatter(raw);
+      if (frontmatter && frontmatter.description.trim() !== '') {
+        setState({ kind: 'ok', text: frontmatter.description });
+      } else {
+        setState({ kind: 'fallback', text: '(no summary in plan)' });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath]);
+
+  return (
+    <Box marginTop={1} borderStyle="round" borderColor="gray" paddingX={2} flexDirection="column">
+      <Text bold dimColor>
+        summary — {plan.slug}
+      </Text>
+      {state.kind === 'loading' ? (
+        <Text dimColor italic>
+          loading…
+        </Text>
+      ) : state.kind === 'ok' ? (
+        state.text.split('\n').map((line, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: lines are stable for this render
+          <Text key={i}>{line}</Text>
+        ))
+      ) : (
+        <Text dimColor italic>
+          {state.text}
+        </Text>
+      )}
     </Box>
   );
 }
@@ -253,6 +317,7 @@ export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactEle
       ) : (
         <PlanTable rows={rows} selectedIndex={selectedIndex} />
       )}
+      {currentRow && <DescriptionPanel plan={currentRow.plan} />}
       <HelpFooter hasRows={rows.length > 0} selectedCancellable={selectedCancellable} />
       {view.kind === 'confirm' && (
         <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>

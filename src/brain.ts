@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { materializePrs } from './core/prs.js';
 import type { TodoStore } from './core/store.js';
 import {
   ImplementingLocked,
@@ -11,10 +12,12 @@ import {
 } from './core/types.js';
 import { BRAIN_ORGANIZE_PROMPT, BRAIN_PLACE_PROMPT } from './lauren-prompts.js';
 import { runClaudeOneshotJson } from './proc/claude.js';
+import { parsePlanFrontmatter } from './util/planFrontmatter.js';
 
-interface ReadyWithBody {
+interface ReadySummary {
   plan: Plan;
-  body: string;
+  description: string;
+  fromFallback: boolean;
 }
 
 interface PlaceInsertDecision {
@@ -68,31 +71,50 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
 
-async function readReadyWithBodies(store: TodoStore): Promise<ReadyWithBody[]> {
-  const out: ReadyWithBody[] = [];
+export function summarizeBody(raw: string): { description: string; fromFallback: boolean } {
+  const { frontmatter, body } = parsePlanFrontmatter(raw);
+  if (frontmatter && frontmatter.description.trim() !== '') {
+    return { description: frontmatter.description, fromFallback: false };
+  }
+  const fallbackSrc = frontmatter ? body : raw;
+  const lines = fallbackSrc
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() !== '')
+    .slice(0, 10);
+  const excerpt = lines.length > 0 ? lines.join('\n') : '(plan body is empty)';
+  return {
+    description: `(no frontmatter — fallback excerpt)\n${excerpt}`,
+    fromFallback: true,
+  };
+}
+
+export async function readReadySummaries(store: TodoStore): Promise<ReadySummary[]> {
+  const out: ReadySummary[] = [];
   for (const p of await store.read()) {
     if (p.status !== 'ready') continue;
-    let body: string;
+    let raw: string;
     try {
-      body = await fs.readFile(planFilePath(p), 'utf8');
+      raw = await fs.readFile(planFilePath(p), 'utf8');
     } catch (err: unknown) {
       if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-        body = '(plan file missing)';
-      } else {
-        throw err;
+        out.push({ plan: p, description: '(plan file missing)', fromFallback: true });
+        continue;
       }
+      throw err;
     }
-    out.push({ plan: p, body });
+    const { description, fromFallback } = summarizeBody(raw);
+    out.push({ plan: p, description, fromFallback });
   }
   return out;
 }
 
-function formatReadyForBrain(ready: ReadyWithBody[]): string {
+export function formatReadyForBrain(ready: ReadySummary[]): string {
   if (ready.length === 0) return '(queue is empty)';
   return ready
     .map(
-      ({ plan, body }, i) =>
-        `### Ready plan #${i} — slug: \`${plan.slug}\` — title: ${plan.title}\n\n${body}`,
+      ({ plan, description }, i) =>
+        `### Ready plan #${i} — slug: \`${plan.slug}\` — title: ${plan.title} — path: \`${plan.path}\`\n\n${description}`,
     )
     .join('\n\n---\n\n');
 }
@@ -151,14 +173,20 @@ export async function brainPlacePlan(
   newBody: string,
   signal?: AbortSignal,
 ): Promise<PlaceDecision> {
-  const ready = await readReadyWithBodies(store);
+  const ready = await readReadySummaries(store);
   const others = ready.filter((p) => p.plan.slug !== newPlan.slug);
+  const { description: newDescription } = summarizeBody(newBody);
+  const newSummary: ReadySummary = {
+    plan: newPlan,
+    description: newDescription,
+    fromFallback: false,
+  };
   const userPrompt =
     `## Current queue (ready only, in order)\n\n` +
     `${formatReadyForBrain(others)}\n\n` +
     `---\n\n` +
-    `## New plan just registered (slug: \`${newPlan.slug}\`, title: ${newPlan.title})\n\n` +
-    `${newBody}\n\n` +
+    `## New plan just registered\n\n` +
+    `${formatReadyForBrain([newSummary])}\n\n` +
     `Decide: insert at a position among the ${others.length} ready plan(s), ` +
     `or merge into one of them. Return the JSON object.`;
   const result = await runClaudeOneshotJson({
@@ -172,8 +200,8 @@ export async function brainPlacePlan(
 export async function brainOrganizeQueue(
   store: TodoStore,
   signal?: AbortSignal,
-): Promise<{ decision: OrganizeDecision; ready: ReadyWithBody[] }> {
-  const ready = await readReadyWithBodies(store);
+): Promise<{ decision: OrganizeDecision; ready: ReadySummary[] }> {
+  const ready = await readReadySummaries(store);
   const userPrompt =
     `## Ready queue (in order)\n\n` +
     `${formatReadyForBrain(ready)}\n\n` +
@@ -334,6 +362,7 @@ export async function applyPlaceDecision(
         targetSlug: decision.targetSlug,
         fromSlug: newPlan.slug,
         newTitle: decision.mergedTitle,
+        newPrs: (target) => materializePrs(decision.mergedMarkdown, target.prs),
         bodyWriter: async (target) => {
           const targetPath = planFilePath(target);
           return replacePlanFileWithRollback(targetPath, decision.mergedMarkdown);
@@ -438,6 +467,7 @@ export async function applyOrganizeDecision(
           targetSlug: op.into,
           fromSlug: op.fromSlug,
           newTitle: op.mergedTitle,
+          newPrs: (target) => materializePrs(op.mergedMarkdown, target.prs),
           bodyWriter: async (target) => {
             const targetPath = planFilePath(target);
             return replacePlanFileWithRollback(targetPath, op.mergedMarkdown);

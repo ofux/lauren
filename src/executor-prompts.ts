@@ -1,9 +1,7 @@
+import type { PR } from './core/prs.js';
 import type { Plan } from './core/types.js';
 
-export interface PR {
-  id: string;
-  title: string;
-}
+export type { PR };
 
 function repoInstruction(repoPaths: readonly string[]): string {
   if (repoPaths.length === 0) return '';

@@ -3,6 +3,7 @@ import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
 import { DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
+import type { PrEntry } from './prs.js';
 import {
   ImplementingLocked,
   migratePlanRecord,
@@ -210,6 +211,13 @@ export class TodoStore {
     targetSlug: string;
     fromSlug: string;
     newTitle: string;
+    /**
+     * Replacement PR list for the target. Pass a function to compute it
+     * from the locked-in target state (e.g. reconcile against the target's
+     * existing PR statuses); pass an array/null to overwrite directly.
+     * Omit to leave the target's PR list unchanged.
+     */
+    newPrs?: PrEntry[] | null | ((target: Plan) => PrEntry[] | null);
     bodyWriter: (target: Plan) => Promise<MergeBodyWrite | undefined>;
   }): Promise<{ target: Plan; from: Plan }> {
     if (args.targetSlug === args.fromSlug) {
@@ -228,10 +236,12 @@ export class TodoStore {
       if (from.status !== 'ready') throw new PlanNotReady(from.slug, from.status);
 
       const bodyWrite = await args.bodyWriter(target);
+      const resolvedPrs = typeof args.newPrs === 'function' ? args.newPrs(target) : args.newPrs;
       const updatedTarget: Plan = {
         ...target,
         title: args.newTitle,
         target_repos: mergeTargetRepos(target.target_repos, from.target_repos),
+        ...(args.newPrs !== undefined ? { prs: resolvedPrs ?? null } : {}),
       };
       try {
         plans[tIdx] = updatedTarget;

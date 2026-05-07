@@ -180,7 +180,28 @@ description and the codebase you can explore.
    \`add-auth-flow\`, \`fix-rate-limit-bug\`, \`extract-prompt-builders\`.
    Slug regex: \`^[a-z0-9][a-z0-9-]{1,48}$\`.
 
-7. Write the plan to \`.lauren/plans/<slug>.md\`.
+7. Write the plan to \`.lauren/plans/<slug>.md\`. The file MUST start
+   with a YAML frontmatter block (no leading blank lines), followed by
+   the plan body:
+
+       ---
+       name: <slug>
+       description: |
+         3–4 lines describing what this plan does, why it matters,
+         and which files/areas it touches. The \`lauren organize\`
+         brain reads this summary to decide placement and to spot
+         overlap with existing plans without reading the full body.
+       ---
+
+       # Plan title …
+
+   Rules:
+   - \`name\` MUST equal the slug you chose in step 6.
+   - \`description\` MUST be a \`|\` block scalar of 3–4 non-empty
+     lines (≤ ~80 chars each). Cover: what the plan does, why, and the
+     concrete files/areas it touches. Avoid filler like "This plan
+     adds…"; lead with the verb.
+   - No other top-level frontmatter keys.
 
 8. Register it in the queue by running, via your Bash tool:
 
@@ -230,6 +251,9 @@ Whether single-unit or multi-PR, every plan must include:
   Ask, or list under a "Decisions still to make" section in the plan.
 - DO NOT skip the \`lauren _register\` call. The plan is invisible to
   the queue until you register it.
+- DO NOT omit the frontmatter block. \`lauren _register\` rejects plan
+  files where \`name\` is missing, \`name\` does not equal the slug, or
+  \`description\` is empty.
 `;
 
 export const BRAIN_PLACE_PROMPT = `# Session task: place a new plan in the queue
@@ -238,9 +262,15 @@ You are the todo-list brain for an autonomous coding agent's queue.
 
 ## Inputs you will receive
 
-- The full markdown of every READY plan currently in the queue
-  (each with slug and title). Earlier plans run first.
-- The new plan that was just registered (slug, title, full markdown).
+For each READY plan currently in the queue (earlier plans run first):
+slug, title, file path, and a 3–4 line description.
+
+For the new plan that was just registered: slug, title, file path, and
+description — the same shape.
+
+You see only descriptions, not full bodies. For insert decisions,
+prefer the description; use your \`Read\` tool only when overlap looks
+plausible but is ambiguous.
 
 Plans that are currently implementing, done, failed, or cancelled are
 intentionally hidden from you.
@@ -264,6 +294,23 @@ to touch, and Acceptance criteria to reflect the union of both plans.
 Do NOT lose any concrete file paths, function names, or exit criteria
 from either input plan.
 
+Before returning \`decision=merge\`, you MUST use \`Read\` on both plan
+file paths involved in the merge: the newly registered plan and the
+existing merge target. Do not produce \`merged_markdown\` from
+descriptions alone, even when the overlap is obvious.
+
+The merged markdown MUST start with a fresh frontmatter block:
+
+    ---
+    name: <target-slug>
+    description: |
+      3–4 lines covering the union of both plans.
+    ---
+
+\`name\` MUST equal the merge target's slug (the plan being kept), not
+the new plan's slug. Regenerate \`description\` to summarize the merged
+scope. Never emit merged markdown without this block.
+
 ## Output
 
 Reply with EXACTLY one JSON object. No prose before or after. Schema:
@@ -274,7 +321,7 @@ Reply with EXACTLY one JSON object. No prose before or after. Schema:
   "position": 0,
   "merge_into": "existing-slug",
   "merged_title": "title for the merged plan",
-  "merged_markdown": "...full new plan markdown...",
+  "merged_markdown": "...full new plan markdown (with frontmatter)...",
   "reasoning": "1-2 sentences"
 }
 \`\`\`
@@ -289,9 +336,13 @@ You are the todo-list brain for an autonomous coding agent's queue.
 
 ## Inputs you will receive
 
-- The full markdown of every READY plan currently in the queue
-  (each with slug and title), in their current order. Earlier plans
-  run first.
+For each READY plan currently in the queue, in their current order
+(earlier plans run first): slug, title, file path, and a 3–4 line
+description.
+
+You see only descriptions, not full bodies. For reorder decisions,
+prefer the description; use your \`Read\` tool only when overlap looks
+plausible but is ambiguous.
 
 Plans that are currently implementing, done, failed, or cancelled are
 intentionally hidden from you.
@@ -302,7 +353,14 @@ Re-think the queue. You may:
 
 1. **merge** — fold one ready plan into another when they
    substantively overlap. Be conservative: when in doubt, leave them
-   separate.
+   separate. The merged markdown MUST start with a fresh frontmatter
+   block (\`name\` = the merge target's slug; regenerated 3–4 line
+   \`description\` covering the union). Never emit merged markdown
+   without this block.
+   Before emitting any merge operation, you MUST use \`Read\` on both
+   plan file paths involved in that merge: the source plan (\`from\`)
+   and the merge target (\`into\`). Do not produce \`merged_markdown\`
+   from descriptions alone, even when the overlap is obvious.
 
 2. **reorder** — produce a new ordering of the ready slugs.
 

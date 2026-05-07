@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
+import { migratePrEntry, type PrEntry } from './prs.js';
 
 export type PlanStatus =
   | 'enqueued'
@@ -37,6 +38,13 @@ export interface Plan {
   started_at: string | null;
   finished_at: string | null;
   failure: PlanFailure | null;
+  /**
+   * Per-PR state for multi-PR plans. `null` means single-unit (no PR
+   * headings in the markdown) or not yet materialized. The list is the
+   * authoritative source for what to run and what's already done — the
+   * executor does not consult git history.
+   */
+  prs: PrEntry[] | null;
 }
 
 export interface TodoFile {
@@ -153,5 +161,16 @@ export function migratePlanRecord(raw: unknown, surface: 'inbox' | 'todo'): Plan
             message: String((r.failure as Record<string, unknown>).message ?? ''),
           }
         : null,
+    prs: migratePrs(r.prs),
   };
+}
+
+function migratePrs(raw: unknown): PrEntry[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: PrEntry[] = [];
+  for (const item of raw) {
+    const entry = migratePrEntry(item);
+    if (entry !== null) out.push(entry);
+  }
+  return out;
 }

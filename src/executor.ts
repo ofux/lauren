@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { displayPath, REPO } from './core/paths.js';
+import type { PR, PrEntry } from './core/prs.js';
 import { type Plan, planFilePath, planLogDir } from './core/types.js';
 import {
   type ResolvedWorkspaceRepo,
@@ -13,28 +14,19 @@ import {
   fixPrompt,
   implementPlanPrompt,
   implementPrompt,
-  type PR,
   planCommitMessage,
   prCommitMessage,
   reviewPlanPrompt,
   reviewPrompt,
 } from './executor-prompts.js';
 import { runCodexReview } from './proc/codex.js';
-import {
-  type GitCommitResult,
-  gitAddAll,
-  gitCommit,
-  gitLogSubjects,
-  workingTreeDirty,
-} from './proc/git.js';
+import { type GitCommitResult, gitAddAll, gitCommit, workingTreeDirty } from './proc/git.js';
 import { streamSubprocess } from './proc/stream.js';
 import { formatClaudeStreamLine } from './util/streamJson.js';
 
 export type StepName = 'implement' | 'review' | 'fix' | 'commit';
 export type StepStatus = 'done' | 'failed' | 'skipped';
 export type ItemStatus = 'done' | 'failed';
-
-const PR_HEADING_RE = /^### PR (\d+\.\d+) — (.+?)\s*$/;
 
 export const PR_STEPS: readonly StepName[] = ['implement', 'review', 'fix', 'commit'] as const;
 
@@ -63,74 +55,6 @@ export interface ProgressSink {
   markItemDone(itemId: string): void;
   beginStep(itemId: string, step: StepName, label: string): void;
   endStep(itemId: string, step: StepName, status: StepStatus): void;
-}
-
-export function parsePrs(text: string): PR[] {
-  const seen = new Set<string>();
-  const out: PR[] = [];
-  for (const line of text.split('\n')) {
-    const m = PR_HEADING_RE.exec(line);
-    if (!m) continue;
-    const [, id, rawTitle] = m;
-    if (id === undefined || rawTitle === undefined) continue;
-    const title = rawTitle.trim();
-    if (seen.has(id)) {
-      throw new Error(`duplicate PR id ${id} in plan`);
-    }
-    seen.add(id);
-    out.push({ id, title });
-  }
-  return out;
-}
-
-export function parseDoneIds(subjects: string[], slug: string): Set<string> {
-  const slugEsc = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`^${slugEsc}: PR (\\d+\\.\\d+) — `);
-  const done = new Set<string>();
-  for (const line of subjects) {
-    const m = re.exec(line);
-    if (m?.[1]) done.add(m[1]);
-  }
-  return done;
-}
-
-export function alreadyDone(plan: Plan, cwd?: string): Set<string> {
-  return parseDoneIds(gitLogSubjects(cwd), plan.slug);
-}
-
-/**
- * Resume detection across a workspace. A PR id is considered done if *any*
- * target repo has the marker commit for it. We don't require markers in
- * every target repo because we no longer create empty placeholders — peers
- * that had no real changes during the original run simply have no marker.
- */
-export function alreadyDoneInRepos(
-  plan: Plan,
-  repos: readonly ResolvedWorkspaceRepo[],
-): Set<string> {
-  const done = new Set<string>();
-  for (const repo of repos) {
-    for (const id of alreadyDone(plan, repo.root)) done.add(id);
-  }
-  return done;
-}
-
-function legacyPlanCommitMessage(plan: Plan): string {
-  return `Plan: ${plan.title}`;
-}
-
-export function singleUnitDone(plan: Plan, cwd?: string): boolean {
-  const subjects = gitLogSubjects(cwd);
-  return (
-    subjects.includes(planCommitMessage(plan)) || subjects.includes(legacyPlanCommitMessage(plan))
-  );
-}
-
-export function singleUnitDoneInRepos(
-  plan: Plan,
-  repos: readonly ResolvedWorkspaceRepo[],
-): boolean {
-  return repos.some((repo) => singleUnitDone(plan, repo.root));
 }
 
 function prLogDir(parentLogDir: string, pr: PR): string {
@@ -244,10 +168,10 @@ export function formatCommitFailureMessage(args: {
  * repo B, A's commit is permanent (we don't rewrite history). The caller
  * throws RunFailure with a message that names B and quotes the exact commit
  * subject; the watcher pauses and the user fixes B manually using that
- * subject. On retry, `alreadyDone` sees the marker in both repos and
- * correctly skips this PR. (If the user commits B with a different subject,
- * resume will re-run the PR — still pick scopes that minimize cross-repo
- * coupling to keep recovery cheap.)
+ * subject. The PR row is marked `failed` in the todo store, so on
+ * `lauren vibe retry <slug>` the PR re-runs — pick scopes that minimize
+ * cross-repo coupling so manual recovery + retry doesn't fight a duplicate
+ * commit in repo A.
  */
 function commitAllTargetRepos(
   dirtyTargets: readonly ResolvedWorkspaceRepo[],
@@ -493,6 +417,13 @@ export interface RunPlanOptions {
   targetRepos?: readonly ResolvedWorkspaceRepo[];
   progress?: ProgressSink;
   signal?: AbortSignal;
+  /**
+   * Persist a PR-list mutation. Called before a PR starts (to record
+   * `started_at`) and after it finishes (to record status + commit subject).
+   * The watcher implements this by writing back to the todo store with
+   * `allowImplementing: true`. Omit in dry-run paths.
+   */
+  onPrUpdate?: (prs: PrEntry[]) => Promise<void>;
 }
 
 async function resolvePlanRepos(plan: Plan): Promise<ResolvedWorkspaceRepo[]> {
@@ -509,19 +440,23 @@ async function resolvePlanRepos(plan: Plan): Promise<ResolvedWorkspaceRepo[]> {
   }
 }
 
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function isRunnable(entry: PrEntry): boolean {
+  return entry.status !== 'done' && entry.status !== 'orphaned';
+}
+
 export async function runPlan(opts: RunPlanOptions): Promise<void> {
-  const { plan, dryRun, progress, signal } = opts;
+  const { plan, dryRun, progress, signal, onPrUpdate } = opts;
   const targetRepos = opts.targetRepos ?? (await resolvePlanRepos(plan));
   const planText = await fs.readFile(planFilePath(plan), 'utf8');
-  const prs = parsePrs(planText);
   const parentLogDir = planLogDir(plan);
   await fs.mkdir(parentLogDir, { recursive: true });
 
-  if (prs.length === 0) {
-    if (singleUnitDoneInRepos(plan, targetRepos)) {
-      progress?.markItemDone(plan.slug);
-      return;
-    }
+  const storedPrs = plan.prs;
+  if (storedPrs === null || storedPrs.length === 0) {
     progress?.beginItem(plan.slug);
     try {
       await runPlanSingleUnit({
@@ -541,16 +476,30 @@ export async function runPlan(opts: RunPlanOptions): Promise<void> {
     return;
   }
 
-  const done = alreadyDoneInRepos(plan, targetRepos);
+  // Take a mutable working copy. `onPrUpdate` persists this list after every
+  // transition so a crash mid-plan never loses progress and `lauren vibe
+  // retry` resumes from the right PR.
+  const prs: PrEntry[] = storedPrs.map((e) => ({ ...e }));
   if (progress) {
     for (const pr of prs) {
-      if (done.has(pr.id)) progress.markItemDone(pr.id);
+      if (pr.status === 'done') progress.markItemDone(pr.id);
     }
   }
 
-  for (const pr of prs) {
-    if (done.has(pr.id)) continue;
-    progress?.beginItem(pr.id);
+  for (let i = 0; i < prs.length; i++) {
+    const entry = prs[i]!;
+    if (!isRunnable(entry)) continue;
+    const startedAt = nowIso();
+    prs[i] = {
+      ...entry,
+      status: 'pending',
+      started_at: startedAt,
+      finished_at: null,
+      commit_subject: null,
+    };
+    await onPrUpdate?.(prs);
+    progress?.beginItem(entry.id);
+    const pr: PR = { id: entry.id, title: entry.title };
     try {
       await runPr({
         pr,
@@ -563,10 +512,19 @@ export async function runPlan(opts: RunPlanOptions): Promise<void> {
         ...(signal !== undefined ? { signal } : {}),
       });
     } catch (err) {
-      progress?.endItem(pr.id, 'failed');
+      prs[i] = { ...prs[i]!, status: 'failed', finished_at: nowIso() };
+      await onPrUpdate?.(prs).catch(() => undefined);
+      progress?.endItem(entry.id, 'failed');
       throw err;
     }
-    progress?.endItem(pr.id, 'done');
+    prs[i] = {
+      ...prs[i]!,
+      status: 'done',
+      finished_at: nowIso(),
+      commit_subject: prCommitMessage(plan, pr),
+    };
+    await onPrUpdate?.(prs);
+    progress?.endItem(entry.id, 'done');
   }
 }
 

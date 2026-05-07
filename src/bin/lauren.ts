@@ -28,6 +28,7 @@ import {
   resolvePlanPath,
   TESTING_PATH,
 } from '../core/paths.js';
+import { materializePrs } from '../core/prs.js';
 import { validateSlug } from '../core/slug.js';
 import { TodoStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
@@ -39,6 +40,7 @@ import { slugHasLaurenHistory } from '../proc/git.js';
 import { writePidFile } from '../proc/pid.js';
 import { TodoApp } from '../tui/TodoApp.js';
 import { confirm } from '../util/confirm.js';
+import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
 import { configureVibeCommand } from '../vibe-command.js';
 import { tryAcquireBrainLock } from '../watcher.js';
 
@@ -171,17 +173,42 @@ async function cmdRegister(args: {
     started_at: null,
     finished_at: null,
     failure: null,
+    prs: null,
   };
 
-  // Existence check — body is unused here; the brain daemon re-reads it later.
+  let rawBody: string;
   try {
-    await fs.access(planFilePath(plan));
+    rawBody = await fs.readFile(planFilePath(plan), 'utf8');
   } catch (err: unknown) {
     if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
       process.stderr.write(`error: plan file not found: ${plan.path}\n`);
       return 1;
     }
     throw err;
+  }
+
+  const { frontmatter } = parsePlanFrontmatter(rawBody);
+  if (!frontmatter) {
+    process.stderr.write(
+      `error: ${plan.path} is missing a frontmatter block. ` +
+        `Add a YAML block at the very top with \`name: ${args.slug}\` and a ` +
+        `3–4 line \`description: |\` summary, then retry.\n`,
+    );
+    return 1;
+  }
+  if (frontmatter.name !== args.slug) {
+    process.stderr.write(
+      `error: frontmatter \`name\` is '${frontmatter.name}' but registered slug is ` +
+        `'${args.slug}'. Update the file so they match, then retry.\n`,
+    );
+    return 1;
+  }
+  if (frontmatter.description.trim() === '') {
+    process.stderr.write(
+      `error: frontmatter \`description\` is empty in ${plan.path}. ` +
+        `Provide a 3–4 line summary, then retry.\n`,
+    );
+    return 1;
   }
 
   // Cross-store collision: refuse if slug already exists in either inbox or todo.
@@ -206,8 +233,13 @@ async function cmdRegister(args: {
     throw err;
   }
 
+  const summaryBlock = frontmatter.description
+    .split('\n')
+    .map((line) => `  ${line}`)
+    .join('\n');
   process.stdout.write(
     `queued '${args.slug}' as enqueued — ${args.title}\n` +
+      `summary:\n${summaryBlock}\n` +
       `target repo(s): ${formatRepoList(targetRepos)}\n` +
       `(run \`lauren organize\` to let the AI place it into the todo queue.)\n`,
   );
@@ -476,7 +508,15 @@ async function processInboxPlan(args: {
   }
 
   // Add to todo as `ready`. Strip `preparing` status before insert.
-  const readyPlan: Plan = { ...plan, status: 'ready', cancel_requested: false };
+  // Materialize PR list from the just-read markdown so the todo row is
+  // immediately the source of truth for what to run — the executor only
+  // re-reconciles at vibe claim time to catch later edits.
+  const readyPlan: Plan = {
+    ...plan,
+    status: 'ready',
+    cancel_requested: false,
+    prs: materializePrs(body, null),
+  };
   await todoStore.add(readyPlan);
   const summary = await applyPlaceDecision(todoStore, readyPlan, decision);
   process.stdout.write(`brain: ${summary}\n`);
