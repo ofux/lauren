@@ -129,6 +129,26 @@ export function WatcherProgress({ runtime }: Props): React.ReactElement {
             <Text key={i}>{line}</Text>
           ))}
         </Box>
+      ) : runtime.idleState === 'organizing' && runtime.organizingPlan !== null ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={2}>
+          <Box>
+            <Spinner />
+            <Text> </Text>
+            <Text color="yellow" bold>
+              organizing inbox
+            </Text>
+          </Box>
+          <Box>
+            <Text>{runtime.organizingPlan.slug}</Text>
+            <Text dimColor> — </Text>
+            <Text>{runtime.organizingPlan.title}</Text>
+          </Box>
+          {runtime.organizingNote !== null && (
+            <Text dimColor italic>
+              {runtime.organizingNote}
+            </Text>
+          )}
+        </Box>
       ) : (
         <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2}>
           <Box>

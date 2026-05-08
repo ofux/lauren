@@ -5,7 +5,7 @@
  * headings (see PR_HEADING_RE). Each heading becomes a {@link PrEntry} stored on
  * the plan's todo row; the executor drives them as independent units.
  *
- * Source of truth is the plan record on disk (`.lauren/todo.json`), not git
+ * Source of truth is the plan record on disk (`.lauren/plans.json`), not git
  * history. This module owns parsing the markdown into a fresh list and
  * reconciling that list with what's already stored — both happen at organize
  * time (when the brain places a plan) and at vibe claim time (when the
@@ -117,25 +117,4 @@ export function materializePrs(
   const parsed = parsePrs(planText);
   if (parsed.length === 0 && (existing === null || existing.length === 0)) return null;
   return reconcilePrs(parsed, existing);
-}
-
-export function migratePrEntry(raw: unknown): PrEntry | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const id = typeof r.id === 'string' ? r.id : '';
-  const title = typeof r.title === 'string' ? r.title : '';
-  if (id === '' || title === '') return null;
-  const rawStatus = typeof r.status === 'string' ? r.status : 'pending';
-  const status: PrStatus =
-    rawStatus === 'done' || rawStatus === 'failed' || rawStatus === 'orphaned'
-      ? rawStatus
-      : 'pending';
-  return {
-    id,
-    title,
-    status,
-    commit_subject: typeof r.commit_subject === 'string' ? r.commit_subject : null,
-    started_at: typeof r.started_at === 'string' ? r.started_at : null,
-    finished_at: typeof r.finished_at === 'string' ? r.finished_at : null,
-  };
 }

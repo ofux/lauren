@@ -10,11 +10,6 @@ const YELLOW = '\x1b[33m';
 const CYAN = '\x1b[36m';
 const MAGENTA = '\x1b[35m';
 
-export interface UnifiedRow {
-  plan: Plan;
-  store: 'inbox' | 'todo';
-}
-
 function statusCell(status: PlanStatus): { plain: string; rendered: string } {
   switch (status) {
     case 'failed':
@@ -42,9 +37,9 @@ function pad(s: string, width: number, align: 'left' | 'right'): string {
   return align === 'right' ? filler + s : s + filler;
 }
 
-export function printTodoTable(rows: UnifiedRow[]): void {
+export function printTodoTable(plans: Plan[]): void {
   const headers = ['#', 'status', 'slug', 'title', 'age'];
-  const tableRows = rows.map(({ plan }, i) => {
+  const tableRows = plans.map((plan, i) => {
     const s = statusCell(plan.status);
     return {
       idx: String(i + 1),

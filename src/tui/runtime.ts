@@ -13,7 +13,7 @@ import { stripAnsi } from '../util/ansi.js';
 
 export const LOG_TAIL_LINES = 8;
 
-export type RuntimeIdleState = 'idle' | 'paused' | 'running';
+export type RuntimeIdleState = 'idle' | 'paused' | 'running' | 'organizing';
 export type ItemDisplayStatus = 'pending' | 'running' | 'done' | 'failed';
 export type StepDisplayStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed';
 
@@ -84,6 +84,8 @@ export class WatcherRuntime implements ProgressSink {
 
   plans: Plan[] = [];
   currentPlan: Plan | null = null;
+  organizingPlan: Plan | null = null;
+  organizingNote: string | null = null;
   planProgress: PlanRuntimeState | null = null;
   idleState: RuntimeIdleState = 'idle';
   idleMessage = 'starting…';
@@ -112,6 +114,8 @@ export class WatcherRuntime implements ProgressSink {
   setRunning(plans: Plan[], plan: Plan, progress: PlanRuntimeState): void {
     this.plans = plans;
     this.currentPlan = plan;
+    this.organizingPlan = null;
+    this.organizingNote = null;
     this.planProgress = progress;
     this.idleState = 'running';
     this.pausedSlug = null;
@@ -121,6 +125,8 @@ export class WatcherRuntime implements ProgressSink {
   setIdle(plans: Plan[]): void {
     this.plans = plans;
     this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
     this.planProgress = null;
     this.idleState = 'idle';
     this.pausedSlug = null;
@@ -129,10 +135,28 @@ export class WatcherRuntime implements ProgressSink {
     this.notify();
   }
 
+  setOrganizing(plans: Plan[], inboxPlan: Plan): void {
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = inboxPlan;
+    this.organizingNote = null;
+    this.planProgress = null;
+    this.idleState = 'organizing';
+    this.pausedSlug = null;
+    this.notify();
+  }
+
+  setOrganizingNote(text: string): void {
+    this.organizingNote = text;
+    this.notify();
+  }
+
   setPaused(plans: Plan[], failedPlan: Plan): void {
     const isNewPause = this.pausedSlug !== failedPlan.slug;
     this.plans = plans;
     this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = failedPlan.slug;

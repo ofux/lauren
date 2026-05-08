@@ -6,11 +6,11 @@ import { DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
 import type { PrEntry } from './prs.js';
 import {
   ImplementingLocked,
-  migratePlanRecord,
   type Plan,
   PlanNotFound,
   PlanNotReady,
   PlanSelfMerge,
+  PreparingLocked,
   SCHEMA_VERSION,
   SlugCollision,
   type TodoFile,
@@ -28,17 +28,22 @@ interface MergeBodyWrite {
   finalize?: () => Promise<void>;
 }
 
+interface LockOptions {
+  allowPreparing?: boolean;
+  allowImplementing?: boolean;
+}
+
 function mergeTargetRepos(a: readonly string[], b: readonly string[]): string[] {
   if (a.length === 0 || b.length === 0) return [];
   return [...new Set([...a, ...b])];
 }
 
-export class TodoStoreFormatError extends Error {
+export class PlanStoreFormatError extends Error {
   readonly path: string;
 
   constructor(filePath: string, message: string) {
     super(`${filePath}: ${message}`);
-    this.name = 'TodoStoreFormatError';
+    this.name = 'PlanStoreFormatError';
     this.path = filePath;
   }
 }
@@ -49,14 +54,40 @@ async function ensureLockFile(lockPath: string): Promise<void> {
   await fd.close();
 }
 
-export class TodoStore {
+function checkLock(plan: Plan, opts: LockOptions): void {
+  if (plan.status === 'implementing' && !opts.allowImplementing) {
+    throw new ImplementingLocked(plan.slug);
+  }
+  if (plan.status === 'preparing' && !opts.allowPreparing) {
+    throw new PreparingLocked(plan.slug);
+  }
+}
+
+/**
+ * Single source of truth for the plan queue across all lifecycle stages.
+ * Plans with status `enqueued`/`preparing` are awaiting brain placement;
+ * `ready`/`implementing`/`failed`/`done`/`cancelled` are post-placement.
+ *
+ * Locking invariants:
+ *   - `implementing` rows are owned by the executor — pass `allowImplementing`
+ *     to mutate them from elsewhere (only the watcher should).
+ *   - `preparing` rows are owned by the brain phase — pass `allowPreparing`
+ *     to mutate them from elsewhere (only the daemon's organize phase should).
+ */
+export class PlanStore {
   readonly path: string;
   readonly lockPath: string;
 
-  constructor(opts: { path?: string; lockPath?: string; context?: LaurenContext } = {}) {
+  constructor(
+    opts: {
+      path?: string;
+      lockPath?: string;
+      context?: LaurenContext;
+    } = {},
+  ) {
     const context = opts.context ?? DEFAULT_CONTEXT;
-    this.path = opts.path ?? context.todoPath;
-    this.lockPath = opts.lockPath ?? context.lockPath;
+    this.path = opts.path ?? context.plansStatePath;
+    this.lockPath = opts.lockPath ?? context.plansStateLockPath;
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -78,9 +109,7 @@ export class TodoStore {
     try {
       raw = await fs.readFile(this.path, 'utf8');
     } catch (err: unknown) {
-      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return [];
-      }
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') return [];
       throw err;
     }
     let data: TodoFile;
@@ -88,21 +117,21 @@ export class TodoStore {
       data = JSON.parse(raw) as TodoFile;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      throw new TodoStoreFormatError(this.path, `malformed JSON: ${msg}`);
+      throw new PlanStoreFormatError(this.path, `malformed JSON: ${msg}`);
     }
     if (data.version !== SCHEMA_VERSION) {
-      throw new TodoStoreFormatError(
+      throw new PlanStoreFormatError(
         this.path,
         `schema version ${JSON.stringify(data.version)} not supported (expected ${SCHEMA_VERSION})`,
       );
     }
-    return Array.isArray(data.plans) ? data.plans.map((p) => migratePlanRecord(p, 'todo')) : [];
+    return Array.isArray(data.plans) ? (data.plans as Plan[]) : [];
   }
 
   private async writeUnlocked(plans: Plan[]): Promise<void> {
     await fs.mkdir(path.dirname(this.path), { recursive: true });
     const data: TodoFile = { version: SCHEMA_VERSION, plans };
-    const tmp = path.join(path.dirname(this.path), `.todo.${process.pid}.${Date.now()}.json.tmp`);
+    const tmp = path.join(path.dirname(this.path), `.plans.${process.pid}.${Date.now()}.json.tmp`);
     const body = `${JSON.stringify(data, null, 2)}\n`;
     await fs.writeFile(tmp, body, 'utf8');
     await fs.rename(tmp, this.path);
@@ -130,15 +159,13 @@ export class TodoStore {
     });
   }
 
-  async remove(slug: string, opts: { allowImplementing?: boolean } = {}): Promise<Plan> {
+  async remove(slug: string, opts: LockOptions = {}): Promise<Plan> {
     return this.withLock(async () => {
       const plans = await this.readUnlocked();
       const idx = plans.findIndex((p) => p.slug === slug);
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
-      if (plan.status === 'implementing' && !opts.allowImplementing) {
-        throw new ImplementingLocked(slug);
-      }
+      checkLock(plan, opts);
       plans.splice(idx, 1);
       await this.writeUnlocked(plans);
       return plan;
@@ -148,16 +175,14 @@ export class TodoStore {
   async update(
     slug: string,
     fields: Partial<Omit<Plan, 'slug'>>,
-    opts: { allowImplementing?: boolean } = {},
+    opts: LockOptions = {},
   ): Promise<Plan> {
     return this.withLock(async () => {
       const plans = await this.readUnlocked();
       const idx = plans.findIndex((p) => p.slug === slug);
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
-      if (plan.status === 'implementing' && !opts.allowImplementing) {
-        throw new ImplementingLocked(slug);
-      }
+      checkLock(plan, opts);
       const updated: Plan = { ...plan, ...fields, slug: plan.slug };
       plans[idx] = updated;
       await this.writeUnlocked(plans);
@@ -245,10 +270,7 @@ export class TodoStore {
       };
       try {
         plans[tIdx] = updatedTarget;
-        // Recompute fromIdx in case it shifted (it can't here, since neither
-        // splice has happened yet, but be explicit).
-        const fIdx2 = plans.findIndex((p) => p.slug === args.fromSlug);
-        plans.splice(fIdx2, 1);
+        plans.splice(fIdx, 1);
         await this.writeUnlocked(plans);
       } catch (err) {
         await bodyWrite?.rollback?.().catch(() => undefined);
@@ -280,7 +302,7 @@ export class TodoStore {
         }
         plans.splice(target, 0, plan);
       } else {
-        plans.splice(idx, 0, plan);
+        throw new Error('move() requires exactly one of toFront/toBack/before');
       }
       await this.writeUnlocked(plans);
     });

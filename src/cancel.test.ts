@@ -1,8 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 
 import { cancelPlan } from './cancel.js';
-import type { InboxStore } from './core/inbox.js';
-import type { TodoStore } from './core/store.js';
+import type { PlanStore } from './core/store.js';
 import { ImplementingLocked, type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
 import { signalDaemon } from './proc/pid.js';
 
@@ -22,14 +21,15 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     started_at: null,
     finished_at: null,
     failure: null,
+    prs: null,
     ...overrides,
   };
 }
 
 describe('cancelPlan', () => {
-  test('redirects an enqueued inbox cancellation when brain claims the row first', async () => {
+  test('redirects an enqueued cancellation when the brain claims the row first', async () => {
     const plan = makePlan({ status: 'enqueued' });
-    const inboxStore = {
+    const store = {
       find: vi.fn(async () => plan),
       remove: vi.fn(async () => {
         plan.status = 'preparing';
@@ -39,50 +39,38 @@ describe('cancelPlan', () => {
         Object.assign(plan, fields);
         return plan;
       }),
-    } as unknown as InboxStore;
-    const todoStore = { find: vi.fn(async () => null) } as unknown as TodoStore;
+    } as unknown as PlanStore;
 
-    const outcome = await cancelPlan({
-      slug: plan.slug,
-      store: 'inbox',
-      todoStore,
-      inboxStore,
-    });
+    const outcome = await cancelPlan({ slug: plan.slug, store });
 
     expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
     expect(plan.cancel_requested).toBe(true);
-    expect(inboxStore.update).toHaveBeenCalledWith(
+    expect(store.update).toHaveBeenCalledWith(
       plan.slug,
       { cancel_requested: true },
-      { allowPreparing: true },
+      { allowPreparing: true, allowImplementing: true },
     );
-    expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('brain.pid'), 'SIGUSR2');
+    expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
   });
 
-  test('does not report success when an enqueued inbox row disappears before remove', async () => {
+  test('does not report success when an enqueued row disappears before remove', async () => {
     const plan = makePlan({ status: 'enqueued' });
-    const inboxStore = {
+    const store = {
       find: vi.fn(async () => plan),
       remove: vi.fn(async () => {
         throw new PlanNotFound(plan.slug);
       }),
-    } as unknown as InboxStore;
-    const todoStore = { find: vi.fn(async () => null) } as unknown as TodoStore;
+    } as unknown as PlanStore;
 
-    const outcome = await cancelPlan({
-      slug: plan.slug,
-      store: 'inbox',
-      todoStore,
-      inboxStore,
-    });
+    const outcome = await cancelPlan({ slug: plan.slug, store });
 
-    expect(outcome).toEqual({ kind: 'noop', message: `no inbox row for '${plan.slug}'` });
+    expect(outcome).toEqual({ kind: 'noop', message: `no row for '${plan.slug}'` });
   });
 
-  test('signals vibe when a ready todo row is claimed during cancellation', async () => {
+  test('signals vibe when a ready row is claimed during cancellation', async () => {
     const plan = makePlan({ status: 'ready' });
     let firstUpdate = true;
-    const todoStore = {
+    const store = {
       find: vi.fn(async () => plan),
       update: vi.fn(
         async (_slug: string, fields: Partial<Plan>, opts?: { allowImplementing?: boolean }) => {
@@ -95,22 +83,16 @@ describe('cancelPlan', () => {
           return plan;
         },
       ),
-    } as unknown as TodoStore;
-    const inboxStore = { find: vi.fn(async () => null) } as unknown as InboxStore;
+    } as unknown as PlanStore;
 
-    const outcome = await cancelPlan({
-      slug: plan.slug,
-      store: 'todo',
-      todoStore,
-      inboxStore,
-    });
+    const outcome = await cancelPlan({ slug: plan.slug, store });
 
     expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
     expect(plan.cancel_requested).toBe(true);
-    expect(todoStore.update).toHaveBeenLastCalledWith(
+    expect(store.update).toHaveBeenLastCalledWith(
       plan.slug,
       { cancel_requested: true },
-      { allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true },
     );
     expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
   });

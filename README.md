@@ -7,21 +7,27 @@ backlog manager then decides where that plan belongs. It can insert, reorder, or
 merge related pending work instead of blindly appending another task to the end of
 a list.
 
-The pipeline is split across three independent processes you run in parallel:
+The pipeline is split across two processes you run in parallel:
 
 ```text
-lauren plan -> .lauren/inbox.json -> lauren organize -> .lauren/todo.json -> lauren vibe -> commits
-                                     (AI placement)                                 (claude/codex/git)
+lauren plan ──► .lauren/plans.json ──► lauren vibe ──► commits
+              (enqueued)   (ready)      (AI placement +
+                                         claude/codex/git)
 ```
 
-`lauren plan` only writes to the inbox and exits — planning sessions never
-block on the AI. `lauren organize` is the long-running daemon that polls the
-inbox, asks the AI where each plan belongs, and drops it into the todo.
-`lauren vibe` drains the todo end-to-end:
+`lauren plan` only enqueues the plan and exits — planning sessions never
+block on the AI. `lauren vibe` is the unified daemon: each loop iteration it
+first drains every `enqueued` plan (asking the AI where each one belongs in
+the ready queue), then implements one ready plan end-to-end:
 
 ```text
 claude implements -> codex reviews -> claude fixes -> git commits
 ```
+
+Multi-repo workspaces are supported: from a parent directory containing several
+git repos, or via an explicit `.lauren/workspace.json`, a single plan can touch
+multiple repos and Lauren creates one commit per dirty repo with a shared
+subject (see [Multi-Repo Workspaces](#multi-repo-workspaces)).
 
 ## Requirements
 
@@ -31,8 +37,9 @@ claude implements -> codex reviews -> claude fixes -> git commits
 - `codex` on `$PATH`, authenticated and usable from the terminal
 - A clean Git working tree before running `lauren vibe`
 
-Lauren runs against the current Git repository. Run `lauren` from inside the
-project you want to change, not from this repository.
+Lauren runs against the current Git repository (or a parent folder containing
+one or more git sub-repositories — see [Multi-Repo Workspaces](#multi-repo-workspaces)).
+Run `lauren` from inside the project you want to change, not from this repository.
 
 ## Install
 
@@ -59,17 +66,14 @@ lauren vibe --help
 
 ## Quick Start
 
-In the repository you want Lauren to modify, open three terminals:
+In the repository you want Lauren to modify, open two terminals:
 
 ```sh
 # Terminal 1 — plan work
 lauren spec
 lauren plan "add password reset"
 
-# Terminal 2 — AI placement daemon
-lauren organize
-
-# Terminal 3 — execution daemon
+# Terminal 2 — unified daemon (AI placement + execution)
 lauren vibe
 ```
 
@@ -80,25 +84,22 @@ lauren vibe
 - `docs/TESTING.md`
 
 `lauren plan` starts an interactive Claude session. When you approve the plan,
-it writes a Markdown plan under `.lauren/plans/` and queues it in
-`.lauren/inbox.json`. The session exits immediately.
+it writes a Markdown plan under `.lauren/plans/` and queues it as `enqueued`
+in `.lauren/plans.json`. The session exits immediately.
 
-`lauren organize` is a long-running daemon that polls the inbox every 3 seconds.
-For each new plan it asks the AI backlog manager how the plan should fit with
-existing pending work, applies that decision against `.lauren/todo.json`, and
-drops the plan from the inbox.
+`lauren vibe` is the single long-running daemon. Each iteration it polls the
+queue every 3 seconds, asks the AI backlog manager where each new plan fits
+against existing pending work (transitioning the row through `preparing` to
+`ready`), then claims one ready plan and runs it through the
+implement/review/fix/commit pipeline.
 
-`lauren vibe` is the execution watcher. It polls `.lauren/todo.json` and runs
-one plan at a time through the implement/review/fix/commit pipeline.
-
-This is the core feature: `.lauren/todo.json` is not a simple append-only todo
+This is the core feature: `.lauren/plans.json` is not a simple append-only todo
 list. It is the persisted state of a backlog that Lauren continuously shapes.
 
-For ad-hoc use you can drain the inbox once and stop:
+For diagnostics you can preview the queue without running anything:
 
 ```sh
 lauren plan "..."
-lauren organize --once
 lauren vibe --dry-run
 ```
 
@@ -109,21 +110,21 @@ flowchart TD
   A[Run lauren spec] --> B[Project docs]
   B --> C[Run lauren plan]
   C --> D[Write .lauren/plans/slug.md]
-  D --> E[Append to .lauren/inbox.json]
-  E --> R[lauren organize polls inbox]
+  D --> E[Insert row as 'enqueued' in .lauren/plans.json]
+  E --> R[lauren vibe drains enqueued plans]
   R --> F[AI compares against pending work]
   F --> N{Placement decision}
   N --> O[Insert at best position]
   N --> P[Merge into related plan]
   N --> Q[Leave as separate work]
-  O --> S[Write to .lauren/todo.json]
+  O --> S[Row transitions to 'ready']
   P --> S
   Q --> S
-  S --> G[lauren vibe claims next pending plan]
+  S --> G[lauren vibe claims next ready plan]
   G --> I[Implement]
   I --> J[Review]
   J --> K[Fix]
-  K --> L[Commit]
+  K --> L[Commit one per dirty target repo]
   L --> M[Mark done]
 ```
 
@@ -132,7 +133,7 @@ Queue state:
 ```mermaid
 stateDiagram-v2
   [*] --> enqueued: lauren plan registers
-  enqueued --> preparing: lauren organize claims
+  enqueued --> preparing: lauren vibe claims (brain phase)
   preparing --> ready: brain placed
   ready --> implementing: lauren vibe claims plan
   implementing --> done: all work committed
@@ -150,22 +151,20 @@ stateDiagram-v2
 Lauren does not treat plans as independent tickets pushed onto the end of a queue.
 Every new plan is evaluated against the pending backlog.
 
-When `lauren organize` picks up a plan from the inbox, the AI can:
+When `lauren vibe`'s brain phase picks up an `enqueued` plan, the AI can:
 
 - insert it before or after existing pending work
 - merge it into a related pending plan
 - leave it as a standalone plan at the end of the queue
 
-`lauren organize --all` runs the same AI pass across the whole pending todo. Use it
-when the queue has drifted, when several plans overlap, or when you want the next
-run to execute in a better order.
-
-`lauren vibe` does not make planning decisions. It only drains the ordered
-backlog that `lauren organize` has shaped.
+`lauren reorganize` runs the same AI pass across the whole pending todo as a
+one-shot. Use it when the queue has drifted, when several plans overlap, or
+when you want the next run to execute in a better order. It refuses to run if
+`lauren vibe` is alive (the daemon owns the queue while running).
 
 ## Commands
 
-### Plan and organize
+### Plan and reorganize
 
 ```sh
 lauren spec
@@ -178,44 +177,34 @@ lauren plan [seed_prompt]
 ```
 
 Open an interactive planner. The planner creates `.lauren/plans/<slug>.md` and
-appends an entry to `.lauren/inbox.json`. Brain placement happens
-asynchronously — the session exits as soon as the plan is queued.
+appends an `enqueued` row to `.lauren/plans.json`. Brain placement happens
+asynchronously — the session exits as soon as the plan is queued. If
+`.lauren/workspace.json` exists, the planner passes one `--repo` flag per repo
+the plan is allowed to touch; omit them to target every configured repo.
 
 ```sh
-lauren organize
-lauren organize --once
-lauren organize --dry-run
-```
-
-Long-running daemon that drains `.lauren/inbox.json` into `.lauren/todo.json`.
-For each inbox plan it asks the AI where it belongs and applies the decision
-against the todo. `--once` exits when the inbox is empty. `--dry-run` prints
-what brain would decide without mutating either file. Only one daemon may run
-per repository (enforced via `.lauren/brain.lock`).
-
-```sh
-lauren organize --all
-lauren organize --all --yes
-lauren organize --all --dry-run
+lauren reorganize
+lauren reorganize --yes
+lauren reorganize --dry-run
 ```
 
 One-shot pass that asks the AI to reorganize the whole pending todo. It may
 reorder plans or merge related plans. Without `--yes`, Lauren asks before
 applying the proposed operations. `--dry-run` prints the proposed operations
-without applying them.
+without applying them. Refuses to run if `lauren vibe` is alive.
 
 ```sh
 lauren todo
 lauren todo --list
 ```
 
-Open the interactive queue TUI showing the merged inbox + todo. Use ↑/↓ to
-navigate, Enter (or `c`) to cancel the highlighted plan, and `q` to quit. The
-cancellation behavior depends on the row's status — `enqueued` rows are
-removed; `preparing` and `implementing` rows signal the brain or vibe daemon
-respectively to abort the in-flight subprocess; `ready` rows are marked
-`cancelled` directly. `--list` prints a static table without entering the TUI
-(also the default in non-TTY contexts like CI).
+Open the interactive queue TUI showing every plan in `.lauren/plans.json`. Use
+↑/↓ to navigate, Enter (or `c`) to cancel the highlighted plan, and `q` to
+quit. The cancellation behavior depends on the row's status — `enqueued` rows
+are removed; `preparing` and `implementing` rows signal the vibe daemon to
+abort the in-flight subprocess; `ready` rows are marked `cancelled` directly.
+`--list` prints a static table without entering the TUI (also the default in
+non-TTY contexts like CI).
 
 ### Execute
 
@@ -223,7 +212,11 @@ respectively to abort the in-flight subprocess; `ready` rows are marked
 lauren vibe
 ```
 
-Start the watcher. It polls the queue every 3 seconds and runs one plan at a time.
+Start the unified daemon. Each iteration it drains every `enqueued` plan
+(placing each one via brain) and runs one ready plan through the
+implement/review/fix/commit pipeline. If the implement step exits cleanly
+with no diff, Lauren assumes the work was already done — review, fix, and
+commit are skipped and the plan (or PR) is marked done with no commit.
 
 ```sh
 lauren vibe --dry-run
@@ -239,20 +232,20 @@ Move a `failed` or stale `implementing` plan back to `ready`.
 
 To remove or stop a plan, open `lauren todo` and cancel the row. There is no
 `lauren vibe rm` command — cancellation is the single, status-aware path that
-correctly handles in-flight work (signaling the daemons, reverting partial
+correctly handles in-flight work (signaling the daemon, reverting partial
 implementations, etc.).
 
 ## Plan Files
 
 Plans live in `.lauren/plans/`.
 
-Every plan starts with a YAML frontmatter block. `lauren organize` reads only
-this block to decide where to insert the plan or whether to merge it into an
-existing one — the brain reaches for the full body only when descriptions are
-not enough. `name` MUST equal the slug; `description` is a 3–4 line `|` block
-scalar covering what the plan does, why, and what files/areas it touches.
-`lauren _register` rejects plans whose frontmatter is missing or whose `name`
-does not match the slug.
+Every plan starts with a YAML frontmatter block. The vibe daemon's brain phase
+reads only this block to decide where to insert the plan or whether to merge
+it into an existing one — the brain reaches for the full body only when
+descriptions are not enough. `name` MUST equal the slug; `description` is a
+3–4 line `|` block scalar covering what the plan does, why, and what
+files/areas it touches. `lauren _register` rejects plans whose frontmatter is
+missing or whose `name` does not match the slug.
 
 A normal plan is one execution unit and produces one commit:
 
@@ -319,25 +312,66 @@ Commit messages:
 - Single-unit plan: `<slug>: Plan — <title>`
 - Multi-PR plan: `<slug>: PR X.Y — <title>`
 
-Multi-PR resume uses Git history. If a plan fails after some PRs were committed,
-`lauren vibe retry <slug>` skips PR IDs that already have matching commit subjects.
+For multi-repo workspaces, every dirty target repo gets its own commit with
+the same subject. Peer repos with no changes are not given empty marker
+commits.
+
+Multi-PR resume reads per-PR state stored on the plan row in
+`.lauren/plans.json` (`plans[].prs`). When `lauren vibe` claims a plan it
+re-parses the markdown and reconciles against that list — PR IDs already
+marked `done` are skipped, only `pending` or `failed` PRs are run. Git history
+is not consulted for resume. PRs you edited out of the markdown after a
+partial run are kept as `orphaned` so they're visible but never re-executed.
+
+## Multi-Repo Workspaces
+
+Lauren can drive a single plan across multiple sibling git repositories.
+
+If `.lauren/workspace.json` exists, it lists the repos Lauren is allowed to
+touch:
+
+```json
+{
+  "version": 1,
+  "repos": [
+    { "name": "frontend", "path": "frontend" },
+    { "name": "backend",  "path": "backend"  }
+  ]
+}
+```
+
+Repo paths must stay inside the workspace root. Without a workspace.json,
+Lauren auto-detects: if the working directory is itself a git repo, that's the
+single target; otherwise, immediate sub-directories that contain a `.git`
+entry are discovered as repos automatically.
+
+The plan row records its `target_repos` (the repo names the plan is allowed to
+modify, or `[]` meaning "every configured repo"). At execution time:
+
+- All target repos must have a clean working tree before `lauren vibe` starts
+  (and before each plan starts).
+- The implement and fix steps run from the workspace root with full access to
+  every target repo.
+- The commit step iterates over the target repos, committing each dirty repo
+  with the same subject.
+- If a commit fails in the second-or-later repo of a multi-repo plan, Lauren
+  pauses with an error that quotes the exact commit subject. Fix the issue,
+  commit the remaining repos manually with that subject, then run
+  `lauren vibe retry <slug>`.
 
 ## Files Written in Target Repos
 
-Lauren writes project-local state under the target repository:
+Lauren writes project-local state under the workspace root:
 
 ```text
 .lauren/
-  plans/           Markdown plans
-  logs/<slug>/     implement/review/fix logs
-  inbox.json       enqueued / preparing plans (waiting for brain placement)
-  inbox.json.lock  inbox mutation lock
-  todo.json        ready / implementing / done / failed / cancelled plans
-  todo.json.lock   todo mutation lock
-  brain.lock       lauren organize daemon lock
-  brain.pid        lauren organize PID (used by lauren todo to send SIGUSR2)
-  vibe.lock        vibe watcher lock
-  vibe.pid         vibe PID (used by lauren todo to send SIGUSR2)
+  plans/             Markdown plans
+  logs/<slug>/       implement/review/fix logs (with per-PR sub-dirs)
+  plans.json         the whole queue (every plan, every status)
+  plans.json.lock    queue mutation lock
+  workspace.json     (optional) multi-repo configuration
+  vibe.lock          vibe daemon single-process lock
+  vibe.pid           vibe PID (used by lauren todo to send SIGUSR2)
 docs/
   PRD.md
   ARCHITECTURE.md
@@ -347,14 +381,15 @@ docs/
 ## Operating Rules
 
 - Start `lauren vibe` only with a clean working tree.
-- Run only one `lauren vibe` watcher per repository.
-- Run only one `lauren organize` daemon per repository.
-- `lauren organize` and `lauren vibe` can run concurrently — they touch different files.
-- A failed plan pauses the `lauren vibe` queue until you retry or remove it.
-- `in_progress` plans are locked against normal queue mutations.
-- Stopping `lauren vibe` with Ctrl-C demotes the active plan back to `pending`.
-- Stopping `lauren organize` with Ctrl-C is safe at any point — placement is
-  retried idempotently on next start.
+- Run only one `lauren vibe` daemon per repository.
+- `lauren reorganize` refuses to run while `lauren vibe` is alive — stop the
+  daemon first if you want to reshape the queue.
+- A failed plan pauses the implement loop until you retry or cancel it. The
+  brain phase keeps draining the inbox while paused.
+- `implementing` plans are locked against normal queue mutations.
+- Stopping `lauren vibe` with Ctrl-C is safe: an active implement is demoted
+  back to `ready`, and partially-placed `preparing` rows are reset to
+  `enqueued` on the next start.
 - Logs are written under `.lauren/logs/<slug>/`.
 
 ## Development
@@ -379,14 +414,20 @@ npm test
 Source layout:
 
 ```text
-src/bin/        CLI entry point
-src/core/       paths, todo & inbox stores, types, slug/time helpers
-src/proc/       claude, codex, git, and subprocess wrappers
-src/tui/        Ink UI for vibe
-src/executor.ts plan execution pipeline
-src/brain.ts    AI queue placement and organization
-src/vibe-command.ts executor subcommand
-src/watcher.ts  vibe loop and process lock helpers
+src/bin/             CLI entry point (lauren.ts)
+src/cli/             plain-text rendering helpers (table.ts)
+src/core/            paths, single PlanStore, types, slug/time/workspace,
+                     per-PR state (prs.ts)
+src/proc/            claude, codex, git, pid file, subprocess streaming
+src/tui/             Ink UI (vibe progress + lauren todo TUI)
+src/executor.ts      plan execution pipeline (4-step, single- or multi-PR)
+src/executor-prompts.ts prompts for implement/review/fix and commit messages
+src/brain.ts         AI queue placement and reorganize
+src/organize.ts      brain-driven enqueued-plan draining (processEnqueuedPlan)
+src/lauren-prompts.ts system prompts for plan / spec / brain sessions
+src/cancel.ts        status-aware cancellation policy used by lauren todo
+src/vibe-command.ts  vibe daemon bootstrap and retry subcommand
+src/watcher.ts       unified vibe loop (drain + implement) and process locks
 ```
 
 ## License

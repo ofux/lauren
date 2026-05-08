@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { materializePrs, migratePrEntry, type PrEntry, parsePrs, reconcilePrs } from './prs.js';
+import { materializePrs, type PrEntry, parsePrs, reconcilePrs } from './prs.js';
 
 function entry(overrides: Partial<PrEntry> & Pick<PrEntry, 'id' | 'title'>): PrEntry {
   return {
@@ -153,27 +153,5 @@ describe('materializePrs', () => {
       ['1.1', 'A', 'pending'],
       ['1.2', 'B', 'pending'],
     ]);
-  });
-});
-
-describe('migratePrEntry', () => {
-  test('coerces an unknown status to pending', () => {
-    expect(migratePrEntry({ id: '1.1', title: 'A', status: 'weird' })).toMatchObject({
-      id: '1.1',
-      title: 'A',
-      status: 'pending',
-    });
-  });
-
-  test('rejects entries without id or title', () => {
-    expect(migratePrEntry({ id: '', title: 'A' })).toBeNull();
-    expect(migratePrEntry({ id: '1.1', title: '' })).toBeNull();
-    expect(migratePrEntry(null)).toBeNull();
-  });
-
-  test('preserves valid status values', () => {
-    for (const status of ['pending', 'done', 'failed', 'orphaned'] as const) {
-      expect(migratePrEntry({ id: '1.1', title: 'A', status })?.status).toBe(status);
-    }
   });
 });

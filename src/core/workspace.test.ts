@@ -19,8 +19,6 @@ function makeContext(repo: string): LaurenContext {
     vibePidPath: path.join(laurenDir, 'vibe.pid'),
     inboxPath: path.join(laurenDir, 'inbox.json'),
     inboxLockPath: path.join(laurenDir, 'inbox.json.lock'),
-    brainLockPath: path.join(laurenDir, 'brain.lock'),
-    brainPidPath: path.join(laurenDir, 'brain.pid'),
     docsDir,
     prdPath: path.join(docsDir, 'PRD.md'),
     archPath: path.join(docsDir, 'ARCHITECTURE.md'),

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
-import { migratePrEntry, type PrEntry } from './prs.js';
+import type { PrEntry } from './prs.js';
 
 export type PlanStatus =
   | 'enqueued'
@@ -10,16 +10,6 @@ export type PlanStatus =
   | 'failed'
   | 'done'
   | 'cancelled';
-
-export const PLAN_STATUSES: readonly PlanStatus[] = [
-  'enqueued',
-  'preparing',
-  'ready',
-  'implementing',
-  'failed',
-  'done',
-  'cancelled',
-] as const;
 
 export interface PlanFailure {
   step: string;
@@ -116,61 +106,4 @@ export class PlanSelfMerge extends Error {
     this.name = 'PlanSelfMerge';
     this.slug = slug;
   }
-}
-
-/**
- * Coerce a plan record loaded from disk into the current schema.
- * Adds defaults for fields introduced after v1 (kept under SCHEMA_VERSION 1
- * for forward-compat) and migrates legacy status values to the new union.
- *
- * The status migration is store-specific (inbox 'pending' → 'enqueued';
- * todo 'pending' → 'ready', 'in_progress' → 'implementing'). Pass which
- * surface this plan came from via `surface`.
- */
-export function migratePlanRecord(raw: unknown, surface: 'inbox' | 'todo'): Plan {
-  const r = raw as Record<string, unknown>;
-  const rawStatus = typeof r.status === 'string' ? r.status : '';
-  let status: PlanStatus;
-  if (surface === 'inbox') {
-    status = rawStatus === 'pending' ? 'enqueued' : (rawStatus as PlanStatus);
-  } else {
-    if (rawStatus === 'pending') status = 'ready';
-    else if (rawStatus === 'in_progress') status = 'implementing';
-    else status = rawStatus as PlanStatus;
-  }
-  return {
-    slug: String(r.slug ?? ''),
-    title: String(r.title ?? ''),
-    path: String(r.path ?? ''),
-    target_repos: Array.isArray(r.target_repos)
-      ? r.target_repos.filter((repo): repo is string => typeof repo === 'string')
-      : [],
-    status,
-    cancel_requested: r.cancel_requested === true,
-    created_at: String(r.created_at ?? ''),
-    started_at: typeof r.started_at === 'string' ? r.started_at : null,
-    finished_at: typeof r.finished_at === 'string' ? r.finished_at : null,
-    failure:
-      r.failure && typeof r.failure === 'object'
-        ? {
-            step: String((r.failure as Record<string, unknown>).step ?? 'unknown'),
-            pr_id:
-              typeof (r.failure as Record<string, unknown>).pr_id === 'string'
-                ? ((r.failure as Record<string, unknown>).pr_id as string)
-                : null,
-            message: String((r.failure as Record<string, unknown>).message ?? ''),
-          }
-        : null,
-    prs: migratePrs(r.prs),
-  };
-}
-
-function migratePrs(raw: unknown): PrEntry[] | null {
-  if (!Array.isArray(raw)) return null;
-  const out: PrEntry[] = [];
-  for (const item of raw) {
-    const entry = migratePrEntry(item);
-    if (entry !== null) out.push(entry);
-  }
-  return out;
 }

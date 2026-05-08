@@ -26,18 +26,22 @@ describe('displayPath', () => {
 });
 
 describe('LaurenContext', () => {
+  const root = path.join(path.sep, 'tmp', 'lauren-context-repo');
+  const laurenDir = path.join(root, '.lauren');
+  const docsDir = path.join(root, 'docs');
   const context: LaurenContext = {
-    repo: path.join(path.sep, 'tmp', 'lauren-context-repo'),
-    laurenDir: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren'),
-    logRoot: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren', 'logs'),
-    plansDir: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren', 'plans'),
-    todoPath: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren', 'todo.json'),
-    lockPath: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren', 'todo.json.lock'),
-    vibeLockPath: path.join(path.sep, 'tmp', 'lauren-context-repo', '.lauren', 'vibe.lock'),
-    docsDir: path.join(path.sep, 'tmp', 'lauren-context-repo', 'docs'),
-    prdPath: path.join(path.sep, 'tmp', 'lauren-context-repo', 'docs', 'PRD.md'),
-    archPath: path.join(path.sep, 'tmp', 'lauren-context-repo', 'docs', 'ARCHITECTURE.md'),
-    testingPath: path.join(path.sep, 'tmp', 'lauren-context-repo', 'docs', 'TESTING.md'),
+    repo: root,
+    laurenDir,
+    logRoot: path.join(laurenDir, 'logs'),
+    plansDir: path.join(laurenDir, 'plans'),
+    plansStatePath: path.join(laurenDir, 'plans.json'),
+    plansStateLockPath: path.join(laurenDir, 'plans.json.lock'),
+    vibeLockPath: path.join(laurenDir, 'vibe.lock'),
+    vibePidPath: path.join(laurenDir, 'vibe.pid'),
+    docsDir,
+    prdPath: path.join(docsDir, 'PRD.md'),
+    archPath: path.join(docsDir, 'ARCHITECTURE.md'),
+    testingPath: path.join(docsDir, 'TESTING.md'),
   };
 
   test('path helpers can use an injected context', () => {

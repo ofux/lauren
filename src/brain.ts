@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { materializePrs } from './core/prs.js';
-import type { TodoStore } from './core/store.js';
+import type { PlanStore } from './core/store.js';
 import {
   ImplementingLocked,
   type Plan,
@@ -89,7 +89,7 @@ export function summarizeBody(raw: string): { description: string; fromFallback:
   };
 }
 
-export async function readReadySummaries(store: TodoStore): Promise<ReadySummary[]> {
+export async function readReadySummaries(store: PlanStore): Promise<ReadySummary[]> {
   const out: ReadySummary[] = [];
   for (const p of await store.read()) {
     if (p.status !== 'ready') continue;
@@ -168,7 +168,7 @@ async function replacePlanFileWithRollback(
 }
 
 export async function brainPlacePlan(
-  store: TodoStore,
+  store: PlanStore,
   newPlan: Plan,
   newBody: string,
   signal?: AbortSignal,
@@ -198,7 +198,7 @@ export async function brainPlacePlan(
 }
 
 export async function brainOrganizeQueue(
-  store: TodoStore,
+  store: PlanStore,
   signal?: AbortSignal,
 ): Promise<{ decision: OrganizeDecision; ready: ReadySummary[] }> {
   const ready = await readReadySummaries(store);
@@ -214,7 +214,7 @@ export async function brainOrganizeQueue(
   return { decision: parseOrganizeDecision(result), ready };
 }
 
-async function fallbackPlaceAtBack(store: TodoStore, newPlan: Plan, msg: string): Promise<string> {
+async function fallbackPlaceAtBack(store: PlanStore, newPlan: Plan, msg: string): Promise<string> {
   try {
     await store.move(newPlan.slug, { toBack: true });
   } catch (err) {
@@ -245,25 +245,6 @@ function parsePlaceDecision(raw: unknown): PlaceDecision {
   if (!isRecord(raw)) {
     return { kind: 'invalid', message: 'unknown brain decision' };
   }
-  if (raw.kind === 'merge') {
-    const targetSlug = stringField(raw, 'targetSlug');
-    const mergedTitle = stringField(raw, 'mergedTitle');
-    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
-    const reasoning = stringField(raw, 'reasoning');
-    if (targetSlug && mergedTitle && mergedMarkdown) {
-      return { kind: 'merge', targetSlug, mergedTitle, mergedMarkdown, reasoning };
-    }
-  }
-  if (raw.kind === 'insert') {
-    const position = parseInsertPosition(raw.position);
-    if (position === null) {
-      return { kind: 'invalid', message: 'insert decision missing valid position' };
-    }
-    return { kind: 'insert', position, reasoning: stringField(raw, 'reasoning') };
-  }
-  if (raw.kind === 'invalid') {
-    return { kind: 'invalid', message: stringField(raw, 'message') || 'unknown brain decision' };
-  }
   const reasoning = stringField(raw, 'reasoning');
   if (raw.decision === 'merge') {
     const targetSlug = stringField(raw, 'merge_into');
@@ -287,26 +268,6 @@ function parsePlaceDecision(raw: unknown): PlaceDecision {
 function parseOrganizeOp(raw: unknown): OrganizeDecisionOp {
   if (!isRecord(raw)) {
     return { kind: 'invalid', op: 'unknown', message: `skip unknown op: ${String(raw)}` };
-  }
-  if (raw.kind === 'merge') {
-    const into = stringField(raw, 'into');
-    const fromSlug = stringField(raw, 'fromSlug');
-    const mergedTitle = stringField(raw, 'mergedTitle');
-    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
-    if (into && fromSlug && mergedTitle && mergedMarkdown) {
-      return { kind: 'merge', into, fromSlug, mergedTitle, mergedMarkdown };
-    }
-  }
-  if (raw.kind === 'reorder') {
-    const order = Array.isArray(raw.order) ? raw.order.map(String) : [];
-    return { kind: 'reorder', order };
-  }
-  if (raw.kind === 'invalid') {
-    return {
-      kind: 'invalid',
-      op: stringField(raw, 'op') || 'unknown',
-      message: stringField(raw, 'message') || 'skip unknown op: undefined',
-    };
   }
   if (raw.op === 'merge') {
     const into = stringField(raw, 'into');
@@ -341,7 +302,7 @@ function parseOrganizeDecision(raw: unknown): OrganizeDecision {
 }
 
 export async function applyPlaceDecision(
-  store: TodoStore,
+  store: PlanStore,
   newPlan: Plan,
   rawDecision: unknown,
 ): Promise<string> {
@@ -448,7 +409,7 @@ export function summarizeOrganizeDecision(rawDecision: unknown): string[] {
 }
 
 export async function applyOrganizeDecision(
-  store: TodoStore,
+  store: PlanStore,
   rawDecision: unknown,
 ): Promise<string[]> {
   const decision = parseOrganizeDecision(rawDecision);

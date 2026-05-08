@@ -188,9 +188,9 @@ description and the codebase you can explore.
        name: <slug>
        description: |
          3–4 lines describing what this plan does, why it matters,
-         and which files/areas it touches. The \`lauren organize\`
-         brain reads this summary to decide placement and to spot
-         overlap with existing plans without reading the full body.
+         and which files/areas it touches. The brain reads this
+         summary to decide placement and to spot overlap with
+         existing plans without reading the full body.
        ---
 
        # Plan title …
@@ -216,11 +216,12 @@ description and the codebase you can explore.
    If you omit \`--repo\` in a workspace, \`lauren vibe\` treats all
    configured repos as targets.
 
-   \`_register\` appends the plan to \`.lauren/inbox.json\`. A separate
-   \`lauren organize\` daemon polls the inbox and decides asynchronously
-   whether to insert at a specific position or merge into an existing
-   pending plan. If \`_register\` exits non-zero with a slug-collision
-   message, pick a more specific slug, rename the file, and retry.
+   \`_register\` appends the plan as \`enqueued\` in \`.lauren/plans.json\`.
+   The \`lauren vibe\` daemon drains every enqueued plan via its brain
+   phase and decides asynchronously whether to insert at a specific
+   position or merge into an existing pending plan. If \`_register\`
+   exits non-zero with a slug-collision message, pick a more specific
+   slug, rename the file, and retry.
 
 9. Print a one-line confirmation: which slug and where the file is.
    Mention that brain placement happens asynchronously.

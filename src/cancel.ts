@@ -1,8 +1,7 @@
 import { promises as fs } from 'node:fs';
 
-import type { InboxStore } from './core/inbox.js';
-import { BRAIN_PID_PATH, VIBE_PID_PATH } from './core/paths.js';
-import type { TodoStore } from './core/store.js';
+import { VIBE_PID_PATH } from './core/paths.js';
+import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
   ImplementingLocked,
@@ -18,110 +17,86 @@ export type CancelOutcome =
   | { kind: 'requested'; message: string; daemonReachable: boolean }
   | { kind: 'noop'; message: string };
 
+async function requestDaemonCancellation(
+  store: PlanStore,
+  slug: string,
+  phase: 'preparing' | 'implementing',
+): Promise<CancelOutcome> {
+  try {
+    await store.update(
+      slug,
+      { cancel_requested: true },
+      { allowPreparing: true, allowImplementing: true },
+    );
+  } catch (err) {
+    if (err instanceof PlanNotFound) {
+      return { kind: 'noop', message: `no row for '${slug}'` };
+    }
+    throw err;
+  }
+  const reachable = await signalDaemon(VIBE_PID_PATH, 'SIGUSR2');
+  const what =
+    phase === 'preparing'
+      ? 'preparing; vibe signalled to abort brain'
+      : 'implementing; vibe signalled to abort and revert';
+  return {
+    kind: 'requested',
+    daemonReachable: reachable,
+    message: reachable
+      ? `cancelling '${slug}' (was ${what})`
+      : `cancel_requested set on '${slug}', but vibe daemon not reachable — start \`lauren vibe\` to finalize.`,
+  };
+}
+
 /**
- * Apply the cancellation policy specified in the user-facing requirements:
- *   enqueued     → remove from inbox + delete .md
- *   preparing    → set cancel_requested=true, signal brain (SIGUSR2);
- *                  the brain finalizes by removing the inbox row
- *   ready        → set status='cancelled' on the todo row
+ * Apply the cancellation policy:
+ *   enqueued     → remove from queue + delete .md
+ *   preparing    → set cancel_requested=true, signal vibe (SIGUSR2);
+ *                  vibe's brain phase aborts and removes the row
+ *   ready        → set status='cancelled' directly
  *   implementing → set cancel_requested=true, signal vibe (SIGUSR2);
- *                  vibe aborts the subprocess + git revert + sets 'cancelled'
+ *                  vibe aborts the subprocess + reverts git + sets 'cancelled'
  *   else (failed/done/cancelled) → no-op
- *
- * The TUI calls this after the user confirms a cancellation. `store` tells
- * us which file the plan lives in (resolves the inbox-vs-todo ambiguity
- * when the same slug briefly appears in both during brain hand-off).
  */
-export async function cancelPlan(args: {
-  slug: string;
-  store: 'inbox' | 'todo';
-  todoStore: TodoStore;
-  inboxStore: InboxStore;
-}): Promise<CancelOutcome> {
-  const { slug, store, todoStore, inboxStore } = args;
+export async function cancelPlan(args: { slug: string; store: PlanStore }): Promise<CancelOutcome> {
+  const { slug, store } = args;
+  const plan = await store.find(slug).catch(() => null);
+  if (plan === null) return { kind: 'noop', message: `no row for '${slug}'` };
 
-  async function requestBrainCancellation(): Promise<CancelOutcome> {
+  if (plan.status === 'enqueued') {
+    let removed: Plan;
     try {
-      await inboxStore.update(slug, { cancel_requested: true }, { allowPreparing: true });
+      removed = await store.remove(slug);
     } catch (err) {
+      if (err instanceof PreparingLocked) {
+        return requestDaemonCancellation(store, slug, 'preparing');
+      }
       if (err instanceof PlanNotFound) {
-        return { kind: 'noop', message: `no inbox row for '${slug}'` };
+        return { kind: 'noop', message: `no row for '${slug}'` };
       }
       throw err;
     }
-    const reachable = await signalDaemon(BRAIN_PID_PATH, 'SIGUSR2');
-    return {
-      kind: 'requested',
-      daemonReachable: reachable,
-      message: reachable
-        ? `cancelling '${slug}' (was preparing; brain signalled to abort)`
-        : `cancel_requested set on '${slug}', but brain daemon not reachable — start \`lauren organize\` to finalize.`,
-    };
-  }
-
-  async function requestVibeCancellation(): Promise<CancelOutcome> {
     try {
-      await todoStore.update(slug, { cancel_requested: true }, { allowImplementing: true });
-    } catch (err) {
-      if (err instanceof PlanNotFound) {
-        return { kind: 'noop', message: `no todo row for '${slug}'` };
-      }
-      throw err;
+      await fs.unlink(planFilePath(removed));
+    } catch {
+      // ignore — plan file may have been cleaned up already
     }
-    const reachable = await signalDaemon(VIBE_PID_PATH, 'SIGUSR2');
-    return {
-      kind: 'requested',
-      daemonReachable: reachable,
-      message: reachable
-        ? `cancelling '${slug}' (was implementing; vibe signalled to abort and revert)`
-        : `cancel_requested set on '${slug}', but vibe daemon not reachable — start \`lauren vibe\` to finalize.`,
-    };
+    return { kind: 'removed', message: `cancelled '${slug}' (was enqueued; removed)` };
   }
 
-  if (store === 'inbox') {
-    const plan = await inboxStore.find(slug).catch(() => null);
-    if (plan === null) return { kind: 'noop', message: `no inbox row for '${slug}'` };
-
-    if (plan.status === 'enqueued') {
-      let removed: Plan;
-      try {
-        removed = await inboxStore.remove(slug);
-      } catch (err) {
-        if (err instanceof PreparingLocked) {
-          return requestBrainCancellation();
-        }
-        if (err instanceof PlanNotFound) {
-          return { kind: 'noop', message: `no inbox row for '${slug}'` };
-        }
-        throw err;
-      }
-      try {
-        await fs.unlink(planFilePath(removed));
-      } catch {
-        // ignore — plan file may have been cleaned up already
-      }
-      return { kind: 'removed', message: `cancelled '${slug}' (was enqueued; removed)` };
-    }
-
-    if (plan.status === 'preparing') {
-      return requestBrainCancellation();
-    }
-
-    return { kind: 'noop', message: `'${slug}' is ${plan.status}; nothing to cancel.` };
+  if (plan.status === 'preparing') {
+    return requestDaemonCancellation(store, slug, 'preparing');
   }
-
-  const plan = await todoStore.find(slug).catch(() => null);
-  if (plan === null) return { kind: 'noop', message: `no todo row for '${slug}'` };
 
   if (plan.status === 'ready') {
     try {
-      await todoStore.update(slug, { status: 'cancelled', finished_at: nowIso() });
+      await store.update(slug, { status: 'cancelled', finished_at: nowIso() });
     } catch (err) {
       if (err instanceof ImplementingLocked) {
-        return requestVibeCancellation();
+        return requestDaemonCancellation(store, slug, 'implementing');
       }
       if (err instanceof PlanNotFound) {
-        return { kind: 'noop', message: `no todo row for '${slug}'` };
+        return { kind: 'noop', message: `no row for '${slug}'` };
       }
       throw err;
     }
@@ -129,7 +104,7 @@ export async function cancelPlan(args: {
   }
 
   if (plan.status === 'implementing') {
-    return requestVibeCancellation();
+    return requestDaemonCancellation(store, slug, 'implementing');
   }
 
   return { kind: 'noop', message: `'${slug}' is ${plan.status}; nothing to cancel.` };
