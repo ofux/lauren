@@ -2,9 +2,10 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
+import type { InboxStore } from './core/inbox.js';
 import { VIBE_LOCK_PATH } from './core/paths.js';
 import { materializePrs, type PrEntry } from './core/prs.js';
-import type { PlanStore } from './core/store.js';
+import type { TodoStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
   ImplementingLocked,
@@ -14,7 +15,7 @@ import {
   planFilePath,
 } from './core/types.js';
 import { RunFailure, runPlan } from './executor.js';
-import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
+import { type BrainCancelState, processInboxPlan } from './organize.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 
 export const IDLE_POLL_SECONDS = 3.0;
@@ -79,18 +80,64 @@ function failureFromError(err: unknown): PlanFailure {
   };
 }
 
-/**
- * Move a plan into a terminal status (done/failed/cancelled). Stamps
- * `finished_at` and swallows `ImplementingLocked` / `PlanNotFound` so a
- * concurrent cancel or removal during finalization doesn't propagate.
- */
-export async function markPlanFinal(
-  store: PlanStore,
-  slug: string,
-  fields: Partial<Omit<Plan, 'slug' | 'finished_at'>>,
-): Promise<void> {
+async function markPlanMissing(store: TodoStore, plan: Plan): Promise<void> {
+  const failure: PlanFailure = {
+    step: 'implement',
+    pr_id: null,
+    message: `plan file missing: ${plan.path}`,
+  };
   try {
-    await store.update(slug, { ...fields, finished_at: nowIso() }, { allowImplementing: true });
+    await store.update(plan.slug, {
+      status: 'failed',
+      finished_at: nowIso(),
+      failure,
+    });
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+      throw err;
+    }
+  }
+}
+
+async function markPlanFailed(store: TodoStore, plan: Plan, failure: PlanFailure): Promise<void> {
+  try {
+    await store.update(
+      plan.slug,
+      { status: 'failed', finished_at: nowIso(), failure },
+      { allowImplementing: true },
+    );
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+      throw err;
+    }
+  }
+}
+
+async function markPlanDone(store: TodoStore, plan: Plan): Promise<void> {
+  try {
+    await store.update(
+      plan.slug,
+      { status: 'done', finished_at: nowIso() },
+      { allowImplementing: true },
+    );
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+      throw err;
+    }
+  }
+}
+
+async function markPlanCancelled(store: TodoStore, plan: Plan): Promise<void> {
+  try {
+    await store.update(
+      plan.slug,
+      {
+        status: 'cancelled',
+        finished_at: nowIso(),
+        cancel_requested: false,
+      },
+      { allowImplementing: true },
+    );
   } catch (err) {
     if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
       throw err;
@@ -126,28 +173,32 @@ export interface WatcherLoopHandles {
 }
 
 /**
- * Drain every `enqueued` plan by running brain placement until none remain.
- * Phase 'organizing' is held throughout. Errors are reported via stderr and
- * the loop sleeps briefly to avoid hot-looping on a broken plan.
+ * Drain the inbox by running brain placement on each enqueued/preparing
+ * plan until none remain. Phase 'organizing' is held throughout. Errors
+ * are reported via stderr and the loop sleeps briefly to avoid hot-looping
+ * on a broken plan.
  */
-async function drainEnqueued(
+async function drainInbox(
   runtime: WatcherRuntime,
-  store: PlanStore,
+  todoStore: TodoStore,
+  inboxStore: InboxStore,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<void> {
   while (!signal.aborted) {
-    const plans = await store.read();
-    const next = plans.find((p) => p.status === 'enqueued');
+    const inboxPlans = await inboxStore.read();
+    const next = inboxPlans[0];
     if (!next) return;
 
-    runtime.setOrganizing(plans, next);
+    const todoSnapshot = await todoStore.read();
+    runtime.setOrganizing(todoSnapshot, next);
     handles.current.slug = next.slug;
     handles.phase.value = 'organizing';
     try {
-      await processEnqueuedPlan({
+      await processInboxPlan({
         plan: next,
-        store,
+        todoStore,
+        inboxStore,
         state: handles.brainState,
         notify: ({ level, text }) => {
           if (level === 'error') {
@@ -172,16 +223,17 @@ async function drainEnqueued(
 
 export async function watcherLoop(
   runtime: WatcherRuntime,
-  store: PlanStore,
+  store: TodoStore,
+  inboxStore: InboxStore,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<{ inFlight: Plan | null; cancelledSlug: string | null }> {
   let inFlight: Plan | null = null;
   let cancelledSlug: string | null = null;
   while (!signal.aborted) {
-    // Phase A: drain every enqueued plan before touching the ready queue.
+    // Phase A: drain the inbox completely before touching the ready queue.
     // New plans landing mid-implement will be placed on the next iteration.
-    await drainEnqueued(runtime, store, signal, handles);
+    await drainInbox(runtime, store, inboxStore, signal, handles);
     if (signal.aborted) break;
 
     const plans = await store.read();
@@ -203,16 +255,11 @@ export async function watcherLoop(
     const next = ready[0]!;
     if (next.cancel_requested) {
       // User cancelled before we picked it up. Mark cancelled directly.
-      await markPlanFinal(store, next.slug, { status: 'cancelled', cancel_requested: false });
+      await markPlanCancelled(store, next);
       continue;
     }
-    const missingFailure = (plan: Plan): PlanFailure => ({
-      step: 'implement',
-      pr_id: null,
-      message: `plan file missing: ${plan.path}`,
-    });
     if (!(await planFileExists(next))) {
-      await markPlanFinal(store, next.slug, { status: 'failed', failure: missingFailure(next) });
+      await markPlanMissing(store, next);
       continue;
     }
 
@@ -221,10 +268,7 @@ export async function watcherLoop(
       planText = await fs.readFile(planFilePath(next), 'utf8');
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-        await markPlanFinal(store, next.slug, {
-          status: 'failed',
-          failure: missingFailure(next),
-        });
+        await markPlanMissing(store, next);
         continue;
       }
       throw err;
@@ -259,7 +303,13 @@ export async function watcherLoop(
 
     // Combine the outer abort signal with our cancel-scoped controller so
     // a Ctrl-C OR a per-plan cancel both interrupt the in-flight subprocess.
-    const merged = AbortSignal.any([signal, cancelController.signal]);
+    const merged = new AbortController();
+    const onOuter = (): void => merged.abort();
+    const onCancel = (): void => merged.abort();
+    signal.addEventListener('abort', onOuter, { once: true });
+    cancelController.signal.addEventListener('abort', onCancel, { once: true });
+    if (signal.aborted) merged.abort();
+    if (cancelController.signal.aborted) merged.abort();
 
     try {
       const planProgress = newPlanRuntimeState({
@@ -280,10 +330,12 @@ export async function watcherLoop(
         plan: claimed,
         dryRun: false,
         progress: runtime,
-        signal: merged,
+        signal: merged.signal,
         onPrUpdate,
       });
     } catch (err) {
+      signal.removeEventListener('abort', onOuter);
+      cancelController.signal.removeEventListener('abort', onCancel);
       handles.current.slug = null;
       handles.cancelController.ref = null;
       handles.phase.value = 'idle';
@@ -295,13 +347,12 @@ export async function watcherLoop(
       if (signal.aborted) {
         return { inFlight, cancelledSlug };
       }
-      await markPlanFinal(store, claimed.slug, {
-        status: 'failed',
-        failure: failureFromError(err),
-      });
+      await markPlanFailed(store, claimed, failureFromError(err));
       inFlight = null;
       continue;
     }
+    signal.removeEventListener('abort', onOuter);
+    cancelController.signal.removeEventListener('abort', onCancel);
     handles.current.slug = null;
     handles.cancelController.ref = null;
     handles.phase.value = 'idle';
@@ -309,8 +360,10 @@ export async function watcherLoop(
     // Clear inFlight before marking done so an abort in the window below
     // cannot demote a finished plan back to pending.
     inFlight = null;
-    await markPlanFinal(store, claimed.slug, { status: 'done' });
+    await markPlanDone(store, claimed);
   }
 
   return { inFlight, cancelledSlug };
 }
+
+export { markPlanCancelled };

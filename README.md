@@ -10,24 +10,18 @@ a list.
 The pipeline is split across two processes you run in parallel:
 
 ```text
-lauren plan ──► .lauren/plans.json ──► lauren vibe ──► commits
-              (enqueued)   (ready)      (AI placement +
-                                         claude/codex/git)
+lauren plan -> .lauren/inbox.json -> lauren vibe -> .lauren/todo.json -> lauren vibe -> commits
+                                     (AI placement)                          (claude/codex/git)
 ```
 
-`lauren plan` only enqueues the plan and exits — planning sessions never
+`lauren plan` only writes to the inbox and exits — planning sessions never
 block on the AI. `lauren vibe` is the unified daemon: each loop iteration it
-first drains every `enqueued` plan (asking the AI where each one belongs in
-the ready queue), then implements one ready plan end-to-end:
+first drains the inbox (asking the AI where each plan belongs and dropping it
+into the todo), then implements one ready plan end-to-end:
 
 ```text
 claude implements -> codex reviews -> claude fixes -> git commits
 ```
-
-Multi-repo workspaces are supported: from a parent directory containing several
-git repos, or via an explicit `.lauren/workspace.json`, a single plan can touch
-multiple repos and Lauren creates one commit per dirty repo with a shared
-subject (see [Multi-Repo Workspaces](#multi-repo-workspaces)).
 
 ## Requirements
 
@@ -37,9 +31,8 @@ subject (see [Multi-Repo Workspaces](#multi-repo-workspaces)).
 - `codex` on `$PATH`, authenticated and usable from the terminal
 - A clean Git working tree before running `lauren vibe`
 
-Lauren runs against the current Git repository (or a parent folder containing
-one or more git sub-repositories — see [Multi-Repo Workspaces](#multi-repo-workspaces)).
-Run `lauren` from inside the project you want to change, not from this repository.
+Lauren runs against the current Git repository. Run `lauren` from inside the
+project you want to change, not from this repository.
 
 ## Install
 
@@ -84,16 +77,15 @@ lauren vibe
 - `docs/TESTING.md`
 
 `lauren plan` starts an interactive Claude session. When you approve the plan,
-it writes a Markdown plan under `.lauren/plans/` and queues it as `enqueued`
-in `.lauren/plans.json`. The session exits immediately.
+it writes a Markdown plan under `.lauren/plans/` and queues it in
+`.lauren/inbox.json`. The session exits immediately.
 
 `lauren vibe` is the single long-running daemon. Each iteration it polls the
-queue every 3 seconds, asks the AI backlog manager where each new plan fits
-against existing pending work (transitioning the row through `preparing` to
-`ready`), then claims one ready plan and runs it through the
-implement/review/fix/commit pipeline.
+inbox every 3 seconds, asks the AI backlog manager where each new plan fits
+against existing pending work, drops it into `.lauren/todo.json`, then claims
+one ready plan and runs it through the implement/review/fix/commit pipeline.
 
-This is the core feature: `.lauren/plans.json` is not a simple append-only todo
+This is the core feature: `.lauren/todo.json` is not a simple append-only todo
 list. It is the persisted state of a backlog that Lauren continuously shapes.
 
 For diagnostics you can preview the queue without running anything:
@@ -110,21 +102,21 @@ flowchart TD
   A[Run lauren spec] --> B[Project docs]
   B --> C[Run lauren plan]
   C --> D[Write .lauren/plans/slug.md]
-  D --> E[Insert row as 'enqueued' in .lauren/plans.json]
-  E --> R[lauren vibe drains enqueued plans]
+  D --> E[Append to .lauren/inbox.json]
+  E --> R[lauren vibe polls inbox]
   R --> F[AI compares against pending work]
   F --> N{Placement decision}
   N --> O[Insert at best position]
   N --> P[Merge into related plan]
   N --> Q[Leave as separate work]
-  O --> S[Row transitions to 'ready']
+  O --> S[Write to .lauren/todo.json]
   P --> S
   Q --> S
-  S --> G[lauren vibe claims next ready plan]
+  S --> G[lauren vibe claims next pending plan]
   G --> I[Implement]
   I --> J[Review]
   J --> K[Fix]
-  K --> L[Commit one per dirty target repo]
+  K --> L[Commit]
   L --> M[Mark done]
 ```
 
@@ -151,7 +143,7 @@ stateDiagram-v2
 Lauren does not treat plans as independent tickets pushed onto the end of a queue.
 Every new plan is evaluated against the pending backlog.
 
-When `lauren vibe`'s brain phase picks up an `enqueued` plan, the AI can:
+When `lauren vibe`'s brain phase picks up a plan from the inbox, the AI can:
 
 - insert it before or after existing pending work
 - merge it into a related pending plan
@@ -177,10 +169,8 @@ lauren plan [seed_prompt]
 ```
 
 Open an interactive planner. The planner creates `.lauren/plans/<slug>.md` and
-appends an `enqueued` row to `.lauren/plans.json`. Brain placement happens
-asynchronously — the session exits as soon as the plan is queued. If
-`.lauren/workspace.json` exists, the planner passes one `--repo` flag per repo
-the plan is allowed to touch; omit them to target every configured repo.
+appends an entry to `.lauren/inbox.json`. Brain placement happens
+asynchronously — the session exits as soon as the plan is queued.
 
 ```sh
 lauren reorganize
@@ -198,11 +188,11 @@ lauren todo
 lauren todo --list
 ```
 
-Open the interactive queue TUI showing every plan in `.lauren/plans.json`. Use
-↑/↓ to navigate, Enter (or `c`) to cancel the highlighted plan, and `q` to
-quit. The cancellation behavior depends on the row's status — `enqueued` rows
-are removed; `preparing` and `implementing` rows signal the vibe daemon to
-abort the in-flight subprocess; `ready` rows are marked `cancelled` directly.
+Open the interactive queue TUI showing the merged inbox + todo. Use ↑/↓ to
+navigate, Enter (or `c`) to cancel the highlighted plan, and `q` to quit. The
+cancellation behavior depends on the row's status — `enqueued` rows are
+removed; `preparing` and `implementing` rows signal the vibe daemon to abort
+the in-flight subprocess; `ready` rows are marked `cancelled` directly.
 `--list` prints a static table without entering the TUI (also the default in
 non-TTY contexts like CI).
 
@@ -212,11 +202,9 @@ non-TTY contexts like CI).
 lauren vibe
 ```
 
-Start the unified daemon. Each iteration it drains every `enqueued` plan
-(placing each one via brain) and runs one ready plan through the
-implement/review/fix/commit pipeline. If the implement step exits cleanly
-with no diff, Lauren assumes the work was already done — review, fix, and
-commit are skipped and the plan (or PR) is marked done with no commit.
+Start the unified daemon. Each iteration it drains the inbox (placing each new
+plan via brain) and runs one ready plan through the implement/review/fix/commit
+pipeline.
 
 ```sh
 lauren vibe --dry-run
@@ -312,66 +300,23 @@ Commit messages:
 - Single-unit plan: `<slug>: Plan — <title>`
 - Multi-PR plan: `<slug>: PR X.Y — <title>`
 
-For multi-repo workspaces, every dirty target repo gets its own commit with
-the same subject. Peer repos with no changes are not given empty marker
-commits.
-
-Multi-PR resume reads per-PR state stored on the plan row in
-`.lauren/plans.json` (`plans[].prs`). When `lauren vibe` claims a plan it
-re-parses the markdown and reconciles against that list — PR IDs already
-marked `done` are skipped, only `pending` or `failed` PRs are run. Git history
-is not consulted for resume. PRs you edited out of the markdown after a
-partial run are kept as `orphaned` so they're visible but never re-executed.
-
-## Multi-Repo Workspaces
-
-Lauren can drive a single plan across multiple sibling git repositories.
-
-If `.lauren/workspace.json` exists, it lists the repos Lauren is allowed to
-touch:
-
-```json
-{
-  "version": 1,
-  "repos": [
-    { "name": "frontend", "path": "frontend" },
-    { "name": "backend",  "path": "backend"  }
-  ]
-}
-```
-
-Repo paths must stay inside the workspace root. Without a workspace.json,
-Lauren auto-detects: if the working directory is itself a git repo, that's the
-single target; otherwise, immediate sub-directories that contain a `.git`
-entry are discovered as repos automatically.
-
-The plan row records its `target_repos` (the repo names the plan is allowed to
-modify, or `[]` meaning "every configured repo"). At execution time:
-
-- All target repos must have a clean working tree before `lauren vibe` starts
-  (and before each plan starts).
-- The implement and fix steps run from the workspace root with full access to
-  every target repo.
-- The commit step iterates over the target repos, committing each dirty repo
-  with the same subject.
-- If a commit fails in the second-or-later repo of a multi-repo plan, Lauren
-  pauses with an error that quotes the exact commit subject. Fix the issue,
-  commit the remaining repos manually with that subject, then run
-  `lauren vibe retry <slug>`.
+Multi-PR resume uses Git history. If a plan fails after some PRs were committed,
+`lauren vibe retry <slug>` skips PR IDs that already have matching commit subjects.
 
 ## Files Written in Target Repos
 
-Lauren writes project-local state under the workspace root:
+Lauren writes project-local state under the target repository:
 
 ```text
 .lauren/
-  plans/             Markdown plans
-  logs/<slug>/       implement/review/fix logs (with per-PR sub-dirs)
-  plans.json         the whole queue (every plan, every status)
-  plans.json.lock    queue mutation lock
-  workspace.json     (optional) multi-repo configuration
-  vibe.lock          vibe daemon single-process lock
-  vibe.pid           vibe PID (used by lauren todo to send SIGUSR2)
+  plans/           Markdown plans
+  logs/<slug>/     implement/review/fix logs
+  inbox.json       enqueued / preparing plans (waiting for brain placement)
+  inbox.json.lock  inbox mutation lock
+  todo.json        ready / implementing / done / failed / cancelled plans
+  todo.json.lock   todo mutation lock
+  vibe.lock        vibe daemon lock
+  vibe.pid         vibe PID (used by lauren todo to send SIGUSR2)
 docs/
   PRD.md
   ARCHITECTURE.md
@@ -414,20 +359,15 @@ npm test
 Source layout:
 
 ```text
-src/bin/             CLI entry point (lauren.ts)
-src/cli/             plain-text rendering helpers (table.ts)
-src/core/            paths, single PlanStore, types, slug/time/workspace,
-                     per-PR state (prs.ts)
-src/proc/            claude, codex, git, pid file, subprocess streaming
-src/tui/             Ink UI (vibe progress + lauren todo TUI)
-src/executor.ts      plan execution pipeline (4-step, single- or multi-PR)
-src/executor-prompts.ts prompts for implement/review/fix and commit messages
-src/brain.ts         AI queue placement and reorganize
-src/organize.ts      brain-driven enqueued-plan draining (processEnqueuedPlan)
-src/lauren-prompts.ts system prompts for plan / spec / brain sessions
-src/cancel.ts        status-aware cancellation policy used by lauren todo
-src/vibe-command.ts  vibe daemon bootstrap and retry subcommand
-src/watcher.ts       unified vibe loop (drain + implement) and process locks
+src/bin/        CLI entry point
+src/core/       paths, todo & inbox stores, types, slug/time helpers
+src/proc/       claude, codex, git, and subprocess wrappers
+src/tui/        Ink UI for vibe
+src/executor.ts plan execution pipeline
+src/brain.ts    AI queue placement and organization
+src/vibe-command.ts vibe daemon bootstrap
+src/watcher.ts  unified vibe loop (inbox-drain + implement) and process lock helpers
+src/organize.ts brain-driven inbox draining (processInboxPlan)
 ```
 
 ## License

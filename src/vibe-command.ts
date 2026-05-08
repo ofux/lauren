@@ -3,8 +3,9 @@ import type { Command } from 'commander';
 import { render } from 'ink';
 import React from 'react';
 
+import { InboxStore } from './core/inbox.js';
 import { displayPath, LAUREN_DIR, VIBE_LOCK_PATH, VIBE_PID_PATH } from './core/paths.js';
-import { PlanStore } from './core/store.js';
+import { TodoStore } from './core/store.js';
 import { ImplementingLocked, type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
 import {
   formatRepoList,
@@ -16,7 +17,7 @@ import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
 import { WatcherRuntime } from './tui/runtime.js';
 import {
-  markPlanFinal,
+  markPlanCancelled,
   tryAcquireVibeLock,
   type WatcherLoopHandles,
   watcherLoop,
@@ -34,7 +35,7 @@ async function resolveCancelledPlanRepos(plans: readonly Plan[]): Promise<Resolv
 }
 
 export async function finalizeCancelledImplementingPlans(
-  store: PlanStore,
+  store: TodoStore,
   plans: Plan[],
 ): Promise<boolean> {
   try {
@@ -51,7 +52,7 @@ export async function finalizeCancelledImplementingPlans(
   }
 
   for (const plan of plans) {
-    await markPlanFinal(store, plan.slug, { status: 'cancelled', cancel_requested: false });
+    await markPlanCancelled(store, plan);
   }
   const slugs = plans.map((p) => p.slug).join(', ');
   process.stdout.write(`cancelled '${slugs}'; reverted working tree.\n`);
@@ -64,15 +65,20 @@ function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceR
 
 async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   await fs.mkdir(LAUREN_DIR, { recursive: true });
-  const store = new PlanStore();
+  const store = new TodoStore();
+  const inboxStore = new InboxStore();
 
   if (opts.dryRun) {
     const plans = await store.read();
+    const inboxPlans = await inboxStore.read();
+    process.stdout.write(`Inbox (${inboxPlans.length} plan(s)):\n`);
+    for (const p of inboxPlans) {
+      process.stdout.write(`  [${p.status}] ${p.slug} — ${p.title}\n`);
+    }
     process.stdout.write(`Queue (${plans.length} plan(s)):\n`);
     for (const p of plans) {
       process.stdout.write(`  [${p.status}] ${p.slug} — ${p.title}\n`);
     }
-    const enqueued = plans.filter((p) => p.status === 'enqueued');
     const ready = plans.filter((p) => p.status === 'ready');
     const implementing = plans.filter((p) => p.status === 'implementing');
     const failed = plans.filter((p) => p.status === 'failed');
@@ -80,8 +86,8 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
       process.stdout.write(
         `\nWould refuse to start: implementing = ${JSON.stringify(implementing.map((p) => p.slug))}\n`,
       );
-    } else if (enqueued.length > 0) {
-      process.stdout.write(`\nWould drain enqueued plans first (${enqueued.length} plan(s)).\n`);
+    } else if (inboxPlans.length > 0) {
+      process.stdout.write(`\nWould drain inbox first (${inboxPlans.length} plan(s)).\n`);
     } else if (failed.length > 0) {
       process.stdout.write(
         `\nWould pause: failed = ${JSON.stringify(failed.map((p) => p.slug))}\n`,
@@ -129,13 +135,13 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     return 1;
   }
 
-  // Recover from a crashed run that left rows in `preparing`. Demote them
-  // back to `enqueued` so the drain loop can place them fresh on this run.
-  // Honors cancel_requested set while the prior process was down.
-  const stalePreparing = (await store.read()).filter((p) => p.status === 'preparing');
+  // Recover from a crashed run that left inbox rows in `preparing`. Demote
+  // them back to `enqueued` so the drain loop can place them fresh on this
+  // run. Honors cancel_requested set while the prior process was down.
+  const stalePreparing = (await inboxStore.read()).filter((p) => p.status === 'preparing');
   for (const plan of stalePreparing) {
     try {
-      await store.update(plan.slug, { status: 'enqueued' }, { allowPreparing: true });
+      await inboxStore.update(plan.slug, { status: 'enqueued' }, { allowPreparing: true });
     } catch (err) {
       if (!(err instanceof PreparingLocked) && !(err instanceof PlanNotFound)) {
         throw err;
@@ -193,19 +199,25 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   process.on('SIGINT', sigint);
 
   // SIGUSR2 = TUI requests cancellation of the in-flight plan. Dispatch by
-  // phase: in 'organizing', abort the brain subprocess; in 'implementing',
-  // abort the executor. Either way the loop drops the cancelled row and
-  // continues.
+  // phase: in 'organizing', re-read the inbox row and abort the brain
+  // subprocess; in 'implementing', re-read the todo row and abort the
+  // executor. Either way the loop drops the cancelled row and continues.
   const sigusr2 = async (): Promise<void> => {
     const slug = handles.current.slug;
     if (!slug) return;
     try {
-      const fresh = await store.find(slug);
-      if (!fresh?.cancel_requested) return;
       if (handles.phase.value === 'organizing') {
-        handles.brainState.controller?.abort();
-      } else if (handles.phase.value === 'implementing') {
-        handles.cancelController.ref?.abort();
+        const fresh = await inboxStore.find(slug);
+        if (fresh?.cancel_requested) {
+          handles.brainState.controller?.abort();
+        }
+        return;
+      }
+      if (handles.phase.value === 'implementing') {
+        const fresh = await store.find(slug);
+        if (fresh?.cancel_requested) {
+          handles.cancelController.ref?.abort();
+        }
       }
     } catch {
       // ignore
@@ -219,7 +231,7 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   let cancelledSlug: string | null = null;
   let loopError: unknown = null;
   try {
-    const result = await watcherLoop(runtime, store, abortController.signal, handles);
+    const result = await watcherLoop(runtime, store, inboxStore, abortController.signal, handles);
     inFlight = result.inFlight;
     cancelledSlug = result.cancelledSlug;
   } catch (err) {
@@ -273,7 +285,7 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
 }
 
 async function cmdRetry(slug: string): Promise<number> {
-  const store = new PlanStore();
+  const store = new TodoStore();
   const plan = await store.find(slug);
   if (plan === null) {
     process.stderr.write(`error: slug not found: ${slug}\n`);
@@ -322,7 +334,7 @@ async function cmdRetry(slug: string): Promise<number> {
 
 export function configureVibeCommand(command: Command): Command {
   command.description(
-    'Plan queue executor — drains .lauren/plans.json one plan at a time (claude → codex → claude → commit).',
+    'Plan queue executor — drains .lauren/todo.json one plan at a time (claude → codex → claude → commit).',
   );
 
   command

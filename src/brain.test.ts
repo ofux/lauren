@@ -9,7 +9,7 @@ import {
   readReadySummaries,
 } from './brain.js';
 import { PLANS_DIR } from './core/paths.js';
-import { PlanStore } from './core/store.js';
+import { TodoStore } from './core/store.js';
 import { type Plan, planFilePath } from './core/types.js';
 
 function makePlan(prefix: string, slug: string): Plan {
@@ -30,15 +30,15 @@ function makePlan(prefix: string, slug: string): Plan {
 
 describe('applyOrganizeDecision', () => {
   let tmpDir: string;
-  let store: PlanStore;
+  let store: TodoStore;
   let planPrefix: string;
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-brain-'));
     planPrefix = path.basename(tmpDir);
-    store = new PlanStore({
-      path: path.join(tmpDir, 'plans.json'),
-      lockPath: path.join(tmpDir, 'plans.json.lock'),
+    store = new TodoStore({
+      path: path.join(tmpDir, 'todo.json'),
+      lockPath: path.join(tmpDir, 'todo.json.lock'),
     });
   });
 
@@ -161,14 +161,14 @@ describe('applyOrganizeDecision', () => {
 
   test.each([
     -1, 0.5,
-  ])('leaves insert decisions with invalid position %s at the back of the queue', async (position) => {
+  ])('leaves normalized insert decisions with invalid position %s at the back of the queue', async (position) => {
     const existing = makePlan(planPrefix, 'a');
     const newPlan = makePlan(planPrefix, 'b');
     await store.add(existing);
     await store.add(newPlan);
 
     const summary = await applyPlaceDecision(store, newPlan, {
-      decision: 'insert',
+      kind: 'insert',
       position,
     });
 

@@ -7,7 +7,8 @@ import { render } from 'ink';
 import React from 'react';
 
 import { applyOrganizeDecision, brainOrganizeQueue, summarizeOrganizeDecision } from '../brain.js';
-import { printTodoTable } from '../cli/table.js';
+import { printTodoTable, type UnifiedRow } from '../cli/table.js';
+import { InboxStore } from '../core/inbox.js';
 import {
   ARCH_PATH,
   DOCS_DIR,
@@ -21,7 +22,7 @@ import {
   VIBE_PID_PATH,
 } from '../core/paths.js';
 import { validateSlug } from '../core/slug.js';
-import { PlanStore } from '../core/store.js';
+import { TodoStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
@@ -92,10 +93,12 @@ async function cmdPlan(seedPrompt?: string): Promise<number> {
     userPrompt,
   });
 
-  // Orphan check — a plan is "registered" if it lives in the store.
+  // Orphan check — a plan is "registered" if it lives in the todo store
+  // (already placed) or in the inbox (awaiting brain placement).
   if (await fileExists(PLANS_DIR)) {
-    const store = new PlanStore();
-    const allPlans = await store.read();
+    const store = new TodoStore();
+    const inboxStore = new InboxStore();
+    const allPlans = [...(await store.read()), ...(await inboxStore.read())];
     const registered = new Set(allPlans.map((p) => path.resolve(resolvePlanPath(p.path))));
     const entries = await fs.readdir(PLANS_DIR);
     const orphans: string[] = [];
@@ -197,13 +200,22 @@ async function cmdRegister(args: {
     return 1;
   }
 
-  const store = new PlanStore();
+  // Cross-store collision: refuse if slug already exists in either inbox or todo.
+  const todoStore = new TodoStore();
+  const inboxStore = new InboxStore();
+  if ((await todoStore.find(args.slug)) !== null) {
+    process.stderr.write(
+      `error: slug '${args.slug}' already in todo; pick a more specific name.\n`,
+    );
+    return 1;
+  }
+
   try {
-    await store.add(plan);
+    await inboxStore.add(plan);
   } catch (err) {
     if (err instanceof SlugCollision) {
       process.stderr.write(
-        `error: slug '${args.slug}' already queued; pick a more specific name.\n`,
+        `error: slug '${args.slug}' already in inbox; pick a more specific name.\n`,
       );
       return 1;
     }
@@ -236,7 +248,7 @@ async function cmdReorganize(opts: { yes: boolean; dryRun: boolean }): Promise<n
     return 1;
   }
 
-  const store = new PlanStore();
+  const store = new TodoStore();
   const ready = (await store.read()).filter((p) => p.status === 'ready');
   if (ready.length < 2) {
     process.stdout.write(
@@ -282,14 +294,23 @@ async function cmdReorganize(opts: { yes: boolean; dryRun: boolean }): Promise<n
   return 0;
 }
 
+function unifiedRows(inboxPlans: Plan[], todoPlans: Plan[]): UnifiedRow[] {
+  const rows: UnifiedRow[] = [];
+  for (const p of inboxPlans) rows.push({ plan: p, store: 'inbox' });
+  for (const p of todoPlans) rows.push({ plan: p, store: 'todo' });
+  return rows;
+}
+
 async function cmdTodoList(): Promise<number> {
-  const store = new PlanStore();
-  const plans = await store.read();
-  if (plans.length === 0) {
+  const todoStore = new TodoStore();
+  const inboxStore = new InboxStore();
+  const [todoPlans, inboxPlans] = await Promise.all([todoStore.read(), inboxStore.read()]);
+  const rows = unifiedRows(inboxPlans, todoPlans);
+  if (rows.length === 0) {
     process.stdout.write('(empty queue)\n');
     return 0;
   }
-  printTodoTable(plans);
+  printTodoTable(rows);
   return 0;
 }
 
@@ -299,9 +320,10 @@ async function cmdTodoTui(): Promise<number> {
     return cmdTodoList();
   }
 
-  const store = new PlanStore();
+  const todoStore = new TodoStore();
+  const inboxStore = new InboxStore();
 
-  const inkApp = render(React.createElement(TodoApp, { store }), {
+  const inkApp = render(React.createElement(TodoApp, { todoStore, inboxStore }), {
     exitOnCtrlC: true,
   });
 

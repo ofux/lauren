@@ -18,10 +18,12 @@ export interface LaurenContext {
   laurenDir: string;
   logRoot: string;
   plansDir: string;
-  plansStatePath: string;
-  plansStateLockPath: string;
+  todoPath: string;
+  lockPath: string;
   vibeLockPath: string;
   vibePidPath: string;
+  inboxPath: string;
+  inboxLockPath: string;
   docsDir: string;
   prdPath: string;
   archPath: string;
@@ -37,10 +39,12 @@ export function createLaurenContext(cwd: string = process.cwd()): LaurenContext 
     laurenDir,
     logRoot: path.join(laurenDir, 'logs'),
     plansDir: path.join(laurenDir, 'plans'),
-    plansStatePath: path.join(laurenDir, 'plans.json'),
-    plansStateLockPath: path.join(laurenDir, 'plans.json.lock'),
+    todoPath: path.join(laurenDir, 'todo.json'),
+    lockPath: path.join(laurenDir, 'todo.json.lock'),
     vibeLockPath: path.join(laurenDir, 'vibe.lock'),
     vibePidPath: path.join(laurenDir, 'vibe.pid'),
+    inboxPath: path.join(laurenDir, 'inbox.json'),
+    inboxLockPath: path.join(laurenDir, 'inbox.json.lock'),
     docsDir,
     prdPath: path.join(docsDir, 'PRD.md'),
     archPath: path.join(docsDir, 'ARCHITECTURE.md'),
@@ -55,8 +59,12 @@ export const REPO = DEFAULT_CONTEXT.repo;
 export const LAUREN_DIR = DEFAULT_CONTEXT.laurenDir;
 export const LOG_ROOT = DEFAULT_CONTEXT.logRoot;
 export const PLANS_DIR = DEFAULT_CONTEXT.plansDir;
+export const TODO_PATH = DEFAULT_CONTEXT.todoPath;
+export const LOCK_PATH = DEFAULT_CONTEXT.lockPath;
 export const VIBE_LOCK_PATH = DEFAULT_CONTEXT.vibeLockPath;
 export const VIBE_PID_PATH = DEFAULT_CONTEXT.vibePidPath;
+export const INBOX_PATH = DEFAULT_CONTEXT.inboxPath;
+export const INBOX_LOCK_PATH = DEFAULT_CONTEXT.inboxLockPath;
 
 export const DOCS_DIR = DEFAULT_CONTEXT.docsDir;
 export const PRD_PATH = DEFAULT_CONTEXT.prdPath;

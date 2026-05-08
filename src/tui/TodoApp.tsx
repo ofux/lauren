@@ -4,7 +4,8 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { type CancelOutcome, cancelPlan, isCancellable } from '../cancel.js';
-import type { PlanStore } from '../core/store.js';
+import type { InboxStore } from '../core/inbox.js';
+import type { TodoStore } from '../core/store.js';
 import { fmtAge } from '../core/time.js';
 import { type Plan, type PlanStatus, planFilePath } from '../core/types.js';
 import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
@@ -13,12 +14,18 @@ import { Spinner } from './Spinner.js';
 const POLL_INTERVAL_MS = 500;
 
 export interface TodoAppProps {
-  store: PlanStore;
+  todoStore: TodoStore;
+  inboxStore: InboxStore;
+}
+
+interface Row {
+  plan: Plan;
+  store: 'inbox' | 'todo';
 }
 
 type View =
   | { kind: 'browse' }
-  | { kind: 'confirm'; plan: Plan }
+  | { kind: 'confirm'; row: Row }
   | { kind: 'message'; outcome: CancelOutcome };
 
 function statusColor(status: PlanStatus): string | undefined {
@@ -47,18 +54,18 @@ function pad(s: string, width: number): string {
 }
 
 function PlanTable({
-  plans,
+  rows,
   selectedIndex,
 }: {
-  plans: Plan[];
+  rows: Row[];
   selectedIndex: number;
 }): React.ReactElement {
   const widths = useMemo(() => {
-    const slug = Math.max(4, ...plans.map((p) => p.slug.length));
-    const status = Math.max(12, ...plans.map((p) => p.status.length));
-    const title = Math.max(5, ...plans.map((p) => p.title.length));
+    const slug = Math.max(4, ...rows.map((r) => r.plan.slug.length));
+    const status = Math.max(12, ...rows.map((r) => r.plan.status.length));
+    const title = Math.max(5, ...rows.map((r) => r.plan.title.length));
     return { slug, status, title };
-  }, [plans]);
+  }, [rows]);
 
   return (
     <Box flexDirection="column">
@@ -67,28 +74,28 @@ function PlanTable({
           bold
         >{`  ${pad('status', widths.status)}  ${pad('slug', widths.slug)}  ${pad('title', widths.title)}  age`}</Text>
       </Box>
-      {plans.map((plan, i) => {
+      {rows.map((row, i) => {
         const selected = i === selectedIndex;
-        const cancellable = isCancellable(plan);
-        const color = statusColor(plan.status);
-        const dim = statusIsDim(plan.status);
+        const cancellable = isCancellable(row.plan);
+        const color = statusColor(row.plan.status);
+        const dim = statusIsDim(row.plan.status);
         const cursor = selected ? '▶ ' : '  ';
-        const age = fmtAge(plan.created_at);
+        const age = fmtAge(row.plan.created_at);
         const rowProps: { backgroundColor?: string } = selected ? { backgroundColor: 'gray' } : {};
         return (
-          <Box key={plan.slug} {...rowProps}>
+          <Box key={`${row.store}:${row.plan.slug}`} {...rowProps}>
             <Text color={selected ? 'white' : undefined} bold={selected}>
               {cursor}
             </Text>
             <Text {...(color ? { color } : {})} dimColor={dim} bold={selected || cancellable}>
-              {pad(plan.status, widths.status)}
+              {pad(row.plan.status, widths.status)}
             </Text>
             <Text> </Text>
             <Text bold dimColor={dim}>
-              {pad(plan.slug, widths.slug)}
+              {pad(row.plan.slug, widths.slug)}
             </Text>
             <Text> </Text>
-            <Text dimColor={dim}>{pad(plan.title, widths.title)}</Text>
+            <Text dimColor={dim}>{pad(row.plan.title, widths.title)}</Text>
             <Text dimColor>{`  ${age}`}</Text>
           </Box>
         );
@@ -160,15 +167,15 @@ function DescriptionPanel({ plan }: { plan: Plan }): React.ReactElement {
 }
 
 function HelpFooter({
-  hasPlans,
+  hasRows,
   selectedCancellable,
 }: {
-  hasPlans: boolean;
+  hasRows: boolean;
   selectedCancellable: boolean;
 }): React.ReactElement {
   return (
     <Box marginTop={1}>
-      {hasPlans ? (
+      {hasRows ? (
         <Text dimColor>
           {selectedCancellable
             ? '↑/↓ navigate · Enter or c cancel · q quit'
@@ -181,9 +188,17 @@ function HelpFooter({
   );
 }
 
-export function TodoApp({ store }: TodoAppProps): React.ReactElement {
+async function loadRows(todoStore: TodoStore, inboxStore: InboxStore): Promise<Row[]> {
+  const [inboxPlans, todoPlans] = await Promise.all([inboxStore.read(), todoStore.read()]);
+  const rows: Row[] = [];
+  for (const p of inboxPlans) rows.push({ plan: p, store: 'inbox' });
+  for (const p of todoPlans) rows.push({ plan: p, store: 'todo' });
+  return rows;
+}
+
+export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactElement {
   const { exit } = useApp();
-  const [plans, setPlans] = useState<Plan[]>([]);
+  const [rows, setRows] = useState<Row[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [view, setView] = useState<View>({ kind: 'browse' });
   const [error, setError] = useState<string | null>(null);
@@ -191,8 +206,8 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
-      const next = await store.read();
-      setPlans(next);
+      const next = await loadRows(todoStore, inboxStore);
+      setRows(next);
       setLoaded(true);
       setError(null);
       setSelectedIndex((prev) => {
@@ -204,7 +219,7 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
-  }, [store]);
+  }, [todoStore, inboxStore]);
 
   useEffect(() => {
     void refresh();
@@ -217,11 +232,16 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
   useInput((input, key) => {
     if (view.kind === 'confirm') {
       if (input === 'y' || input === 'Y') {
-        const target = view.plan;
+        const target = view.row;
         setView({ kind: 'browse' });
         void (async () => {
           try {
-            const outcome = await cancelPlan({ slug: target.slug, store });
+            const outcome = await cancelPlan({
+              slug: target.plan.slug,
+              store: target.store,
+              todoStore,
+              inboxStore,
+            });
             setView({ kind: 'message', outcome });
             await refresh();
           } catch (err) {
@@ -248,19 +268,19 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
       exit();
       return;
     }
-    if (plans.length === 0) return;
+    if (rows.length === 0) return;
     if (key.upArrow || input === 'k') {
       setSelectedIndex((i) => Math.max(0, i - 1));
       return;
     }
     if (key.downArrow || input === 'j') {
-      setSelectedIndex((i) => Math.min(plans.length - 1, i + 1));
+      setSelectedIndex((i) => Math.min(rows.length - 1, i + 1));
       return;
     }
     if (key.return || input === 'c') {
-      const plan = plans[selectedIndex];
-      if (!plan || !isCancellable(plan)) return;
-      setView({ kind: 'confirm', plan });
+      const row = rows[selectedIndex];
+      if (!row || !isCancellable(row.plan)) return;
+      setView({ kind: 'confirm', row });
       return;
     }
   });
@@ -274,8 +294,8 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
     );
   }
 
-  const current = plans[selectedIndex];
-  const selectedCancellable = current ? isCancellable(current) : false;
+  const currentRow = rows[selectedIndex];
+  const selectedCancellable = currentRow ? isCancellable(currentRow.plan) : false;
 
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -283,27 +303,27 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
         <Text color="magenta" bold>
           ✨ lauren todo
         </Text>
-        <Text dimColor>{`  (${plans.length} plan${plans.length === 1 ? '' : 's'})`}</Text>
+        <Text dimColor>{`  (${rows.length} plan${rows.length === 1 ? '' : 's'})`}</Text>
       </Box>
       {error && (
         <Box marginBottom={1}>
           <Text color="red">error: {error}</Text>
         </Box>
       )}
-      {plans.length === 0 ? (
+      {rows.length === 0 ? (
         <Text dimColor italic>
           (empty queue)
         </Text>
       ) : (
-        <PlanTable plans={plans} selectedIndex={selectedIndex} />
+        <PlanTable rows={rows} selectedIndex={selectedIndex} />
       )}
-      {current && <DescriptionPanel plan={current} />}
-      <HelpFooter hasPlans={plans.length > 0} selectedCancellable={selectedCancellable} />
+      {currentRow && <DescriptionPanel plan={currentRow.plan} />}
+      <HelpFooter hasRows={rows.length > 0} selectedCancellable={selectedCancellable} />
       {view.kind === 'confirm' && (
         <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
           <Text>
-            Cancel <Text bold>{view.plan.slug}</Text> (currently{' '}
-            <Text bold>{view.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
+            Cancel <Text bold>{view.row.plan.slug}</Text> (currently{' '}
+            <Text bold>{view.row.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
           </Text>
         </Box>
       )}

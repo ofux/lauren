@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
-import type { PlanStore } from './core/store.js';
+import type { TodoStore } from './core/store.js';
 import type { Plan } from './core/types.js';
 import { resolveWorkspaceRepos } from './core/workspace.js';
 import { revertWorkingTree } from './proc/git.js';
@@ -39,10 +39,10 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
   };
 }
 
-function makeStore(): PlanStore {
+function makeStore(): TodoStore {
   return {
     update: vi.fn(async () => makePlan({ status: 'cancelled' })),
-  } as unknown as PlanStore;
+  } as unknown as TodoStore;
 }
 
 describe('finalizeCancelledImplementingPlans', () => {
