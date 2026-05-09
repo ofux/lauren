@@ -68,7 +68,7 @@ export function newPlanRuntimeState(args: {
 function failureMessageHasCommitRecovery(message: string, slug: string): boolean {
   return (
     message.toLowerCase().includes('commit manually') &&
-    message.includes(`lauren vibe retry ${slug}`)
+    message.includes(`press \`t\` on '${slug}' in \`lauren\``)
   );
 }
 
@@ -175,9 +175,47 @@ export class WatcherRuntime implements ProgressSink {
     const trailer = hasRecoveryHint
       ? `  ${ready} plan(s) queued behind it.`
       : `  ${ready} plan(s) queued behind it.\n` +
-        `  Run \`lauren vibe retry ${failedPlan.slug}\` to resume, or ` +
-        `\`lauren todo\` and cancel it.`;
+        `  Press \`t\` on '${failedPlan.slug}' in \`lauren\` to reset it to ready, ` +
+        `or cancel it from there.`;
     this.idleMessage = `PAUSED: plan '${failedPlan.slug}' failed at ${step}.\n${indentedMsg}\n${trailer}`;
+    if (isNewPause) playPauseNotification();
+    this.notify();
+  }
+
+  setPausedCancelling(plans: Plan[], plan: Plan): void {
+    const isNewPause = this.pausedSlug !== plan.slug;
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
+    this.planProgress = null;
+    this.idleState = 'paused';
+    this.pausedSlug = plan.slug;
+    const ready = plans.filter((p) => p.status === 'ready').length;
+    this.idleMessage =
+      `PAUSED: plan '${plan.slug}' is cancelling — uncommitted changes left on disk.\n` +
+      `  Inspect with \`git status\`, then commit/stash/discard, and set\n` +
+      `  status to 'cancelled' in .lauren/plans.json to resume.\n` +
+      `  ${ready} plan(s) queued behind it.`;
+    if (isNewPause) playPauseNotification();
+    this.notify();
+  }
+
+  setPausedDirtyWorkspace(plans: Plan[], dirtyRepos: string): void {
+    const isNewPause = this.pausedSlug !== '__dirty_workspace__';
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
+    this.planProgress = null;
+    this.idleState = 'paused';
+    this.pausedSlug = '__dirty_workspace__';
+    const ready = plans.filter((p) => p.status === 'ready').length;
+    this.idleMessage =
+      `PAUSED: working tree is dirty after cancellation cleared.\n` +
+      `  Dirty repo(s): ${dirtyRepos}.\n` +
+      `  Commit/stash/discard changes before vibe resumes.\n` +
+      `  ${ready} plan(s) queued behind it.`;
     if (isNewPause) playPauseNotification();
     this.notify();
   }

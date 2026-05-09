@@ -44,7 +44,7 @@ describe('formatCommitFailureMessage', () => {
     const msg = formatCommitFailureMessage(baseArgs);
     expect(msg).toContain("repo 'backend' (apps/backend)");
     expect(msg).toContain('feat-x: PR 1.2 — Add foo');
-    expect(msg).toContain('lauren vibe retry feat-x');
+    expect(msg).toContain("press `t` on 'feat-x' in `lauren`");
   });
 
   test('includes the git tail when present', () => {

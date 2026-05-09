@@ -6,9 +6,7 @@ import { Command } from 'commander';
 import { render } from 'ink';
 import React from 'react';
 
-import { applyOrganizeDecision, brainOrganizeQueue, summarizeOrganizeDecision } from '../brain.js';
-import { printTodoTable, type UnifiedRow } from '../cli/table.js';
-import { InboxStore } from '../core/inbox.js';
+import { printTodoTable } from '../cli/table.js';
 import {
   ARCH_PATH,
   DOCS_DIR,
@@ -19,17 +17,15 @@ import {
   PRD_PATH,
   resolvePlanPath,
   TESTING_PATH,
-  VIBE_PID_PATH,
 } from '../core/paths.js';
 import { validateSlug } from '../core/slug.js';
-import { TodoStore } from '../core/store.js';
+import { PlanStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
 import { PLAN_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT } from '../lauren-prompts.js';
 import { runClaudeInteractive } from '../proc/claude.js';
 import { slugHasLaurenHistory } from '../proc/git.js';
-import { readLivePid } from '../proc/pid.js';
 import { TodoApp } from '../tui/TodoApp.js';
 import { confirm } from '../util/confirm.js';
 import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
@@ -93,12 +89,10 @@ async function cmdPlan(seedPrompt?: string): Promise<number> {
     userPrompt,
   });
 
-  // Orphan check — a plan is "registered" if it lives in the todo store
-  // (already placed) or in the inbox (awaiting brain placement).
+  // Orphan check — a plan is "registered" if it lives in the store.
   if (await fileExists(PLANS_DIR)) {
-    const store = new TodoStore();
-    const inboxStore = new InboxStore();
-    const allPlans = [...(await store.read()), ...(await inboxStore.read())];
+    const store = new PlanStore();
+    const allPlans = await store.read();
     const registered = new Set(allPlans.map((p) => path.resolve(resolvePlanPath(p.path))));
     const entries = await fs.readdir(PLANS_DIR);
     const orphans: string[] = [];
@@ -200,22 +194,13 @@ async function cmdRegister(args: {
     return 1;
   }
 
-  // Cross-store collision: refuse if slug already exists in either inbox or todo.
-  const todoStore = new TodoStore();
-  const inboxStore = new InboxStore();
-  if ((await todoStore.find(args.slug)) !== null) {
-    process.stderr.write(
-      `error: slug '${args.slug}' already in todo; pick a more specific name.\n`,
-    );
-    return 1;
-  }
-
+  const store = new PlanStore();
   try {
-    await inboxStore.add(plan);
+    await store.add(plan);
   } catch (err) {
     if (err instanceof SlugCollision) {
       process.stderr.write(
-        `error: slug '${args.slug}' already in inbox; pick a more specific name.\n`,
+        `error: slug '${args.slug}' already queued; pick a more specific name.\n`,
       );
       return 1;
     }
@@ -235,82 +220,14 @@ async function cmdRegister(args: {
   return 0;
 }
 
-async function cmdReorganize(opts: { yes: boolean; dryRun: boolean }): Promise<number> {
-  await fs.mkdir(LAUREN_DIR, { recursive: true });
-
-  // Refuse if vibe is running — vibe owns the todo queue while alive, and
-  // a concurrent reorganize would race the implement loop's claim step.
-  const vibePid = await readLivePid(VIBE_PID_PATH);
-  if (vibePid !== null) {
-    process.stderr.write(
-      `error: lauren vibe is running (pid ${vibePid}); stop it before reorganizing.\n`,
-    );
-    return 1;
-  }
-
-  const store = new TodoStore();
-  const ready = (await store.read()).filter((p) => p.status === 'ready');
-  if (ready.length < 2) {
-    process.stdout.write(
-      `only ${ready.length} ready plan(s); nothing for the brain to organize.\n`,
-    );
-    return 0;
-  }
-
-  process.stdout.write(`asking brain to organize ${ready.length} ready plan(s)…\n`);
-  let decision: Awaited<ReturnType<typeof brainOrganizeQueue>>['decision'];
-  try {
-    ({ decision } = await brainOrganizeQueue(store));
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`error: brain failed: ${msg}\n`);
-    return 1;
-  }
-
-  const reasoning = typeof decision.reasoning === 'string' ? decision.reasoning.trim() : '';
-  process.stdout.write('\nbrain proposes:\n');
-  for (const line of summarizeOrganizeDecision(decision)) {
-    process.stdout.write(`  ${line}\n`);
-  }
-  if (reasoning) process.stdout.write(`reasoning: ${reasoning}\n`);
-
-  const ops = decision.operations ?? [];
-  if (ops.length === 0) return 0;
-
-  if (opts.dryRun) {
-    process.stdout.write('\n[dry-run] no mutations applied.\n');
-    return 0;
-  }
-
-  if (!opts.yes && !(await confirm('\nApply these operations?'))) {
-    process.stdout.write('aborted; queue unchanged.\n');
-    return 0;
-  }
-
-  process.stdout.write('\n');
-  for (const line of await applyOrganizeDecision(store, decision)) {
-    process.stdout.write(`${line}\n`);
-  }
-  return 0;
-}
-
-function unifiedRows(inboxPlans: Plan[], todoPlans: Plan[]): UnifiedRow[] {
-  const rows: UnifiedRow[] = [];
-  for (const p of inboxPlans) rows.push({ plan: p, store: 'inbox' });
-  for (const p of todoPlans) rows.push({ plan: p, store: 'todo' });
-  return rows;
-}
-
 async function cmdTodoList(): Promise<number> {
-  const todoStore = new TodoStore();
-  const inboxStore = new InboxStore();
-  const [todoPlans, inboxPlans] = await Promise.all([todoStore.read(), inboxStore.read()]);
-  const rows = unifiedRows(inboxPlans, todoPlans);
-  if (rows.length === 0) {
+  const store = new PlanStore();
+  const plans = await store.read();
+  if (plans.length === 0) {
     process.stdout.write('(empty queue)\n');
     return 0;
   }
-  printTodoTable(rows);
+  printTodoTable(plans);
   return 0;
 }
 
@@ -320,10 +237,9 @@ async function cmdTodoTui(): Promise<number> {
     return cmdTodoList();
   }
 
-  const todoStore = new TodoStore();
-  const inboxStore = new InboxStore();
+  const store = new PlanStore();
 
-  const inkApp = render(React.createElement(TodoApp, { todoStore, inboxStore }), {
+  const inkApp = render(React.createElement(TodoApp, { store }), {
     exitOnCtrlC: true,
   });
 
@@ -333,7 +249,15 @@ async function cmdTodoTui(): Promise<number> {
 
 async function main(): Promise<void> {
   const program = new Command();
-  program.name('lauren').description('Queue-driven plan/vibe lifecycle runner.').version('0.1.0');
+  program
+    .name('lauren')
+    .description('Queue-driven plan/vibe lifecycle runner.')
+    .version('0.1.0')
+    .allowExcessArguments(false)
+    .option('--list', 'print a static table and exit (no TUI)', false)
+    .action(async (opts: { list: boolean }) => {
+      process.exit(opts.list ? await cmdTodoList() : await cmdTodoTui());
+    });
 
   program
     .command('spec')
@@ -348,23 +272,6 @@ async function main(): Promise<void> {
     .argument('[seed_prompt]', 'optional seed message for the planner')
     .action(async (seedPrompt?: string) => {
       process.exit(await cmdPlan(seedPrompt));
-    });
-
-  program
-    .command('reorganize')
-    .description('re-think the whole ready todo queue (one-shot; may reorder and merge)')
-    .option('--dry-run', 'print what brain would decide without applying', false)
-    .option('-y, --yes', 'apply without asking for confirmation', false)
-    .action(async (opts: { dryRun: boolean; yes: boolean }) => {
-      process.exit(await cmdReorganize({ yes: opts.yes, dryRun: opts.dryRun }));
-    });
-
-  program
-    .command('todo')
-    .description('show the merged inbox+todo table (interactive TUI; --list for plain table)')
-    .option('--list', 'print a static table and exit (no TUI)', false)
-    .action(async (opts: { list: boolean }) => {
-      process.exit(opts.list ? await cmdTodoList() : await cmdTodoTui());
     });
 
   configureVibeCommand(program.command('vibe'));

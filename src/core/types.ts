@@ -1,25 +1,28 @@
 import path from 'node:path';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
-import { migratePrEntry, type PrEntry } from './prs.js';
+import type { PrEntry } from './prs.js';
 
 export type PlanStatus =
   | 'enqueued'
   | 'preparing'
   | 'ready'
   | 'implementing'
+  | 'cancelling'
   | 'failed'
   | 'done'
   | 'cancelled';
 
-export const PLAN_STATUSES: readonly PlanStatus[] = [
-  'enqueued',
-  'preparing',
-  'ready',
-  'implementing',
-  'failed',
-  'done',
-  'cancelled',
-] as const;
+/**
+ * Set alongside `cancel_requested` to tell the vibe daemon how to finalize
+ * a cancellation on an `implementing` plan.
+ *   'revert' — abort the subprocess, revert the working tree, mark
+ *              'cancelled'. This is the legacy default (absent = 'revert').
+ *   'keep'   — abort the subprocess but leave the working tree untouched.
+ *              The plan is marked 'cancelling' and the daemon pauses until
+ *              the user manually resolves it (commit/stash + flip status
+ *              to 'cancelled').
+ */
+export type CancelIntent = 'revert' | 'keep';
 
 export interface PlanFailure {
   step: string;
@@ -34,6 +37,12 @@ export interface Plan {
   target_repos: string[];
   status: PlanStatus;
   cancel_requested: boolean;
+  /**
+   * When `cancel_requested` is true on an `implementing` plan, this field
+   * encodes whether the daemon should revert the working tree before
+   * finalizing. Absent / null = 'revert' (legacy default).
+   */
+  cancel_intent?: CancelIntent;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -118,59 +127,11 @@ export class PlanSelfMerge extends Error {
   }
 }
 
-/**
- * Coerce a plan record loaded from disk into the current schema.
- * Adds defaults for fields introduced after v1 (kept under SCHEMA_VERSION 1
- * for forward-compat) and migrates legacy status values to the new union.
- *
- * The status migration is store-specific (inbox 'pending' → 'enqueued';
- * todo 'pending' → 'ready', 'in_progress' → 'implementing'). Pass which
- * surface this plan came from via `surface`.
- */
-export function migratePlanRecord(raw: unknown, surface: 'inbox' | 'todo'): Plan {
-  const r = raw as Record<string, unknown>;
-  const rawStatus = typeof r.status === 'string' ? r.status : '';
-  let status: PlanStatus;
-  if (surface === 'inbox') {
-    status = rawStatus === 'pending' ? 'enqueued' : (rawStatus as PlanStatus);
-  } else {
-    if (rawStatus === 'pending') status = 'ready';
-    else if (rawStatus === 'in_progress') status = 'implementing';
-    else status = rawStatus as PlanStatus;
+export class PlanPreconditionFailed extends Error {
+  readonly slug: string;
+  constructor(slug: string, detail: string) {
+    super(`plan '${slug}' failed update precondition: ${detail}`);
+    this.name = 'PlanPreconditionFailed';
+    this.slug = slug;
   }
-  return {
-    slug: String(r.slug ?? ''),
-    title: String(r.title ?? ''),
-    path: String(r.path ?? ''),
-    target_repos: Array.isArray(r.target_repos)
-      ? r.target_repos.filter((repo): repo is string => typeof repo === 'string')
-      : [],
-    status,
-    cancel_requested: r.cancel_requested === true,
-    created_at: String(r.created_at ?? ''),
-    started_at: typeof r.started_at === 'string' ? r.started_at : null,
-    finished_at: typeof r.finished_at === 'string' ? r.finished_at : null,
-    failure:
-      r.failure && typeof r.failure === 'object'
-        ? {
-            step: String((r.failure as Record<string, unknown>).step ?? 'unknown'),
-            pr_id:
-              typeof (r.failure as Record<string, unknown>).pr_id === 'string'
-                ? ((r.failure as Record<string, unknown>).pr_id as string)
-                : null,
-            message: String((r.failure as Record<string, unknown>).message ?? ''),
-          }
-        : null,
-    prs: migratePrs(r.prs),
-  };
-}
-
-function migratePrs(raw: unknown): PrEntry[] | null {
-  if (!Array.isArray(raw)) return null;
-  const out: PrEntry[] = [];
-  for (const item of raw) {
-    const entry = migratePrEntry(item);
-    if (entry !== null) out.push(entry);
-  }
-  return out;
 }

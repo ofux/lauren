@@ -3,10 +3,9 @@ import type { Command } from 'commander';
 import { render } from 'ink';
 import React from 'react';
 
-import { InboxStore } from './core/inbox.js';
 import { displayPath, LAUREN_DIR, VIBE_LOCK_PATH, VIBE_PID_PATH } from './core/paths.js';
-import { TodoStore } from './core/store.js';
-import { ImplementingLocked, type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
+import { PlanStore } from './core/store.js';
+import { type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
 import {
   formatRepoList,
   type ResolvedWorkspaceRepo,
@@ -17,7 +16,8 @@ import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
 import { WatcherRuntime } from './tui/runtime.js';
 import {
-  markPlanCancelled,
+  handleCancelSignal,
+  markPlanFinal,
   tryAcquireVibeLock,
   type WatcherLoopHandles,
   watcherLoop,
@@ -35,7 +35,7 @@ async function resolveCancelledPlanRepos(plans: readonly Plan[]): Promise<Resolv
 }
 
 export async function finalizeCancelledImplementingPlans(
-  store: TodoStore,
+  store: PlanStore,
   plans: Plan[],
 ): Promise<boolean> {
   try {
@@ -52,7 +52,7 @@ export async function finalizeCancelledImplementingPlans(
   }
 
   for (const plan of plans) {
-    await markPlanCancelled(store, plan);
+    await markPlanFinal(store, plan.slug, { status: 'cancelled', cancel_requested: false });
   }
   const slugs = plans.map((p) => p.slug).join(', ');
   process.stdout.write(`cancelled '${slugs}'; reverted working tree.\n`);
@@ -65,29 +65,29 @@ function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceR
 
 async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   await fs.mkdir(LAUREN_DIR, { recursive: true });
-  const store = new TodoStore();
-  const inboxStore = new InboxStore();
+  const store = new PlanStore();
 
   if (opts.dryRun) {
     const plans = await store.read();
-    const inboxPlans = await inboxStore.read();
-    process.stdout.write(`Inbox (${inboxPlans.length} plan(s)):\n`);
-    for (const p of inboxPlans) {
-      process.stdout.write(`  [${p.status}] ${p.slug} — ${p.title}\n`);
-    }
     process.stdout.write(`Queue (${plans.length} plan(s)):\n`);
     for (const p of plans) {
       process.stdout.write(`  [${p.status}] ${p.slug} — ${p.title}\n`);
     }
+    const enqueued = plans.filter((p) => p.status === 'enqueued');
     const ready = plans.filter((p) => p.status === 'ready');
     const implementing = plans.filter((p) => p.status === 'implementing');
+    const cancelling = plans.filter((p) => p.status === 'cancelling');
     const failed = plans.filter((p) => p.status === 'failed');
     if (implementing.length > 0) {
       process.stdout.write(
         `\nWould refuse to start: implementing = ${JSON.stringify(implementing.map((p) => p.slug))}\n`,
       );
-    } else if (inboxPlans.length > 0) {
-      process.stdout.write(`\nWould drain inbox first (${inboxPlans.length} plan(s)).\n`);
+    } else if (cancelling.length > 0) {
+      process.stdout.write(
+        `\nWould pause: cancelling = ${JSON.stringify(cancelling.map((p) => p.slug))}\n`,
+      );
+    } else if (enqueued.length > 0) {
+      process.stdout.write(`\nWould drain enqueued plans first (${enqueued.length} plan(s)).\n`);
     } else if (failed.length > 0) {
       process.stdout.write(
         `\nWould pause: failed = ${JSON.stringify(failed.map((p) => p.slug))}\n`,
@@ -119,29 +119,56 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   if (implementing.length > 0) {
     const cancellable = implementing.filter((p) => p.cancel_requested);
     if (cancellable.length === implementing.length) {
-      const finalized = await finalizeCancelledImplementingPlans(store, cancellable);
+      // Honor cancel_requested set while the prior process was down. Split
+      // by intent: revert-intent plans get the working tree reverted and
+      // are marked 'cancelled' (today's behavior); keep-intent plans are
+      // demoted to 'cancelling' inline (no tree change) and the loop will
+      // pause on them.
+      const revertGroup = cancellable.filter((p) => p.cancel_intent !== 'keep');
+      const keepGroup = cancellable.filter((p) => p.cancel_intent === 'keep');
+      if (revertGroup.length > 0) {
+        const finalized = await finalizeCancelledImplementingPlans(store, revertGroup);
+        if (!finalized) {
+          await releasePidFile().catch(() => undefined);
+          await releaseVibeLock().catch(() => undefined);
+          return 1;
+        }
+      }
+      for (const p of keepGroup) {
+        await markPlanFinal(store, p.slug, {
+          status: 'cancelling',
+          cancel_requested: false,
+          cancel_intent: undefined,
+        });
+      }
+      if (keepGroup.length === 0) {
+        await releasePidFile().catch(() => undefined);
+        await releaseVibeLock().catch(() => undefined);
+        return 0;
+      }
+      // Fall through: keep-intent plans are now 'cancelling'; the loop will
+      // enter the paused state on them.
+    } else {
       await releasePidFile().catch(() => undefined);
-      await releaseVibeLock().catch(() => undefined);
-      return finalized ? 0 : 1;
+      await releaseVibeLock();
+      const slugs = implementing.map((p) => p.slug).join(', ');
+      process.stderr.write(
+        `error: plan(s) ${slugs} marked implementing (likely from a crashed run). ` +
+          `Inspect with \`git status\`, clean the working tree, then manually set ` +
+          `\`status: "ready"\` (and clear \`started_at\`/\`failure\`) for each row in ` +
+          `\`.lauren/plans.json\`.\n`,
+      );
+      return 1;
     }
-    await releasePidFile().catch(() => undefined);
-    await releaseVibeLock();
-    const slugs = implementing.map((p) => p.slug).join(', ');
-    process.stderr.write(
-      `error: plan(s) ${slugs} marked implementing (likely from a crashed run). ` +
-        `Inspect with \`git status\`, clean the working tree, then run ` +
-        `\`lauren vibe retry <slug>\` to retry from scratch.\n`,
-    );
-    return 1;
   }
 
-  // Recover from a crashed run that left inbox rows in `preparing`. Demote
-  // them back to `enqueued` so the drain loop can place them fresh on this
-  // run. Honors cancel_requested set while the prior process was down.
-  const stalePreparing = (await inboxStore.read()).filter((p) => p.status === 'preparing');
+  // Recover from a crashed run that left rows in `preparing`. Demote them
+  // back to `enqueued` so the drain loop can place them fresh on this run.
+  // Honors cancel_requested set while the prior process was down.
+  const stalePreparing = (await store.read()).filter((p) => p.status === 'preparing');
   for (const plan of stalePreparing) {
     try {
-      await inboxStore.update(plan.slug, { status: 'enqueued' }, { allowPreparing: true });
+      await store.update(plan.slug, { status: 'enqueued' }, { allowPreparing: true });
     } catch (err) {
       if (!(err instanceof PreparingLocked) && !(err instanceof PlanNotFound)) {
         throw err;
@@ -149,25 +176,31 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     }
   }
 
-  let dirty: ResolvedWorkspaceRepo[];
-  try {
-    dirty = dirtyRepos(await resolveWorkspaceRepos());
-  } catch (err) {
-    await releasePidFile().catch(() => undefined);
-    await releaseVibeLock().catch(() => undefined);
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`error: ${msg}\n`);
-    return 1;
-  }
-  if (dirty.length > 0) {
-    await releasePidFile().catch(() => undefined);
-    await releaseVibeLock().catch(() => undefined);
-    process.stderr.write(
-      `error: working tree is dirty in ${formatRepoList(
-        dirty,
-      )}. Commit or stash changes before running lauren vibe.\n`,
-    );
-    return 1;
+  // If any plan is 'cancelling', the working tree is expected to be dirty
+  // (the user kept the partial work). Skip the dirty-tree refusal — the
+  // watcher loop will enter the paused state and tell the user what to do.
+  const hasCancelling = (await store.read()).some((p) => p.status === 'cancelling');
+  if (!hasCancelling) {
+    let dirty: ResolvedWorkspaceRepo[];
+    try {
+      dirty = dirtyRepos(await resolveWorkspaceRepos());
+    } catch (err) {
+      await releasePidFile().catch(() => undefined);
+      await releaseVibeLock().catch(() => undefined);
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`error: ${msg}\n`);
+      return 1;
+    }
+    if (dirty.length > 0) {
+      await releasePidFile().catch(() => undefined);
+      await releaseVibeLock().catch(() => undefined);
+      process.stderr.write(
+        `error: working tree is dirty in ${formatRepoList(
+          dirty,
+        )}. Commit or stash changes before running lauren vibe.\n`,
+      );
+      return 1;
+    }
   }
 
   process.stdout.write('✨ vibe watcher started. Ctrl-C to stop.\n\n');
@@ -199,39 +232,18 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   process.on('SIGINT', sigint);
 
   // SIGUSR2 = TUI requests cancellation of the in-flight plan. Dispatch by
-  // phase: in 'organizing', re-read the inbox row and abort the brain
-  // subprocess; in 'implementing', re-read the todo row and abort the
-  // executor. Either way the loop drops the cancelled row and continues.
-  const sigusr2 = async (): Promise<void> => {
-    const slug = handles.current.slug;
-    if (!slug) return;
-    try {
-      if (handles.phase.value === 'organizing') {
-        const fresh = await inboxStore.find(slug);
-        if (fresh?.cancel_requested) {
-          handles.brainState.controller?.abort();
-        }
-        return;
-      }
-      if (handles.phase.value === 'implementing') {
-        const fresh = await store.find(slug);
-        if (fresh?.cancel_requested) {
-          handles.cancelController.ref?.abort();
-        }
-      }
-    } catch {
-      // ignore
-    }
-  };
+  // phase: in 'organizing', abort the brain subprocess; in 'implementing',
+  // abort the executor. Either way the loop drops the cancelled row and
+  // continues. See handleCancelSignal for the race-handling details.
   process.on('SIGUSR2', () => {
-    void sigusr2();
+    void handleCancelSignal(store, handles);
   });
 
   let inFlight: Plan | null = null;
   let cancelledSlug: string | null = null;
   let loopError: unknown = null;
   try {
-    const result = await watcherLoop(runtime, store, inboxStore, abortController.signal, handles);
+    const result = await watcherLoop(runtime, store, abortController.signal, handles);
     inFlight = result.inFlight;
     cancelledSlug = result.cancelledSlug;
   } catch (err) {
@@ -284,72 +296,15 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   return exitCode;
 }
 
-async function cmdRetry(slug: string): Promise<number> {
-  const store = new TodoStore();
-  const plan = await store.find(slug);
-  if (plan === null) {
-    process.stderr.write(`error: slug not found: ${slug}\n`);
-    return 1;
-  }
-  if (plan.status !== 'failed' && plan.status !== 'implementing') {
-    process.stderr.write(
-      `error: plan '${slug}' is '${plan.status}', not failed or implementing. ` +
-        `Only failed or implementing plans can be retried.\n`,
-    );
-    return 1;
-  }
-  if (plan.status === 'implementing') {
-    const releaseVibeLock = await tryAcquireVibeLock();
-    if (releaseVibeLock === null) {
-      process.stderr.write(
-        `error: plan '${slug}' is implementing and a vibe watcher is still running. ` +
-          `Stop the watcher first, or wait for it to finish the current run.\n`,
-      );
-      return 1;
-    }
-    await releaseVibeLock();
-  }
-  try {
-    await store.update(
-      slug,
-      {
-        status: 'ready',
-        started_at: null,
-        finished_at: null,
-        failure: null,
-        cancel_requested: false,
-      },
-      { allowImplementing: true },
-    );
-  } catch (err) {
-    if (err instanceof ImplementingLocked || err instanceof PlanNotFound) {
-      process.stderr.write(`error: ${err.message}\n`);
-      return 1;
-    }
-    throw err;
-  }
-  process.stdout.write(`retrying '${slug}' — back to ready\n`);
-  return 0;
-}
-
 export function configureVibeCommand(command: Command): Command {
-  command.description(
-    'Plan queue executor — drains .lauren/todo.json one plan at a time (claude → codex → claude → commit).',
-  );
-
   command
+    .description(
+      'Plan queue executor — drains .lauren/plans.json one plan at a time (claude → codex → claude → commit).',
+    )
+    .allowExcessArguments(false)
     .option('--dry-run', 'print queue and exit without running anything', false)
     .action(async (opts: { dryRun: boolean }) => {
-      // Default action — only fires when no subcommand was given.
       process.exit(await cmdVibe(opts));
-    });
-
-  command
-    .command('retry')
-    .description('reset a failed or implementing plan back to ready')
-    .argument('<slug>')
-    .action(async (slug: string) => {
-      process.exit(await cmdRetry(slug));
     });
 
   return command;

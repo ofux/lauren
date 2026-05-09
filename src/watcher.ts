@@ -2,20 +2,26 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
-import type { InboxStore } from './core/inbox.js';
 import { VIBE_LOCK_PATH } from './core/paths.js';
 import { materializePrs, type PrEntry } from './core/prs.js';
-import type { TodoStore } from './core/store.js';
+import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
   ImplementingLocked,
   type Plan,
   type PlanFailure,
   PlanNotFound,
+  PlanPreconditionFailed,
   planFilePath,
 } from './core/types.js';
+import {
+  formatRepoList,
+  type ResolvedWorkspaceRepo,
+  resolveWorkspaceRepos,
+} from './core/workspace.js';
 import { RunFailure, runPlan } from './executor.js';
-import { type BrainCancelState, processInboxPlan } from './organize.js';
+import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
+import { workingTreeDirty } from './proc/git.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 
 export const IDLE_POLL_SECONDS = 3.0;
@@ -42,6 +48,10 @@ async function planFileExists(plan: Plan): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceRepo[] {
+  return repos.filter((repo) => workingTreeDirty(repo.root));
 }
 
 export async function tryAcquireVibeLock(): Promise<(() => Promise<void>) | null> {
@@ -80,64 +90,18 @@ function failureFromError(err: unknown): PlanFailure {
   };
 }
 
-async function markPlanMissing(store: TodoStore, plan: Plan): Promise<void> {
-  const failure: PlanFailure = {
-    step: 'implement',
-    pr_id: null,
-    message: `plan file missing: ${plan.path}`,
-  };
+/**
+ * Move a plan into a terminal status (done/failed/cancelled). Stamps
+ * `finished_at` and swallows `ImplementingLocked` / `PlanNotFound` so a
+ * concurrent cancel or removal during finalization doesn't propagate.
+ */
+export async function markPlanFinal(
+  store: PlanStore,
+  slug: string,
+  fields: Partial<Omit<Plan, 'slug' | 'finished_at'>>,
+): Promise<void> {
   try {
-    await store.update(plan.slug, {
-      status: 'failed',
-      finished_at: nowIso(),
-      failure,
-    });
-  } catch (err) {
-    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
-      throw err;
-    }
-  }
-}
-
-async function markPlanFailed(store: TodoStore, plan: Plan, failure: PlanFailure): Promise<void> {
-  try {
-    await store.update(
-      plan.slug,
-      { status: 'failed', finished_at: nowIso(), failure },
-      { allowImplementing: true },
-    );
-  } catch (err) {
-    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
-      throw err;
-    }
-  }
-}
-
-async function markPlanDone(store: TodoStore, plan: Plan): Promise<void> {
-  try {
-    await store.update(
-      plan.slug,
-      { status: 'done', finished_at: nowIso() },
-      { allowImplementing: true },
-    );
-  } catch (err) {
-    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
-      throw err;
-    }
-  }
-}
-
-async function markPlanCancelled(store: TodoStore, plan: Plan): Promise<void> {
-  try {
-    await store.update(
-      plan.slug,
-      {
-        status: 'cancelled',
-        finished_at: nowIso(),
-        cancel_requested: false,
-      },
-      { allowImplementing: true },
-    );
+    await store.update(slug, { ...fields, finished_at: nowIso() }, { allowImplementing: true });
   } catch (err) {
     if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
       throw err;
@@ -146,6 +110,39 @@ async function markPlanCancelled(store: TodoStore, plan: Plan): Promise<void> {
 }
 
 export type DaemonPhase = 'idle' | 'organizing' | 'implementing';
+
+/**
+ * Handle a SIGUSR2 cancellation request: abort the in-flight subprocess
+ * matching the current phase, but only if (a) there is an in-flight slug,
+ * (b) that slug actually has `cancel_requested=true` on disk, and (c) it's
+ * still the in-flight slug after the disk read.
+ *
+ * (c) is the load-bearing check: between capturing the slug and reading
+ * the store, the daemon can transition phase (organizing → idle →
+ * implementing of a different plan). Without the re-verify we'd dispatch
+ * the abort on the *current* phase/controller — which now belongs to an
+ * unrelated subprocess.
+ */
+export async function handleCancelSignal(
+  store: { find: (slug: string) => Promise<Plan | null> },
+  handles: WatcherLoopHandles,
+): Promise<void> {
+  const slug = handles.current.slug;
+  if (!slug) return;
+  let fresh: Plan | null;
+  try {
+    fresh = await store.find(slug);
+  } catch {
+    return;
+  }
+  if (!fresh?.cancel_requested) return;
+  if (handles.current.slug !== slug) return;
+  if (handles.phase.value === 'organizing') {
+    handles.brainState.controller?.abort();
+  } else if (handles.phase.value === 'implementing') {
+    handles.cancelController.ref?.abort();
+  }
+}
 
 export interface WatcherLoopHandles {
   /**
@@ -173,32 +170,28 @@ export interface WatcherLoopHandles {
 }
 
 /**
- * Drain the inbox by running brain placement on each enqueued/preparing
- * plan until none remain. Phase 'organizing' is held throughout. Errors
- * are reported via stderr and the loop sleeps briefly to avoid hot-looping
- * on a broken plan.
+ * Drain every `enqueued` plan by running brain placement until none remain.
+ * Phase 'organizing' is held throughout. Errors are reported via stderr and
+ * the loop sleeps briefly to avoid hot-looping on a broken plan.
  */
-async function drainInbox(
+async function drainEnqueued(
   runtime: WatcherRuntime,
-  todoStore: TodoStore,
-  inboxStore: InboxStore,
+  store: PlanStore,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<void> {
   while (!signal.aborted) {
-    const inboxPlans = await inboxStore.read();
-    const next = inboxPlans[0];
+    const plans = await store.read();
+    const next = plans.find((p) => p.status === 'enqueued');
     if (!next) return;
 
-    const todoSnapshot = await todoStore.read();
-    runtime.setOrganizing(todoSnapshot, next);
+    runtime.setOrganizing(plans, next);
     handles.current.slug = next.slug;
     handles.phase.value = 'organizing';
     try {
-      await processInboxPlan({
+      await processEnqueuedPlan({
         plan: next,
-        todoStore,
-        inboxStore,
+        store,
         state: handles.brainState,
         notify: ({ level, text }) => {
           if (level === 'error') {
@@ -223,17 +216,41 @@ async function drainInbox(
 
 export async function watcherLoop(
   runtime: WatcherRuntime,
-  store: TodoStore,
-  inboxStore: InboxStore,
+  store: PlanStore,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<{ inFlight: Plan | null; cancelledSlug: string | null }> {
   let inFlight: Plan | null = null;
   let cancelledSlug: string | null = null;
+  let requireCleanWorkspaceAfterCancelling = false;
   while (!signal.aborted) {
-    // Phase A: drain the inbox completely before touching the ready queue.
+    const beforeDrain = await store.read();
+
+    // A 'cancelling' row means the user cancelled an implementing plan with
+    // intent='keep'. The working tree still has the partial work; vibe must
+    // pause before doing any other queue work until the user resolves the
+    // dirty state and flips status to 'cancelled'.
+    const cancellingBeforeDrain = beforeDrain.find((p) => p.status === 'cancelling');
+    if (cancellingBeforeDrain) {
+      requireCleanWorkspaceAfterCancelling = true;
+      runtime.setPausedCancelling(beforeDrain, cancellingBeforeDrain);
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
+
+    if (requireCleanWorkspaceAfterCancelling) {
+      const dirty = dirtyRepos(await resolveWorkspaceRepos());
+      if (dirty.length > 0) {
+        runtime.setPausedDirtyWorkspace(beforeDrain, formatRepoList(dirty));
+        await sleep(IDLE_POLL_SECONDS * 1000, signal);
+        continue;
+      }
+      requireCleanWorkspaceAfterCancelling = false;
+    }
+
+    // Phase A: drain every enqueued plan before touching the ready queue.
     // New plans landing mid-implement will be placed on the next iteration.
-    await drainInbox(runtime, store, inboxStore, signal, handles);
+    await drainEnqueued(runtime, store, signal, handles);
     if (signal.aborted) break;
 
     const plans = await store.read();
@@ -241,6 +258,18 @@ export async function watcherLoop(
     const failed = plans.find((p) => p.status === 'failed');
     if (failed) {
       runtime.setPaused(plans, failed);
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
+
+    // A 'cancelling' row means the user cancelled an implementing plan with
+    // intent='keep'. The working tree still has the partial work; vibe must
+    // pause until the user resolves the dirty state and flips status to
+    // 'cancelled'.
+    const stuck = plans.find((p) => p.status === 'cancelling');
+    if (stuck) {
+      requireCleanWorkspaceAfterCancelling = true;
+      runtime.setPausedCancelling(plans, stuck);
       await sleep(IDLE_POLL_SECONDS * 1000, signal);
       continue;
     }
@@ -254,12 +283,22 @@ export async function watcherLoop(
 
     const next = ready[0]!;
     if (next.cancel_requested) {
-      // User cancelled before we picked it up. Mark cancelled directly.
-      await markPlanCancelled(store, next);
+      // User cancelled before we picked it up. No partial work exists, so
+      // regardless of intent there's nothing to revert/keep — just cancel.
+      await markPlanFinal(store, next.slug, {
+        status: 'cancelled',
+        cancel_requested: false,
+        cancel_intent: undefined,
+      });
       continue;
     }
+    const missingFailure = (plan: Plan): PlanFailure => ({
+      step: 'implement',
+      pr_id: null,
+      message: `plan file missing: ${plan.path}`,
+    });
     if (!(await planFileExists(next))) {
-      await markPlanMissing(store, next);
+      await markPlanFinal(store, next.slug, { status: 'failed', failure: missingFailure(next) });
       continue;
     }
 
@@ -268,7 +307,10 @@ export async function watcherLoop(
       planText = await fs.readFile(planFilePath(next), 'utf8');
     } catch (err) {
       if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-        await markPlanMissing(store, next);
+        await markPlanFinal(store, next.slug, {
+          status: 'failed',
+          failure: missingFailure(next),
+        });
         continue;
       }
       throw err;
@@ -281,15 +323,30 @@ export async function watcherLoop(
 
     let claimed: Plan;
     try {
-      claimed = await store.update(next.slug, {
-        status: 'implementing',
-        started_at: nowIso(),
-        finished_at: null,
-        failure: null,
-        prs: reconciledPrs,
-      });
+      // Require the row to still be `ready` at lock time. Without this CAS,
+      // a concurrent cancel that flipped the row to `cancelled` between our
+      // read above and this update would be silently overwritten back to
+      // `implementing` — the cancellation lost without a trace.
+      claimed = await store.update(
+        next.slug,
+        {
+          status: 'implementing',
+          started_at: nowIso(),
+          finished_at: null,
+          failure: null,
+          prs: reconciledPrs,
+        },
+        {
+          precondition: (p) => p.status === 'ready',
+          preconditionDetail: 'row is no longer ready (likely cancelled concurrently)',
+        },
+      );
     } catch (err) {
-      if (err instanceof ImplementingLocked || err instanceof PlanNotFound) {
+      if (
+        err instanceof ImplementingLocked ||
+        err instanceof PlanNotFound ||
+        err instanceof PlanPreconditionFailed
+      ) {
         continue;
       }
       throw err;
@@ -303,13 +360,7 @@ export async function watcherLoop(
 
     // Combine the outer abort signal with our cancel-scoped controller so
     // a Ctrl-C OR a per-plan cancel both interrupt the in-flight subprocess.
-    const merged = new AbortController();
-    const onOuter = (): void => merged.abort();
-    const onCancel = (): void => merged.abort();
-    signal.addEventListener('abort', onOuter, { once: true });
-    cancelController.signal.addEventListener('abort', onCancel, { once: true });
-    if (signal.aborted) merged.abort();
-    if (cancelController.signal.aborted) merged.abort();
+    const merged = AbortSignal.any([signal, cancelController.signal]);
 
     try {
       const planProgress = newPlanRuntimeState({
@@ -330,29 +381,43 @@ export async function watcherLoop(
         plan: claimed,
         dryRun: false,
         progress: runtime,
-        signal: merged.signal,
+        signal: merged,
         onPrUpdate,
       });
     } catch (err) {
-      signal.removeEventListener('abort', onOuter);
-      cancelController.signal.removeEventListener('abort', onCancel);
       handles.current.slug = null;
       handles.cancelController.ref = null;
       handles.phase.value = 'idle';
       if (cancelController.signal.aborted && !signal.aborted) {
-        // Per-plan cancellation: revert the working tree and mark cancelled.
+        // Per-plan cancellation. Branch by intent:
+        //   'keep' — leave the working tree untouched, demote to 'cancelling',
+        //            and let the outer loop pause on the cancelling row.
+        //   'revert' (default) — return to the caller so vibe-command can
+        //            revert + mark 'cancelled' and exit.
+        const cancelledPlan = await store.find(claimed.slug);
+        const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
+        if (cancelIntent === 'keep') {
+          await markPlanFinal(store, claimed.slug, {
+            status: 'cancelling',
+            cancel_requested: false,
+            cancel_intent: undefined,
+          });
+          inFlight = null;
+          continue;
+        }
         cancelledSlug = claimed.slug;
         return { inFlight: claimed, cancelledSlug };
       }
       if (signal.aborted) {
         return { inFlight, cancelledSlug };
       }
-      await markPlanFailed(store, claimed, failureFromError(err));
+      await markPlanFinal(store, claimed.slug, {
+        status: 'failed',
+        failure: failureFromError(err),
+      });
       inFlight = null;
       continue;
     }
-    signal.removeEventListener('abort', onOuter);
-    cancelController.signal.removeEventListener('abort', onCancel);
     handles.current.slug = null;
     handles.cancelController.ref = null;
     handles.phase.value = 'idle';
@@ -360,10 +425,8 @@ export async function watcherLoop(
     // Clear inFlight before marking done so an abort in the window below
     // cannot demote a finished plan back to pending.
     inFlight = null;
-    await markPlanDone(store, claimed);
+    await markPlanFinal(store, claimed.slug, { status: 'done' });
   }
 
   return { inFlight, cancelledSlug };
 }
-
-export { markPlanCancelled };

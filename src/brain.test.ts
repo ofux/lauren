@@ -7,9 +7,10 @@ import {
   applyPlaceDecision,
   formatReadyForBrain,
   readReadySummaries,
+  summarizeOrganizeDecision,
 } from './brain.js';
 import { PLANS_DIR } from './core/paths.js';
-import { TodoStore } from './core/store.js';
+import { PlanStore } from './core/store.js';
 import { type Plan, planFilePath } from './core/types.js';
 
 function makePlan(prefix: string, slug: string): Plan {
@@ -30,15 +31,15 @@ function makePlan(prefix: string, slug: string): Plan {
 
 describe('applyOrganizeDecision', () => {
   let tmpDir: string;
-  let store: TodoStore;
+  let store: PlanStore;
   let planPrefix: string;
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-brain-'));
     planPrefix = path.basename(tmpDir);
-    store = new TodoStore({
-      path: path.join(tmpDir, 'todo.json'),
-      lockPath: path.join(tmpDir, 'todo.json.lock'),
+    store = new PlanStore({
+      path: path.join(tmpDir, 'plans.json'),
+      lockPath: path.join(tmpDir, 'plans.json.lock'),
     });
   });
 
@@ -132,6 +133,23 @@ describe('applyOrganizeDecision', () => {
     expect((await store.read()).map((p) => p.slug)).toEqual(['b', 'a']);
   });
 
+  test('applies normalized insert decisions returned by brainPlacePlan', async () => {
+    const existing = makePlan(planPrefix, 'a');
+    const newPlan = makePlan(planPrefix, 'b');
+    await store.add(existing);
+    await store.add(newPlan);
+
+    const summary = await applyPlaceDecision(store, newPlan, {
+      kind: 'insert',
+      position: 0,
+      reasoning: 'Run the smaller task first.',
+    });
+
+    expect(summary).toContain("placed 'b' at position 0");
+    expect(summary).toContain('Run the smaller task first.');
+    expect((await store.read()).map((p) => p.slug)).toEqual(['b', 'a']);
+  });
+
   test('leaves malformed placement decisions at the back of the queue', async () => {
     const existing = makePlan(planPrefix, 'a');
     const newPlan = makePlan(planPrefix, 'b');
@@ -161,14 +179,14 @@ describe('applyOrganizeDecision', () => {
 
   test.each([
     -1, 0.5,
-  ])('leaves normalized insert decisions with invalid position %s at the back of the queue', async (position) => {
+  ])('leaves insert decisions with invalid position %s at the back of the queue', async (position) => {
     const existing = makePlan(planPrefix, 'a');
     const newPlan = makePlan(planPrefix, 'b');
     await store.add(existing);
     await store.add(newPlan);
 
     const summary = await applyPlaceDecision(store, newPlan, {
-      kind: 'insert',
+      decision: 'insert',
       position,
     });
 
@@ -194,6 +212,33 @@ describe('applyOrganizeDecision', () => {
     expect(formatted).toContain('Adds the sample feature.');
     expect(formatted).toContain('Touches src/sample/.');
     expect(formatted).not.toContain(bodyMarker);
+  });
+
+  test('summarizes and applies normalized organize decisions returned by brainOrganizeQueue', async () => {
+    for (const slug of ['a', 'b', 'c']) {
+      const plan = makePlan(planPrefix, slug);
+      await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+      await fs.writeFile(
+        planFilePath(plan),
+        `---\nname: ${slug}\ndescription: |\n  test plan ${slug}\n---\n\n# ${slug}\n`,
+        'utf8',
+      );
+      await store.add(plan);
+    }
+
+    const decision = {
+      operations: [
+        {
+          kind: 'reorder',
+          order: ['c', 'b', 'a'],
+        },
+      ],
+      reasoning: 'Put c first.',
+    };
+
+    expect(summarizeOrganizeDecision(decision)).toEqual(['reorder: c → b → a']);
+    expect(await applyOrganizeDecision(store, decision)).toEqual(['  reordered 3 ready plan(s)']);
+    expect((await store.read()).map((p) => p.slug)).toEqual(['c', 'b', 'a']);
   });
 
   test('readReadySummaries falls back to an excerpt when frontmatter is missing', async () => {

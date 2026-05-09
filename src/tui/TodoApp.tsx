@@ -3,34 +3,41 @@ import { Box, Text, useApp, useInput } from 'ink';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { type CancelOutcome, cancelPlan, isCancellable } from '../cancel.js';
-import type { InboxStore } from '../core/inbox.js';
-import type { TodoStore } from '../core/store.js';
+import { applyOrganizeDecision, brainOrganizeQueue, summarizeOrganizeDecision } from '../brain.js';
+import { cancelPlan, isCancellable } from '../cancel.js';
+import { VIBE_PID_PATH } from '../core/paths.js';
+import type { PlanStore } from '../core/store.js';
 import { fmtAge } from '../core/time.js';
 import { type Plan, type PlanStatus, planFilePath } from '../core/types.js';
+import { readLivePid } from '../proc/pid.js';
+import { isRetryable, retryPlan } from '../retry.js';
 import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
 import { Spinner } from './Spinner.js';
 
 const POLL_INTERVAL_MS = 500;
 
 export interface TodoAppProps {
-  todoStore: TodoStore;
-  inboxStore: InboxStore;
-}
-
-interface Row {
-  plan: Plan;
-  store: 'inbox' | 'todo';
+  store: PlanStore;
 }
 
 type View =
   | { kind: 'browse' }
-  | { kind: 'confirm'; row: Row }
-  | { kind: 'message'; outcome: CancelOutcome };
+  | { kind: 'confirm-cancel'; plan: Plan }
+  | { kind: 'confirm-retry'; plan: Plan }
+  | { kind: 'reorganize-loading' }
+  | {
+      kind: 'reorganize-confirm';
+      decision: unknown;
+      summary: string[];
+      reasoning: string;
+    }
+  | { kind: 'message'; message: string };
 
 function statusColor(status: PlanStatus): string | undefined {
   switch (status) {
     case 'failed':
+      return 'red';
+    case 'cancelling':
       return 'red';
     case 'implementing':
       return 'cyan';
@@ -54,18 +61,18 @@ function pad(s: string, width: number): string {
 }
 
 function PlanTable({
-  rows,
+  plans,
   selectedIndex,
 }: {
-  rows: Row[];
+  plans: Plan[];
   selectedIndex: number;
 }): React.ReactElement {
   const widths = useMemo(() => {
-    const slug = Math.max(4, ...rows.map((r) => r.plan.slug.length));
-    const status = Math.max(12, ...rows.map((r) => r.plan.status.length));
-    const title = Math.max(5, ...rows.map((r) => r.plan.title.length));
+    const slug = Math.max(4, ...plans.map((p) => p.slug.length));
+    const status = Math.max(12, ...plans.map((p) => p.status.length));
+    const title = Math.max(5, ...plans.map((p) => p.title.length));
     return { slug, status, title };
-  }, [rows]);
+  }, [plans]);
 
   return (
     <Box flexDirection="column">
@@ -74,28 +81,28 @@ function PlanTable({
           bold
         >{`  ${pad('status', widths.status)}  ${pad('slug', widths.slug)}  ${pad('title', widths.title)}  age`}</Text>
       </Box>
-      {rows.map((row, i) => {
+      {plans.map((plan, i) => {
         const selected = i === selectedIndex;
-        const cancellable = isCancellable(row.plan);
-        const color = statusColor(row.plan.status);
-        const dim = statusIsDim(row.plan.status);
+        const cancellable = isCancellable(plan);
+        const color = statusColor(plan.status);
+        const dim = statusIsDim(plan.status);
         const cursor = selected ? '▶ ' : '  ';
-        const age = fmtAge(row.plan.created_at);
+        const age = fmtAge(plan.created_at);
         const rowProps: { backgroundColor?: string } = selected ? { backgroundColor: 'gray' } : {};
         return (
-          <Box key={`${row.store}:${row.plan.slug}`} {...rowProps}>
+          <Box key={plan.slug} {...rowProps}>
             <Text color={selected ? 'white' : undefined} bold={selected}>
               {cursor}
             </Text>
             <Text {...(color ? { color } : {})} dimColor={dim} bold={selected || cancellable}>
-              {pad(row.plan.status, widths.status)}
+              {pad(plan.status, widths.status)}
             </Text>
             <Text> </Text>
             <Text bold dimColor={dim}>
-              {pad(row.plan.slug, widths.slug)}
+              {pad(plan.slug, widths.slug)}
             </Text>
             <Text> </Text>
-            <Text dimColor={dim}>{pad(row.plan.title, widths.title)}</Text>
+            <Text dimColor={dim}>{pad(plan.title, widths.title)}</Text>
             <Text dimColor>{`  ${age}`}</Text>
           </Box>
         );
@@ -167,47 +174,49 @@ function DescriptionPanel({ plan }: { plan: Plan }): React.ReactElement {
 }
 
 function HelpFooter({
-  hasRows,
+  hasPlans,
   selectedCancellable,
+  selectedRetryable,
+  canReorganize,
 }: {
-  hasRows: boolean;
+  hasPlans: boolean;
   selectedCancellable: boolean;
+  selectedRetryable: boolean;
+  canReorganize: boolean;
 }): React.ReactElement {
+  if (!hasPlans) {
+    return (
+      <Box marginTop={1}>
+        <Text dimColor>q to quit</Text>
+      </Box>
+    );
+  }
+  const hints: string[] = ['↑/↓ navigate'];
+  if (selectedCancellable) hints.push('Enter or c cancel');
+  if (selectedRetryable) hints.push('t reset to ready');
+  if (canReorganize) hints.push('r reorganize');
+  hints.push('q quit');
   return (
     <Box marginTop={1}>
-      {hasRows ? (
-        <Text dimColor>
-          {selectedCancellable
-            ? '↑/↓ navigate · Enter or c cancel · q quit'
-            : '↑/↓ navigate · (selected row is not cancellable) · q quit'}
-        </Text>
-      ) : (
-        <Text dimColor>q to quit</Text>
-      )}
+      <Text dimColor>{hints.join(' · ')}</Text>
     </Box>
   );
 }
 
-async function loadRows(todoStore: TodoStore, inboxStore: InboxStore): Promise<Row[]> {
-  const [inboxPlans, todoPlans] = await Promise.all([inboxStore.read(), todoStore.read()]);
-  const rows: Row[] = [];
-  for (const p of inboxPlans) rows.push({ plan: p, store: 'inbox' });
-  for (const p of todoPlans) rows.push({ plan: p, store: 'todo' });
-  return rows;
-}
-
-export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactElement {
+export function TodoApp({ store }: TodoAppProps): React.ReactElement {
   const { exit } = useApp();
-  const [rows, setRows] = useState<Row[]>([]);
+  const [plans, setPlans] = useState<Plan[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [view, setView] = useState<View>({ kind: 'browse' });
+  const [vibeRunning, setVibeRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
-      const next = await loadRows(todoStore, inboxStore);
-      setRows(next);
+      const [next, pid] = await Promise.all([store.read(), readLivePid(VIBE_PID_PATH)]);
+      setPlans(next);
+      setVibeRunning(pid !== null);
       setLoaded(true);
       setError(null);
       setSelectedIndex((prev) => {
@@ -219,7 +228,7 @@ export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactEle
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
-  }, [todoStore, inboxStore]);
+  }, [store]);
 
   useEffect(() => {
     void refresh();
@@ -229,24 +238,115 @@ export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactEle
     return () => clearInterval(handle);
   }, [refresh]);
 
+  const readyCount = useMemo(() => plans.filter((p) => p.status === 'ready').length, [plans]);
+  const canReorganize = !vibeRunning && readyCount >= 2;
+
   useInput((input, key) => {
-    if (view.kind === 'confirm') {
+    if (view.kind === 'confirm-cancel') {
+      const target = view.plan;
+      const isImplementing = target.status === 'implementing';
+      // Implementing rows get a three-option prompt; non-implementing keep
+      // the legacy y/N behavior.
+      if (isImplementing) {
+        if (input === 'y' || input === 'Y') {
+          setView({ kind: 'browse' });
+          void (async () => {
+            try {
+              const outcome = await cancelPlan({ slug: target.slug, store, intent: 'revert' });
+              setView({ kind: 'message', message: outcome.message });
+              await refresh();
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              setError(msg);
+            }
+          })();
+          return;
+        }
+        if (input === 'n' || input === 'N') {
+          setView({ kind: 'browse' });
+          void (async () => {
+            try {
+              const outcome = await cancelPlan({ slug: target.slug, store, intent: 'keep' });
+              setView({ kind: 'message', message: outcome.message });
+              await refresh();
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              setError(msg);
+            }
+          })();
+          return;
+        }
+        if (key.escape) {
+          setView({ kind: 'browse' });
+          return;
+        }
+        return;
+      }
       if (input === 'y' || input === 'Y') {
-        const target = view.row;
         setView({ kind: 'browse' });
         void (async () => {
           try {
-            const outcome = await cancelPlan({
-              slug: target.plan.slug,
-              store: target.store,
-              todoStore,
-              inboxStore,
-            });
-            setView({ kind: 'message', outcome });
+            const outcome = await cancelPlan({ slug: target.slug, store });
+            setView({ kind: 'message', message: outcome.message });
             await refresh();
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             setError(msg);
+          }
+        })();
+        return;
+      }
+      if (input === 'n' || input === 'N' || key.escape) {
+        setView({ kind: 'browse' });
+        return;
+      }
+      return;
+    }
+
+    if (view.kind === 'confirm-retry') {
+      if (input === 'y' || input === 'Y') {
+        const target = view.plan;
+        setView({ kind: 'browse' });
+        void (async () => {
+          try {
+            const outcome = await retryPlan({ slug: target.slug, store });
+            setView({ kind: 'message', message: outcome.message });
+            await refresh();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setError(msg);
+          }
+        })();
+        return;
+      }
+      if (input === 'n' || input === 'N' || key.escape) {
+        setView({ kind: 'browse' });
+        return;
+      }
+      return;
+    }
+
+    if (view.kind === 'reorganize-loading') {
+      // Block input until the brain returns.
+      return;
+    }
+
+    if (view.kind === 'reorganize-confirm') {
+      if (input === 'y' || input === 'Y') {
+        const decision = view.decision;
+        setView({ kind: 'reorganize-loading' });
+        void (async () => {
+          try {
+            const lines = await applyOrganizeDecision(store, decision);
+            const message =
+              lines.length > 0
+                ? `reorganize applied:\n${lines.join('\n')}`
+                : 'reorganize applied (no operations).';
+            setView({ kind: 'message', message });
+            await refresh();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setView({ kind: 'message', message: `reorganize failed: ${msg}` });
           }
         })();
         return;
@@ -268,19 +368,41 @@ export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactEle
       exit();
       return;
     }
-    if (rows.length === 0) return;
+    if (plans.length === 0) return;
     if (key.upArrow || input === 'k') {
       setSelectedIndex((i) => Math.max(0, i - 1));
       return;
     }
     if (key.downArrow || input === 'j') {
-      setSelectedIndex((i) => Math.min(rows.length - 1, i + 1));
+      setSelectedIndex((i) => Math.min(plans.length - 1, i + 1));
       return;
     }
     if (key.return || input === 'c') {
-      const row = rows[selectedIndex];
-      if (!row || !isCancellable(row.plan)) return;
-      setView({ kind: 'confirm', row });
+      const plan = plans[selectedIndex];
+      if (!plan || !isCancellable(plan)) return;
+      setView({ kind: 'confirm-cancel', plan });
+      return;
+    }
+    if (input === 't') {
+      const plan = plans[selectedIndex];
+      if (!plan || !isRetryable(plan)) return;
+      setView({ kind: 'confirm-retry', plan });
+      return;
+    }
+    if (input === 'r') {
+      if (!canReorganize) return;
+      setView({ kind: 'reorganize-loading' });
+      void (async () => {
+        try {
+          const { decision } = await brainOrganizeQueue(store);
+          const summary = summarizeOrganizeDecision(decision);
+          const reasoning = decision.reasoning.trim();
+          setView({ kind: 'reorganize-confirm', decision, summary, reasoning });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setView({ kind: 'message', message: `reorganize failed: ${msg}` });
+        }
+      })();
       return;
     }
   });
@@ -294,43 +416,129 @@ export function TodoApp({ todoStore, inboxStore }: TodoAppProps): React.ReactEle
     );
   }
 
-  const currentRow = rows[selectedIndex];
-  const selectedCancellable = currentRow ? isCancellable(currentRow.plan) : false;
+  const current = plans[selectedIndex];
+  const selectedCancellable = current ? isCancellable(current) : false;
+  const selectedRetryable = current ? isRetryable(current) : false;
 
   return (
     <Box flexDirection="column" paddingX={1}>
       <Box marginBottom={1}>
         <Text color="magenta" bold>
-          ✨ lauren todo
+          ✨ lauren
         </Text>
-        <Text dimColor>{`  (${rows.length} plan${rows.length === 1 ? '' : 's'})`}</Text>
+        <Text dimColor>{`  (${plans.length} plan${plans.length === 1 ? '' : 's'})`}</Text>
       </Box>
       {error && (
         <Box marginBottom={1}>
           <Text color="red">error: {error}</Text>
         </Box>
       )}
-      {rows.length === 0 ? (
+      {plans.length === 0 ? (
         <Text dimColor italic>
           (empty queue)
         </Text>
       ) : (
-        <PlanTable rows={rows} selectedIndex={selectedIndex} />
+        <PlanTable plans={plans} selectedIndex={selectedIndex} />
       )}
-      {currentRow && <DescriptionPanel plan={currentRow.plan} />}
-      <HelpFooter hasRows={rows.length > 0} selectedCancellable={selectedCancellable} />
-      {view.kind === 'confirm' && (
+      {current && <DescriptionPanel plan={current} />}
+      <HelpFooter
+        hasPlans={plans.length > 0}
+        selectedCancellable={selectedCancellable}
+        selectedRetryable={selectedRetryable}
+        canReorganize={canReorganize}
+      />
+      {view.kind === 'confirm-cancel' &&
+        (view.plan.status === 'implementing' ? (
+          <Box
+            marginTop={1}
+            borderStyle="round"
+            borderColor="yellow"
+            paddingX={2}
+            flexDirection="column"
+          >
+            <Text>
+              Cancel <Text bold>{view.plan.slug}</Text> (currently <Text bold>implementing</Text>)?
+            </Text>
+            <Text>
+              {'  '}
+              <Text bold>[y]</Text> revert uncommitted changes and cancel
+            </Text>
+            <Text>
+              {'  '}
+              <Text bold>[n]</Text> keep changes and mark cancelling (vibe pauses)
+            </Text>
+            <Text>
+              {'  '}
+              <Text bold>[Esc]</Text> nevermind
+            </Text>
+          </Box>
+        ) : (
+          <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
+            <Text>
+              Cancel <Text bold>{view.plan.slug}</Text> (currently{' '}
+              <Text bold>{view.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
+            </Text>
+          </Box>
+        ))}
+      {view.kind === 'confirm-retry' && (
         <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
           <Text>
-            Cancel <Text bold>{view.row.plan.slug}</Text> (currently{' '}
-            <Text bold>{view.row.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
+            Reset <Text bold>{view.plan.slug}</Text> back to <Text bold>ready</Text>?{' '}
+            <Text dimColor>[y/N]</Text>
           </Text>
         </Box>
       )}
+      {view.kind === 'reorganize-loading' && (
+        <Box marginTop={1} borderStyle="round" borderColor="magenta" paddingX={2}>
+          <Spinner />
+          <Text> brain is thinking…</Text>
+        </Box>
+      )}
+      {view.kind === 'reorganize-confirm' && (
+        <Box
+          marginTop={1}
+          borderStyle="round"
+          borderColor="magenta"
+          paddingX={2}
+          flexDirection="column"
+        >
+          <Text bold>brain proposes:</Text>
+          {view.summary.length === 0 ? (
+            <Text dimColor italic>
+              (no operations)
+            </Text>
+          ) : (
+            view.summary.map((line, i) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: lines are stable for this render
+              <Text key={i}> {line}</Text>
+            ))
+          )}
+          {view.reasoning !== '' && (
+            <Box marginTop={1} flexDirection="column">
+              <Text dimColor>reasoning:</Text>
+              <Text dimColor>{view.reasoning}</Text>
+            </Box>
+          )}
+          <Box marginTop={1}>
+            <Text>
+              Apply? <Text dimColor>[y/N]</Text>
+            </Text>
+          </Box>
+        </Box>
+      )}
       {view.kind === 'message' && (
-        <Box marginTop={1} borderStyle="round" borderColor="cyan" paddingX={2}>
-          <Text>{view.outcome.message} </Text>
-          <Text dimColor>(any key)</Text>
+        <Box
+          marginTop={1}
+          borderStyle="round"
+          borderColor="cyan"
+          paddingX={2}
+          flexDirection="column"
+        >
+          {view.message.split('\n').map((line, i) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: lines are stable for this render
+            <Text key={i}>{line}</Text>
+          ))}
+          <Text dimColor>(any key to dismiss)</Text>
         </Box>
       )}
     </Box>

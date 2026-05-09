@@ -2,11 +2,12 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { TodoStore, TodoStoreFormatError } from './store.js';
+import { PlanStore, PlanStoreFormatError } from './store.js';
 import {
   ImplementingLocked,
   type Plan,
   PlanNotFound,
+  PlanPreconditionFailed,
   PlanSelfMerge,
   SlugCollision,
 } from './types.js';
@@ -28,16 +29,20 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
   };
 }
 
-describe('TodoStore', () => {
+function makeStore(tmpDir: string): PlanStore {
+  return new PlanStore({
+    path: path.join(tmpDir, 'plans.json'),
+    lockPath: path.join(tmpDir, 'plans.json.lock'),
+  });
+}
+
+describe('PlanStore', () => {
   let tmpDir: string;
-  let store: TodoStore;
+  let store: PlanStore;
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-store-'));
-    store = new TodoStore({
-      path: path.join(tmpDir, 'todo.json'),
-      lockPath: path.join(tmpDir, 'todo.json.lock'),
-    });
+    store = makeStore(tmpDir);
   });
 
   afterEach(async () => {
@@ -49,42 +54,19 @@ describe('TodoStore', () => {
   });
 
   test('read() throws a typed error for malformed JSON', async () => {
-    await fs.writeFile(path.join(tmpDir, 'todo.json'), '{', 'utf8');
-    await expect(store.read()).rejects.toBeInstanceOf(TodoStoreFormatError);
+    await fs.writeFile(path.join(tmpDir, 'plans.json'), '{', 'utf8');
+    await expect(store.read()).rejects.toBeInstanceOf(PlanStoreFormatError);
     await expect(store.read()).rejects.toThrow(/malformed JSON/);
   });
 
   test('read() throws a typed error for unsupported schema versions', async () => {
     await fs.writeFile(
-      path.join(tmpDir, 'todo.json'),
+      path.join(tmpDir, 'plans.json'),
       JSON.stringify({ version: 999, plans: [] }),
       'utf8',
     );
-    await expect(store.read()).rejects.toBeInstanceOf(TodoStoreFormatError);
+    await expect(store.read()).rejects.toBeInstanceOf(PlanStoreFormatError);
     await expect(store.read()).rejects.toThrow(/schema version 999 not supported/);
-  });
-
-  test('read() migrates legacy todo statuses (pending → ready, in_progress → implementing)', async () => {
-    await fs.writeFile(
-      path.join(tmpDir, 'todo.json'),
-      JSON.stringify({
-        version: 1,
-        plans: [
-          { slug: 'a', title: 'A', path: '.lauren/plans/a.md', status: 'pending' },
-          { slug: 'b', title: 'B', path: '.lauren/plans/b.md', status: 'in_progress' },
-          { slug: 'c', title: 'C', path: '.lauren/plans/c.md', status: 'done' },
-        ],
-      }),
-      'utf8',
-    );
-    const plans = await store.read();
-    expect(plans.map((p) => [p.slug, p.status])).toEqual([
-      ['a', 'ready'],
-      ['b', 'implementing'],
-      ['c', 'done'],
-    ]);
-    // cancel_requested defaults to false when missing.
-    expect(plans.every((p) => p.cancel_requested === false)).toBe(true);
   });
 
   test('add() persists a plan and read() returns it', async () => {
@@ -145,6 +127,28 @@ describe('TodoStore', () => {
     await expect(
       store.update('running', { title: 'Yes' }, { allowImplementing: true }),
     ).resolves.toMatchObject({ title: 'Yes' });
+  });
+
+  test('update() throws PlanPreconditionFailed and leaves the row untouched', async () => {
+    await store.add(makePlan({ slug: 'claim-me', status: 'cancelled' }));
+    await expect(
+      store.update(
+        'claim-me',
+        { status: 'implementing' },
+        { precondition: (p) => p.status === 'ready' },
+      ),
+    ).rejects.toBeInstanceOf(PlanPreconditionFailed);
+    expect((await store.find('claim-me'))?.status).toBe('cancelled');
+  });
+
+  test('update() with a satisfied precondition applies the patch', async () => {
+    await store.add(makePlan({ slug: 'claim-me', status: 'ready' }));
+    const updated = await store.update(
+      'claim-me',
+      { status: 'implementing' },
+      { precondition: (p) => p.status === 'ready' },
+    );
+    expect(updated.status).toBe('implementing');
   });
 
   describe('move()', () => {
@@ -230,9 +234,9 @@ describe('TodoStore', () => {
     test('rolls back body writes when the queue write fails', async () => {
       const stateDir = path.join(tmpDir, 'readonly-state');
       await fs.mkdir(stateDir);
-      const failingStore = new TodoStore({
-        path: path.join(stateDir, 'todo.json'),
-        lockPath: path.join(tmpDir, 'todo.json.lock'),
+      const failingStore = new PlanStore({
+        path: path.join(stateDir, 'plans.json'),
+        lockPath: path.join(tmpDir, 'plans.json.lock'),
       });
       await failingStore.add(makePlan({ slug: 'a', title: 'A' }));
       await failingStore.add(makePlan({ slug: 'b', title: 'B' }));
