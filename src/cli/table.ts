@@ -14,8 +14,6 @@ function statusCell(status: PlanStatus): { plain: string; rendered: string } {
   switch (status) {
     case 'failed':
       return { plain: 'failed', rendered: `${BOLD}${RED}failed${RESET}` };
-    case 'cancelling':
-      return { plain: 'cancelling', rendered: `${BOLD}${RED}cancelling${RESET}` };
     case 'implementing':
       return { plain: 'implementing', rendered: `${BOLD}${CYAN}implementing${RESET}` };
     case 'preparing':

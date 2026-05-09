@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import { applyPlaceDecision, brainPlacePlan } from './brain.js';
 import { materializePrs } from './core/prs.js';
 import type { PlanStore } from './core/store.js';
-import { type Plan, PlanNotFound, PlanPreconditionFailed, planFilePath } from './core/types.js';
+import { type Plan, PlanNotFound, planFilePath } from './core/types.js';
 import { ClaudeAborted } from './proc/claude.js';
 
 export interface BrainCancelState {
@@ -122,41 +122,15 @@ export async function processEnqueuedPlan(args: {
   // Transition the row to `ready`. Materialize PR list from the just-read
   // markdown so the row is immediately the source of truth for what to run
   // — the executor only re-reconciles at claim time to catch later edits.
-  //
-  // The precondition guards against a cancel that landed after `state.controller`
-  // was nulled but before this update wins the lock: in that gap the SIGUSR2
-  // handler can't abort anything, so the cancel only sets cancel_requested=true.
-  // Without the guard, this update would silently overwrite that flag back to
-  // false and the cancellation would be lost.
-  try {
-    await store.update(
-      plan.slug,
-      {
-        status: 'ready',
-        cancel_requested: false,
-        prs: materializePrs(body, null),
-      },
-      {
-        allowPreparing: true,
-        precondition: (p) => !p.cancel_requested,
-        preconditionDetail: 'cancel_requested landed during brain placement',
-      },
-    );
-  } catch (err) {
-    if (err instanceof PlanPreconditionFailed) {
-      note('info', `cancelled '${plan.slug}' just before ready transition; removing.`);
-      await store.remove(plan.slug, { allowPreparing: true }).catch((cleanupErr) => {
-        if (!(cleanupErr instanceof PlanNotFound)) throw cleanupErr;
-      });
-      try {
-        await fs.unlink(planFilePath(plan));
-      } catch {
-        // ignore
-      }
-      return;
-    }
-    throw err;
-  }
+  await store.update(
+    plan.slug,
+    {
+      status: 'ready',
+      cancel_requested: false,
+      prs: materializePrs(body, null),
+    },
+    { allowPreparing: true },
+  );
   const summary = await applyPlaceDecision(store, plan, decision);
   note('info', summary);
 }

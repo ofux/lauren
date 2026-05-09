@@ -37,8 +37,6 @@ function statusColor(status: PlanStatus): string | undefined {
   switch (status) {
     case 'failed':
       return 'red';
-    case 'cancelling':
-      return 'red';
     case 'implementing':
       return 'cyan';
     case 'preparing':
@@ -243,46 +241,8 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
 
   useInput((input, key) => {
     if (view.kind === 'confirm-cancel') {
-      const target = view.plan;
-      const isImplementing = target.status === 'implementing';
-      // Implementing rows get a three-option prompt; non-implementing keep
-      // the legacy y/N behavior.
-      if (isImplementing) {
-        if (input === 'y' || input === 'Y') {
-          setView({ kind: 'browse' });
-          void (async () => {
-            try {
-              const outcome = await cancelPlan({ slug: target.slug, store, intent: 'revert' });
-              setView({ kind: 'message', message: outcome.message });
-              await refresh();
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              setError(msg);
-            }
-          })();
-          return;
-        }
-        if (input === 'n' || input === 'N') {
-          setView({ kind: 'browse' });
-          void (async () => {
-            try {
-              const outcome = await cancelPlan({ slug: target.slug, store, intent: 'keep' });
-              setView({ kind: 'message', message: outcome.message });
-              await refresh();
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              setError(msg);
-            }
-          })();
-          return;
-        }
-        if (key.escape) {
-          setView({ kind: 'browse' });
-          return;
-        }
-        return;
-      }
       if (input === 'y' || input === 'Y') {
+        const target = view.plan;
         setView({ kind: 'browse' });
         void (async () => {
           try {
@@ -447,39 +407,14 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
         selectedRetryable={selectedRetryable}
         canReorganize={canReorganize}
       />
-      {view.kind === 'confirm-cancel' &&
-        (view.plan.status === 'implementing' ? (
-          <Box
-            marginTop={1}
-            borderStyle="round"
-            borderColor="yellow"
-            paddingX={2}
-            flexDirection="column"
-          >
-            <Text>
-              Cancel <Text bold>{view.plan.slug}</Text> (currently <Text bold>implementing</Text>)?
-            </Text>
-            <Text>
-              {'  '}
-              <Text bold>[y]</Text> revert uncommitted changes and cancel
-            </Text>
-            <Text>
-              {'  '}
-              <Text bold>[n]</Text> keep changes and mark cancelling (vibe pauses)
-            </Text>
-            <Text>
-              {'  '}
-              <Text bold>[Esc]</Text> nevermind
-            </Text>
-          </Box>
-        ) : (
-          <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
-            <Text>
-              Cancel <Text bold>{view.plan.slug}</Text> (currently{' '}
-              <Text bold>{view.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
-            </Text>
-          </Box>
-        ))}
+      {view.kind === 'confirm-cancel' && (
+        <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
+          <Text>
+            Cancel <Text bold>{view.plan.slug}</Text> (currently{' '}
+            <Text bold>{view.plan.status}</Text>)? <Text dimColor>[y/N]</Text>
+          </Text>
+        </Box>
+      )}
       {view.kind === 'confirm-retry' && (
         <Box marginTop={1} borderStyle="round" borderColor="yellow" paddingX={2}>
           <Text>

@@ -7,22 +7,9 @@ export type PlanStatus =
   | 'preparing'
   | 'ready'
   | 'implementing'
-  | 'cancelling'
   | 'failed'
   | 'done'
   | 'cancelled';
-
-/**
- * Set alongside `cancel_requested` to tell the vibe daemon how to finalize
- * a cancellation on an `implementing` plan.
- *   'revert' — abort the subprocess, revert the working tree, mark
- *              'cancelled'. This is the legacy default (absent = 'revert').
- *   'keep'   — abort the subprocess but leave the working tree untouched.
- *              The plan is marked 'cancelling' and the daemon pauses until
- *              the user manually resolves it (commit/stash + flip status
- *              to 'cancelled').
- */
-export type CancelIntent = 'revert' | 'keep';
 
 export interface PlanFailure {
   step: string;
@@ -37,12 +24,6 @@ export interface Plan {
   target_repos: string[];
   status: PlanStatus;
   cancel_requested: boolean;
-  /**
-   * When `cancel_requested` is true on an `implementing` plan, this field
-   * encodes whether the daemon should revert the working tree before
-   * finalizing. Absent / null = 'revert' (legacy default).
-   */
-  cancel_intent?: CancelIntent;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -123,15 +104,6 @@ export class PlanSelfMerge extends Error {
   constructor(slug: string) {
     super(`plan '${slug}' cannot be merged into itself`);
     this.name = 'PlanSelfMerge';
-    this.slug = slug;
-  }
-}
-
-export class PlanPreconditionFailed extends Error {
-  readonly slug: string;
-  constructor(slug: string, detail: string) {
-    super(`plan '${slug}' failed update precondition: ${detail}`);
-    this.name = 'PlanPreconditionFailed';
     this.slug = slug;
   }
 }

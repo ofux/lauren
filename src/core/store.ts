@@ -9,7 +9,6 @@ import {
   type Plan,
   PlanNotFound,
   PlanNotReady,
-  PlanPreconditionFailed,
   PlanSelfMerge,
   PreparingLocked,
   SCHEMA_VERSION,
@@ -32,18 +31,6 @@ interface MergeBodyWrite {
 interface LockOptions {
   allowPreparing?: boolean;
   allowImplementing?: boolean;
-}
-
-interface UpdateOptions extends LockOptions {
-  /**
-   * Predicate evaluated against the locked-in row before the patch is
-   * applied. Returning false throws {@link PlanPreconditionFailed} and the
-   * row is left untouched. Use for compare-and-set semantics — e.g. the
-   * watcher claim requires the row to still be `ready`.
-   */
-  precondition?: (plan: Plan) => boolean;
-  /** Optional human-readable detail surfaced in the thrown error message. */
-  preconditionDetail?: string;
 }
 
 function mergeTargetRepos(a: readonly string[], b: readonly string[]): string[] {
@@ -79,8 +66,7 @@ function checkLock(plan: Plan, opts: LockOptions): void {
 /**
  * Single source of truth for the plan queue across all lifecycle stages.
  * Plans with status `enqueued`/`preparing` are awaiting brain placement;
- * `ready`/`implementing`/`cancelling`/`failed`/`done`/`cancelled` are
- * post-placement.
+ * `ready`/`implementing`/`failed`/`done`/`cancelled` are post-placement.
  *
  * Locking invariants:
  *   - `implementing` rows are owned by the executor — pass `allowImplementing`
@@ -189,7 +175,7 @@ export class PlanStore {
   async update(
     slug: string,
     fields: Partial<Omit<Plan, 'slug'>>,
-    opts: UpdateOptions = {},
+    opts: LockOptions = {},
   ): Promise<Plan> {
     return this.withLock(async () => {
       const plans = await this.readUnlocked();
@@ -197,9 +183,6 @@ export class PlanStore {
       if (idx === -1) throw new PlanNotFound(slug);
       const plan = plans[idx]!;
       checkLock(plan, opts);
-      if (opts.precondition && !opts.precondition(plan)) {
-        throw new PlanPreconditionFailed(slug, opts.preconditionDetail ?? `row is ${plan.status}`);
-      }
       const updated: Plan = { ...plan, ...fields, slug: plan.slug };
       plans[idx] = updated;
       await this.writeUnlocked(plans);
