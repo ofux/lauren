@@ -7,6 +7,7 @@ import {
   applyPlaceDecision,
   formatReadyForBrain,
   readReadySummaries,
+  summarizeOrganizeDecision,
 } from './brain.js';
 import { PLANS_DIR } from './core/paths.js';
 import { PlanStore } from './core/store.js';
@@ -24,7 +25,7 @@ function makePlan(prefix: string, slug: string): Plan {
     started_at: null,
     finished_at: null,
     failure: null,
-    prs: null,
+    steps: null,
   };
 }
 
@@ -89,7 +90,7 @@ describe('applyOrganizeDecision', () => {
     });
   });
 
-  test('merge materializes a PR list on the target from the merged markdown', async () => {
+  test('merge materializes a Step list on the target from the merged markdown', async () => {
     for (const slug of ['a', 'b']) {
       const plan = makePlan(planPrefix, slug);
       await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
@@ -103,7 +104,7 @@ describe('applyOrganizeDecision', () => {
 
     const mergedBody =
       `---\nname: a\ndescription: |\n  merged a+b\n---\n\n` +
-      `### PR 1.1 — First\nbody\n\n### PR 1.2 — Second\nbody\n`;
+      `### Step 1.1 — First\nbody\n\n### Step 1.2 — Second\nbody\n`;
     await applyOrganizeDecision(store, {
       operations: [
         { op: 'merge', into: 'a', from: 'b', merged_title: 'A and B', merged_markdown: mergedBody },
@@ -111,7 +112,7 @@ describe('applyOrganizeDecision', () => {
     });
 
     const target = (await store.read()).find((p) => p.slug === 'a');
-    expect(target?.prs?.map((e) => [e.id, e.title, e.status])).toEqual([
+    expect(target?.steps?.map((e) => [e.id, e.title, e.status])).toEqual([
       ['1.1', 'First', 'pending'],
       ['1.2', 'Second', 'pending'],
     ]);
@@ -129,6 +130,23 @@ describe('applyOrganizeDecision', () => {
     });
 
     expect(summary).toContain("placed 'b' at position 0");
+    expect((await store.read()).map((p) => p.slug)).toEqual(['b', 'a']);
+  });
+
+  test('applies normalized insert decisions returned by brainPlacePlan', async () => {
+    const existing = makePlan(planPrefix, 'a');
+    const newPlan = makePlan(planPrefix, 'b');
+    await store.add(existing);
+    await store.add(newPlan);
+
+    const summary = await applyPlaceDecision(store, newPlan, {
+      kind: 'insert',
+      position: 0,
+      reasoning: 'Run the smaller task first.',
+    });
+
+    expect(summary).toContain("placed 'b' at position 0");
+    expect(summary).toContain('Run the smaller task first.');
     expect((await store.read()).map((p) => p.slug)).toEqual(['b', 'a']);
   });
 
@@ -194,6 +212,33 @@ describe('applyOrganizeDecision', () => {
     expect(formatted).toContain('Adds the sample feature.');
     expect(formatted).toContain('Touches src/sample/.');
     expect(formatted).not.toContain(bodyMarker);
+  });
+
+  test('summarizes and applies normalized organize decisions returned by brainOrganizeQueue', async () => {
+    for (const slug of ['a', 'b', 'c']) {
+      const plan = makePlan(planPrefix, slug);
+      await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+      await fs.writeFile(
+        planFilePath(plan),
+        `---\nname: ${slug}\ndescription: |\n  test plan ${slug}\n---\n\n# ${slug}\n`,
+        'utf8',
+      );
+      await store.add(plan);
+    }
+
+    const decision = {
+      operations: [
+        {
+          kind: 'reorder',
+          order: ['c', 'b', 'a'],
+        },
+      ],
+      reasoning: 'Put c first.',
+    };
+
+    expect(summarizeOrganizeDecision(decision)).toEqual(['reorder: c → b → a']);
+    expect(await applyOrganizeDecision(store, decision)).toEqual(['  reordered 3 ready plan(s)']);
+    expect((await store.read()).map((p) => p.slug)).toEqual(['c', 'b', 'a']);
   });
 
   test('readReadySummaries falls back to an excerpt when frontmatter is missing', async () => {

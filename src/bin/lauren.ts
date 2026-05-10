@@ -156,7 +156,7 @@ async function cmdRegister(args: {
     started_at: null,
     finished_at: null,
     failure: null,
-    prs: null,
+    steps: null,
   };
 
   let rawBody: string;

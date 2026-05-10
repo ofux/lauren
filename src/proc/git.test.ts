@@ -82,10 +82,10 @@ describe('git worktree helpers', () => {
     );
   });
 
-  test('slugHasLaurenHistory detects prior PR and plan commits for a slug', () => {
+  test('slugHasLaurenHistory detects prior Step and plan commits for a slug', () => {
     expect(slugHasLaurenHistory('feature-x', repoDir)).toBe(false);
 
-    git(repoDir, 'commit', '--allow-empty', '-m', 'feature-x: PR 1.1 — First');
+    git(repoDir, 'commit', '--allow-empty', '-m', 'feature-x: Step 1.1 — First');
     expect(slugHasLaurenHistory('feature-x', repoDir)).toBe(true);
     expect(slugHasLaurenHistory('other-slug', repoDir)).toBe(false);
 

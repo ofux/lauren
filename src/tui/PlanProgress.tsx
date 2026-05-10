@@ -2,15 +2,15 @@ import { Box, Text } from 'ink';
 import type React from 'react';
 
 import { fmtDuration, monotonicSeconds } from '../core/time.js';
-import { PR_STEPS, type StepName } from '../executor.js';
+import { type PhaseName, STEP_PHASES } from '../executor.js';
 import {
   getItemElapsed,
-  getStepElapsed,
-  getStepStatus,
+  getPhaseElapsed,
+  getPhaseStatus,
   type ItemDisplayStatus,
   LOG_TAIL_LINES,
+  type PhaseDisplayStatus,
   type PlanRuntimeState,
-  type StepDisplayStatus,
 } from './runtime.js';
 import { Spinner } from './Spinner.js';
 
@@ -74,18 +74,18 @@ function ItemLine({
   );
 }
 
-function StepLine({
+function PhaseLine({
   state,
   itemId,
-  step,
+  phase,
 }: {
   state: PlanRuntimeState;
   itemId: string;
-  step: StepName;
+  phase: PhaseName;
 }): React.ReactElement {
-  const status: StepDisplayStatus = getStepStatus(state, itemId, step);
+  const status: PhaseDisplayStatus = getPhaseStatus(state, itemId, phase);
   const now = monotonicSeconds();
-  const elapsed = getStepElapsed(state, itemId, step, now);
+  const elapsed = getPhaseElapsed(state, itemId, phase, now);
 
   if (status === 'done') {
     return (
@@ -93,7 +93,7 @@ function StepLine({
         <Text color="green" bold>
           ✓{' '}
         </Text>
-        <Text>{step}</Text>
+        <Text>{phase}</Text>
         <Text dimColor>{`   ${fmtDuration(elapsed)}`}</Text>
       </Box>
     );
@@ -104,7 +104,7 @@ function StepLine({
         <Spinner />
         <Text> </Text>
         <Text color="cyan" bold>
-          {step}
+          {phase}
         </Text>
         <Text dimColor>{`   ${fmtDuration(elapsed)}`}</Text>
       </Box>
@@ -114,7 +114,7 @@ function StepLine({
     return (
       <Box paddingLeft={4}>
         <Text dimColor>⊘ </Text>
-        <Text dimColor>{step}</Text>
+        <Text dimColor>{phase}</Text>
         <Text dimColor italic>
           {' '}
           skipped
@@ -128,14 +128,14 @@ function StepLine({
         <Text color="red" bold>
           ✗{' '}
         </Text>
-        <Text color="red">{step}</Text>
+        <Text color="red">{phase}</Text>
       </Box>
     );
   }
   return (
     <Box paddingLeft={4}>
       <Text dimColor>· </Text>
-      <Text dimColor>{step}</Text>
+      <Text dimColor>{phase}</Text>
     </Box>
   );
 }
@@ -157,7 +157,7 @@ function _PanelHeader({
 }
 
 export function PlanProgress({ state }: Props): React.ReactElement {
-  const showLogPanel = state.currentStep !== null;
+  const showLogPanel = state.currentPhase !== null;
   const tail = state.logTail.slice(-LOG_TAIL_LINES);
   while (tail.length < LOG_TAIL_LINES) tail.push('');
 
@@ -173,8 +173,8 @@ export function PlanProgress({ state }: Props): React.ReactElement {
             <Box key={id} flexDirection="column">
               <ItemLine state={state} itemId={id} itemTitle={title} />
               {isRunning &&
-                PR_STEPS.map((step) => (
-                  <StepLine key={`${id}:${step}`} state={state} itemId={id} step={step} />
+                STEP_PHASES.map((phase) => (
+                  <PhaseLine key={`${id}:${phase}`} state={state} itemId={id} phase={phase} />
                 ))}
             </Box>
           );

@@ -33,12 +33,18 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         ✗{' '}
       </Text>
     );
+  else if (plan.status === 'cancelling')
+    icon = (
+      <Text color="red" bold>
+        ⊘{' '}
+      </Text>
+    );
   else if (plan.status === 'cancelled') icon = <Text dimColor>⊘ </Text>;
   else icon = <Text dimColor>· </Text>;
 
   const titleProps: { bold?: boolean; color?: string; dimColor?: boolean } = {};
   if (plan.status === 'implementing') titleProps.bold = true;
-  else if (plan.status === 'failed') titleProps.color = 'red';
+  else if (plan.status === 'failed' || plan.status === 'cancelling') titleProps.color = 'red';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
   const age = fmtAge(plan.created_at);
@@ -81,6 +87,7 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     preparing: 0,
     ready: 0,
     implementing: 0,
+    cancelling: 0,
     done: 0,
     failed: 0,
     cancelled: 0,

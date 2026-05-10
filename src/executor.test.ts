@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { LOG_ROOT, PLANS_DIR } from './core/paths.js';
-import type { PrEntry } from './core/prs.js';
+import type { StepEntry } from './core/steps.js';
 import type { Plan } from './core/types.js';
 import { formatCommitFailureMessage, RunFailure, runPlan } from './executor.js';
 import { planCommitMessage } from './executor-prompts.js';
@@ -34,7 +34,7 @@ describe('formatCommitFailureMessage', () => {
   const baseArgs = {
     repoName: 'backend',
     repoPath: 'apps/backend',
-    commitSubject: 'feat-x: PR 1.2 — Add foo',
+    commitSubject: 'feat-x: Step 1.2 — Add foo',
     slug: 'feat-x',
     exitCode: 1,
     gitTail: 'pre-commit hook failed',
@@ -43,7 +43,7 @@ describe('formatCommitFailureMessage', () => {
   test('names the repo, quotes the commit subject, and references the slug for retry', () => {
     const msg = formatCommitFailureMessage(baseArgs);
     expect(msg).toContain("repo 'backend' (apps/backend)");
-    expect(msg).toContain('feat-x: PR 1.2 — Add foo');
+    expect(msg).toContain('feat-x: Step 1.2 — Add foo');
     expect(msg).toContain("press `t` on 'feat-x' in `lauren`");
   });
 
@@ -66,12 +66,12 @@ describe('formatCommitFailureMessage', () => {
 });
 
 describe('RunFailure', () => {
-  test('Error.message has the step prefix; rawMessage does not', () => {
+  test('Error.message has the phase prefix; rawMessage does not', () => {
     const f = new RunFailure('commit', 'something went wrong', '1.2');
     expect(f.message).toBe('commit: something went wrong');
     expect(f.rawMessage).toBe('something went wrong');
-    expect(f.step).toBe('commit');
-    expect(f.prId).toBe('1.2');
+    expect(f.phase).toBe('commit');
+    expect(f.stepId).toBe('1.2');
   });
 });
 
@@ -89,7 +89,7 @@ describe('planCommitMessage', () => {
         started_at: null,
         finished_at: null,
         failure: null,
-        prs: null,
+        steps: null,
       }),
     ).toBe('single-plan: Plan — Single plan');
   });
@@ -100,7 +100,7 @@ describe('runPlan zero-diff already-done handling', () => {
   let planPath: string;
   let createdLogDirs: string[];
 
-  function makePr(id: string, title: string, status: PrEntry['status'] = 'pending'): PrEntry {
+  function makeStep(id: string, title: string, status: StepEntry['status'] = 'pending'): StepEntry {
     return {
       id,
       title,
@@ -120,7 +120,7 @@ describe('runPlan zero-diff already-done handling', () => {
     await fs.writeFile(
       planPath,
       `---\nname: ${planSlug}\ndescription: |\n  test\n---\n\n# ${planSlug}\n\n` +
-        '### PR 1.1 — Already done\n\nbody\n',
+        '### Step 1.1 — Already done\n\nbody\n',
       'utf8',
     );
     vi.mocked(streamSubprocess).mockReset();
@@ -139,7 +139,7 @@ describe('runPlan zero-diff already-done handling', () => {
     vi.restoreAllMocks();
   });
 
-  test('marks PR done with null commit_subject when implement produces no diff', async () => {
+  test('marks Step done with null commit_subject when implement produces no diff', async () => {
     vi.mocked(streamSubprocess).mockResolvedValue(0);
     vi.mocked(workingTreeDirty).mockReturnValue(false);
 
@@ -154,17 +154,17 @@ describe('runPlan zero-diff already-done handling', () => {
       started_at: '2026-05-08T12:05:00Z',
       finished_at: null,
       failure: null,
-      prs: [makePr('1.1', 'Already done')],
+      steps: [makeStep('1.1', 'Already done')],
     };
     const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: PrEntry[][] = [];
+    const updates: StepEntry[][] = [];
 
     await runPlan({
       plan,
       dryRun: false,
       targetRepos: [fakeRepo],
-      onPrUpdate: async (prs) => {
-        updates.push(prs.map((p) => ({ ...p })));
+      onStepUpdate: async (steps) => {
+        updates.push(steps.map((s) => ({ ...s })));
       },
     });
 
@@ -197,17 +197,17 @@ describe('runPlan zero-diff already-done handling', () => {
       started_at: '2026-05-08T12:05:00Z',
       finished_at: null,
       failure: null,
-      prs: [makePr('1.1', 'Already done')],
+      steps: [makeStep('1.1', 'Already done')],
     };
     const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: PrEntry[][] = [];
+    const updates: StepEntry[][] = [];
 
     await runPlan({
       plan,
       dryRun: false,
       targetRepos: [fakeRepo],
-      onPrUpdate: async (prs) => {
-        updates.push(prs.map((p) => ({ ...p })));
+      onStepUpdate: async (steps) => {
+        updates.push(steps.map((s) => ({ ...s })));
       },
     });
 
@@ -215,6 +215,6 @@ describe('runPlan zero-diff already-done handling', () => {
     expect(gitCommit).toHaveBeenCalled();
     const last = updates.at(-1)!;
     expect(last[0]?.status).toBe('done');
-    expect(last[0]?.commit_subject).toBe(`${planSlug}: PR 1.1 — Already done`);
+    expect(last[0]?.commit_subject).toBe(`${planSlug}: Step 1.1 — Already done`);
   });
 });

@@ -207,7 +207,7 @@ Start the unified daemon. Each iteration it drains every `enqueued` plan
 (placing each one via brain) and runs one ready plan through the
 implement/review/fix/commit pipeline. If the implement step exits cleanly
 with no diff, Lauren assumes the work was already done — review, fix, and
-commit are skipped and the plan (or PR) is marked done with no commit.
+commit are skipped and the plan (or Step) is marked done with no commit.
 
 ```sh
 lauren vibe --dry-run
@@ -251,7 +251,7 @@ description: |
 ...
 ```
 
-A multi-PR plan keeps the same frontmatter and is split into separate commits
+A multi-step plan keeps the same frontmatter and is split into separate commits
 by headings that match this exact format:
 
 ```md
@@ -263,14 +263,14 @@ description: |
   Touches src/auth/, src/email/, src/components/auth/.
 ---
 
-### PR 1.1 — Add reset token model
+### Step 1.1 — Add reset token model
 
-### PR 1.2 — Add reset request endpoint
+### Step 1.2 — Add reset request endpoint
 
-### PR 1.3 — Add reset form
+### Step 1.3 — Add reset form
 ```
 
-Each PR section runs through the full pipeline and gets its own commit.
+Each Step section runs through the full pipeline and gets its own commit.
 
 ## Execution Pipeline
 
@@ -281,7 +281,7 @@ sequenceDiagram
   participant X as codex
   participant G as git
 
-  V->>C: implement plan or PR
+  V->>C: implement plan or Step
   C-->>V: dirty working tree
   V->>X: review uncommitted changes
   X-->>V: review notes
@@ -298,17 +298,17 @@ sequenceDiagram
 Commit messages:
 
 - Single-unit plan: `<slug>: Plan — <title>`
-- Multi-PR plan: `<slug>: PR X.Y — <title>`
+- Multi-step plan: `<slug>: Step X.Y — <title>`
 
 For multi-repo workspaces, every dirty target repo gets its own commit with
 the same subject. Peer repos with no changes are not given empty marker
 commits.
 
-Multi-PR resume reads per-PR state stored on the plan row in
-`.lauren/plans.json` (`plans[].prs`). When `lauren vibe` claims a plan it
-re-parses the markdown and reconciles against that list — PR IDs already
-marked `done` are skipped, only `pending` or `failed` PRs are run. Git history
-is not consulted for resume. PRs you edited out of the markdown after a
+Multi-step resume reads per-Step state stored on the plan row in
+`.lauren/plans.json` (`plans[].steps`). When `lauren vibe` claims a plan it
+re-parses the markdown and reconciles against that list — Step IDs already
+marked `done` are skipped, only `pending` or `failed` Steps are run. Git history
+is not consulted for resume. Steps you edited out of the markdown after a
 partial run are kept as `orphaned` so they're visible but never re-executed.
 
 ## Multi-Repo Workspaces
@@ -354,7 +354,7 @@ Lauren writes project-local state under the workspace root:
 ```text
 .lauren/
   plans/             Markdown plans
-  logs/<slug>/       implement/review/fix logs (with per-PR sub-dirs)
+  logs/<slug>/       implement/review/fix logs (with per-Step sub-dirs)
   plans.json         the whole queue (every plan, every status)
   plans.json.lock    queue mutation lock
   workspace.json     (optional) multi-repo configuration
@@ -405,10 +405,10 @@ Source layout:
 src/bin/             CLI entry point (lauren.ts)
 src/cli/             plain-text rendering helpers (table.ts)
 src/core/            paths, single PlanStore, types, slug/time/workspace,
-                     per-PR state (prs.ts)
+                     per-Step state (steps.ts)
 src/proc/            claude, codex, git, pid file, subprocess streaming
 src/tui/             Ink UI (vibe progress + the default lauren TUI)
-src/executor.ts      plan execution pipeline (4-step, single- or multi-PR)
+src/executor.ts      plan execution pipeline (4-phase, single- or multi-step)
 src/executor-prompts.ts prompts for implement/review/fix and commit messages
 src/brain.ts         AI queue placement and reorganize
 src/organize.ts      brain-driven enqueued-plan draining (processEnqueuedPlan)

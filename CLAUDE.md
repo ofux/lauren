@@ -33,31 +33,33 @@ Lauren is a single-daemon system that drains a plan queue end-to-end without fur
 
 **`lauren vibe` (`src/vibe-command.ts` + `src/watcher.ts`)** — the unified daemon. Each loop iteration (a) drains every `enqueued` plan via *brain* (`brainPlacePlan` in `src/brain.ts`, called from `processEnqueuedPlan` in `src/organize.ts`), transitioning each row from `enqueued` → `preparing` → `ready` in place; then (b) claims one `ready` plan (status → `implementing`), runs the 4-step pipeline in `src/executor.ts`, and marks `done` (or `failed`). Renders progress via Ink (`src/tui/App.tsx` + `runtime.ts`) with distinct UI for the `organizing` and `implementing` phases. On Ctrl-C it demotes the in-flight plan back to `ready` so it can resume cleanly.
 
-### The 4-step pipeline (`src/executor.ts`)
+### The 4-phase pipeline (`src/executor.ts`)
 
-For each work unit (a whole plan, or a single PR section within a plan):
+For each work unit (a whole plan, or a single Step section within a plan):
 
-1. **implement** — `claude -p` with `implementPrompt`/`implementPlanPrompt`. If claude exits 0 but produces no diff, the unit short-circuits as "already done": review/fix/commit are marked `skipped`, the PR row finalizes as `done` with `commit_subject: null`, and the executor moves on. This lets the queue drain past PRs that a human or another agent already implemented instead of getting stuck.
+1. **implement** — `claude -p` with `implementPrompt`/`implementPlanPrompt`. If claude exits 0 but produces no diff, the unit short-circuits as "already done": review/fix/commit are marked `skipped`, the Step row finalizes as `done` with `commit_subject: null`, and the executor moves on. This lets the queue drain past Steps that a human or another agent already implemented instead of getting stuck.
 2. **review** — `codex exec review -o <file>` with `reviewPrompt`. Reads the `-o` file as the structured review.
 3. **fix** — `claude -p` with `fixPrompt`, given the review text. Skipped if review was empty.
-4. **commit** — `git add -A && git commit -m <message>`. Subject format is `<slug>: PR X.Y — <title>` for PR units, `Plan: <title>` for single-unit plans.
+4. **commit** — `git add -A && git commit -m <message>`. Subject format is `<slug>: Step X.Y — <title>` for Step units, `Plan: <title>` for single-unit plans.
 
-### Plan modes (single-unit vs. multi-PR)
+> Terminology note: a plan is divided into outer **Steps** (`### Step X.Y — …` sections, each its own commit); each Step runs through the four inner **Phases** above (implement / review / fix / commit). "Step" and "Phase" are used consistently throughout the code — `Step`/`StepEntry` for the outer concept, `PhaseName`/`STEP_PHASES` for the inner one.
 
-A plan file is **multi-PR** if it contains lines matching `^### PR (\d+\.\d+) — (.+)$` (parsed by `parsePrs`). Each match becomes one PR run with its own commit. Otherwise the entire plan is a **single unit** with one commit. Both are handled by `runUnit` in `executor.ts` — the only difference is which prompts run and whether the log dir is per-PR.
+### Plan modes (single-unit vs. multi-step)
 
-**Resume semantics** (multi-PR only): per-PR state lives on the plan row in `plan.prs[]` (see `src/core/prs.ts`). When the watcher claims a `ready` plan, `materializePrs` re-parses the plan markdown and reconciles it against the stored list — PRs that already finished keep status `done` and are skipped; the executor only runs PRs with status `pending` or `failed`. Git history is not consulted. This is how pressing `t` on a failed row in `lauren` (which flips it back to `ready`) picks up where it left off after a partial failure.
+A plan file is **multi-step** if it contains lines matching `^### Step (\d+\.\d+) — (.+)$` (parsed by `parseSteps`). Each match becomes one Step run with its own commit. Otherwise the entire plan is a **single unit** with one commit. Both are handled by `runUnit` in `executor.ts` — the only difference is which prompts run and whether the log dir is per-Step.
+
+**Resume semantics** (multi-step only): per-Step state lives on the plan row in `plan.steps[]` (see `src/core/steps.ts`). When the watcher claims a `ready` plan, `materializeSteps` re-parses the plan markdown and reconciles it against the stored list — Steps that already finished keep status `done` and are skipped; the executor only runs Steps with status `pending` or `failed`. Git history is not consulted. This is how pressing `t` on a failed row in `lauren` (which flips it back to `ready`) picks up where it left off after a partial failure.
 
 ### State and concurrency
 
 `.lauren/plans.json` (via `PlanStore` in `src/core/store.ts`) holds the entire queue. The `status` field is the sole lifecycle discriminator:
 
 - `enqueued` / `preparing` — pre-placement (brain hasn't decided where to put it yet).
-- `ready` / `implementing` / `failed` / `done` / `cancelled` — post-placement.
+- `ready` / `implementing` / `cancelling` / `failed` / `done` / `cancelled` — post-placement.
 
 The file is schema-versioned (`SCHEMA_VERSION` in `core/types.ts`); `PlanStore.read()` rejects unsupported versions with `PlanStoreFormatError`. All mutations serialize via `proper-lockfile` on `.lauren/plans.json.lock`.
 
-Status machine: `enqueued → preparing → ready → implementing → done | failed | cancelled`.
+Status machine: `enqueued → preparing → ready → implementing → done | failed | cancelled | cancelling`. `cancelling` is a paused state: the user cancelled an `implementing` plan with intent `keep` (don't revert), so vibe stopped the subprocess but left the working tree dirty. Vibe pauses on `cancelling` rows (analogous to `failed`) until the user manually commits/stashes the partial work and flips status to `cancelled`.
 
 Locking invariants: while a plan is `implementing`, only the executor (passing `allowImplementing: true`) may mutate the row. External operations throw `ImplementingLocked` otherwise. The same protection applies to `preparing` rows (`PreparingLocked`); only the vibe daemon's brain phase (passing `allowPreparing: true`) may mutate them.
 
@@ -70,8 +72,8 @@ The TUI dispatches per-status cancellation:
 - `enqueued` → remove from the queue + delete the plan `.md`.
 - `preparing` → set `cancel_requested=true` on the row, send `SIGUSR2` to vibe via `.lauren/vibe.pid`. Vibe's SIGUSR2 handler dispatches by phase: in `organizing`, the brain's claude subprocess is aborted (AbortSignal plumbed through `runClaudeOneshotJson`) and the row + `.md` are dropped.
 - `ready` → set status to `cancelled` directly.
-- `implementing` → set `cancel_requested=true` on the row, send `SIGUSR2` to vibe via `.lauren/vibe.pid`. Vibe aborts the in-flight subprocess, runs `revertWorkingTree` (`git checkout -- … && git clean -fd …` excluding `.lauren/`), and finalizes the row to `cancelled`.
-- `failed | done | cancelled` → no-op.
+- `implementing` → set `cancel_requested=true` (plus `cancel_intent: 'revert' | 'keep'`) on the row, send `SIGUSR2` to vibe. Vibe aborts the in-flight subprocess, then branches on the intent: `revert` (default) runs `revertWorkingTree` (`git checkout -- … && git clean -fd …` excluding `.lauren/`) and finalizes the row to `cancelled`; `keep` leaves the working tree dirty and finalizes the row to `cancelling`, then pauses the loop until the user resolves it.
+- `failed | done | cancelled | cancelling` → no-op.
 
 The vibe daemon writes its PID on startup (`src/proc/pid.ts`) and removes it on clean shutdown. If the daemon isn't running, the `cancel_requested` flag persists and is honored on the daemon's next start.
 

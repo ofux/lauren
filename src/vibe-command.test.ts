@@ -34,7 +34,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     started_at: '2026-05-08T12:05:00Z',
     finished_at: null,
     failure: null,
-    prs: null,
+    steps: null,
     ...overrides,
   };
 }

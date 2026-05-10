@@ -7,6 +7,7 @@ import {
   ImplementingLocked,
   type Plan,
   PlanNotFound,
+  PlanPreconditionFailed,
   PlanSelfMerge,
   SlugCollision,
 } from './types.js';
@@ -23,7 +24,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     started_at: null,
     finished_at: null,
     failure: null,
-    prs: null,
+    steps: null,
     ...overrides,
   };
 }
@@ -126,6 +127,28 @@ describe('PlanStore', () => {
     await expect(
       store.update('running', { title: 'Yes' }, { allowImplementing: true }),
     ).resolves.toMatchObject({ title: 'Yes' });
+  });
+
+  test('update() throws PlanPreconditionFailed and leaves the row untouched', async () => {
+    await store.add(makePlan({ slug: 'claim-me', status: 'cancelled' }));
+    await expect(
+      store.update(
+        'claim-me',
+        { status: 'implementing' },
+        { precondition: (p) => p.status === 'ready' },
+      ),
+    ).rejects.toBeInstanceOf(PlanPreconditionFailed);
+    expect((await store.find('claim-me'))?.status).toBe('cancelled');
+  });
+
+  test('update() with a satisfied precondition applies the patch', async () => {
+    await store.add(makePlan({ slug: 'claim-me', status: 'ready' }));
+    const updated = await store.update(
+      'claim-me',
+      { status: 'implementing' },
+      { precondition: (p) => p.status === 'ready' },
+    );
+    expect(updated.status).toBe('implementing');
   });
 
   describe('move()', () => {

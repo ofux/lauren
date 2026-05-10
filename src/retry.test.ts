@@ -15,8 +15,8 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     created_at: '2026-05-08T12:00:00Z',
     started_at: '2026-05-08T12:05:00Z',
     finished_at: '2026-05-08T12:10:00Z',
-    failure: { step: 'implement', pr_id: null, message: 'boom' },
-    prs: null,
+    failure: { phase: 'implement', step_id: null, message: 'boom' },
+    steps: null,
     ...overrides,
   };
 }

@@ -4,10 +4,10 @@ import { monotonicSeconds } from '../core/time.js';
 import type { Plan } from '../core/types.js';
 import {
   type ItemStatus,
-  PR_STEPS,
+  type PhaseName,
+  type PhaseStatus,
   type ProgressSink,
-  type StepName,
-  type StepStatus,
+  STEP_PHASES,
 } from '../executor.js';
 import { stripAnsi } from '../util/ansi.js';
 
@@ -15,7 +15,7 @@ export const LOG_TAIL_LINES = 8;
 
 export type RuntimeIdleState = 'idle' | 'paused' | 'running' | 'organizing';
 export type ItemDisplayStatus = 'pending' | 'running' | 'done' | 'failed';
-export type StepDisplayStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed';
+export type PhaseDisplayStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed';
 
 export interface PlanItem {
   id: string;
@@ -29,17 +29,17 @@ export interface PlanRuntimeState {
   itemStatus: Map<string, ItemDisplayStatus>;
   itemStarted: Map<string, number>;
   itemFinished: Map<string, number>;
-  stepStatus: Map<string, StepDisplayStatus>; // key: `${itemId}:${step}`
-  stepStarted: Map<string, number>;
-  stepFinished: Map<string, number>;
+  phaseStatus: Map<string, PhaseDisplayStatus>; // key: `${itemId}:${phase}`
+  phaseStarted: Map<string, number>;
+  phaseFinished: Map<string, number>;
   currentItem: string | null;
-  currentStep: StepName | null;
+  currentPhase: PhaseName | null;
   logLabel: string;
   logTail: string[]; // ring of last LOG_TAIL_LINES lines
 }
 
-function stepKey(itemId: string, step: StepName): string {
-  return `${itemId}:${step}`;
+function phaseKey(itemId: string, phase: PhaseName): string {
+  return `${itemId}:${phase}`;
 }
 
 export function newPlanRuntimeState(args: {
@@ -55,11 +55,11 @@ export function newPlanRuntimeState(args: {
     itemStatus,
     itemStarted: new Map(),
     itemFinished: new Map(),
-    stepStatus: new Map(),
-    stepStarted: new Map(),
-    stepFinished: new Map(),
+    phaseStatus: new Map(),
+    phaseStarted: new Map(),
+    phaseFinished: new Map(),
     currentItem: null,
-    currentStep: null,
+    currentPhase: null,
     logLabel: '',
     logTail: [],
   };
@@ -161,7 +161,7 @@ export class WatcherRuntime implements ProgressSink {
     this.idleState = 'paused';
     this.pausedSlug = failedPlan.slug;
     const f = failedPlan.failure;
-    const step = f ? f.step : '?';
+    const phase = f ? f.phase : '?';
     const msg = f ? f.message : '(no message)';
     const ready = plans.filter((p) => p.status === 'ready').length;
     const indentedMsg = msg
@@ -169,15 +169,53 @@ export class WatcherRuntime implements ProgressSink {
       .map((l) => `  ${l}`)
       .join('\n');
     // Git commit failures already explain the manual-fix path including the
-    // retry command. Other commit-step failures still need the generic hint.
+    // retry command. Other commit-phase failures still need the generic hint.
     const hasRecoveryHint =
-      step === 'commit' && failureMessageHasCommitRecovery(msg, failedPlan.slug);
+      phase === 'commit' && failureMessageHasCommitRecovery(msg, failedPlan.slug);
     const trailer = hasRecoveryHint
       ? `  ${ready} plan(s) queued behind it.`
       : `  ${ready} plan(s) queued behind it.\n` +
         `  Press \`t\` on '${failedPlan.slug}' in \`lauren\` to reset it to ready, ` +
         `or cancel it from there.`;
-    this.idleMessage = `PAUSED: plan '${failedPlan.slug}' failed at ${step}.\n${indentedMsg}\n${trailer}`;
+    this.idleMessage = `PAUSED: plan '${failedPlan.slug}' failed at ${phase}.\n${indentedMsg}\n${trailer}`;
+    if (isNewPause) playPauseNotification();
+    this.notify();
+  }
+
+  setPausedCancelling(plans: Plan[], plan: Plan): void {
+    const isNewPause = this.pausedSlug !== plan.slug;
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
+    this.planProgress = null;
+    this.idleState = 'paused';
+    this.pausedSlug = plan.slug;
+    const ready = plans.filter((p) => p.status === 'ready').length;
+    this.idleMessage =
+      `PAUSED: plan '${plan.slug}' is cancelling — uncommitted changes left on disk.\n` +
+      `  Inspect with \`git status\`, then commit/stash/discard, and set\n` +
+      `  status to 'cancelled' in .lauren/plans.json to resume.\n` +
+      `  ${ready} plan(s) queued behind it.`;
+    if (isNewPause) playPauseNotification();
+    this.notify();
+  }
+
+  setPausedDirtyWorkspace(plans: Plan[], dirtyRepos: string): void {
+    const isNewPause = this.pausedSlug !== '__dirty_workspace__';
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
+    this.planProgress = null;
+    this.idleState = 'paused';
+    this.pausedSlug = '__dirty_workspace__';
+    const ready = plans.filter((p) => p.status === 'ready').length;
+    this.idleMessage =
+      `PAUSED: working tree is dirty after cancellation cleared.\n` +
+      `  Dirty repo(s): ${dirtyRepos}.\n` +
+      `  Commit/stash/discard changes before vibe resumes.\n` +
+      `  ${ready} plan(s) queued behind it.`;
     if (isNewPause) playPauseNotification();
     this.notify();
   }
@@ -211,8 +249,8 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress.currentItem = itemId;
     this.planProgress.itemStatus.set(itemId, 'running');
     this.planProgress.itemStarted.set(itemId, monotonicSeconds());
-    for (const step of PR_STEPS) {
-      this.planProgress.stepStatus.set(stepKey(itemId, step), 'pending');
+    for (const phase of STEP_PHASES) {
+      this.planProgress.phaseStatus.set(phaseKey(itemId, phase), 'pending');
     }
     this.notify();
   }
@@ -224,50 +262,50 @@ export class WatcherRuntime implements ProgressSink {
     if (this.planProgress.currentItem === itemId) {
       this.planProgress.currentItem = null;
     }
-    this.planProgress.currentStep = null;
+    this.planProgress.currentPhase = null;
     this.notify();
   }
 
-  beginStep(itemId: string, step: StepName, label: string): void {
+  beginPhase(itemId: string, phase: PhaseName, label: string): void {
     if (!this.planProgress) return;
-    this.planProgress.currentStep = step;
-    this.planProgress.stepStatus.set(stepKey(itemId, step), 'running');
-    this.planProgress.stepStarted.set(stepKey(itemId, step), monotonicSeconds());
+    this.planProgress.currentPhase = phase;
+    this.planProgress.phaseStatus.set(phaseKey(itemId, phase), 'running');
+    this.planProgress.phaseStarted.set(phaseKey(itemId, phase), monotonicSeconds());
     this.planProgress.logTail.length = 0;
-    this.planProgress.logLabel = label || `${step} · ${itemId}`;
+    this.planProgress.logLabel = label || `${phase} · ${itemId}`;
     this.notify();
   }
 
-  endStep(itemId: string, step: StepName, status: StepStatus): void {
+  endPhase(itemId: string, phase: PhaseName, status: PhaseStatus): void {
     if (!this.planProgress) return;
-    this.planProgress.stepStatus.set(stepKey(itemId, step), status);
-    this.planProgress.stepFinished.set(stepKey(itemId, step), monotonicSeconds());
-    if (this.planProgress.currentStep === step) {
-      this.planProgress.currentStep = null;
+    this.planProgress.phaseStatus.set(phaseKey(itemId, phase), status);
+    this.planProgress.phaseFinished.set(phaseKey(itemId, phase), monotonicSeconds());
+    if (this.planProgress.currentPhase === phase) {
+      this.planProgress.currentPhase = null;
     }
     this.notify();
   }
 }
 
-export function getStepStatus(
+export function getPhaseStatus(
   state: PlanRuntimeState,
   itemId: string,
-  step: StepName,
-): StepDisplayStatus {
-  return state.stepStatus.get(stepKey(itemId, step)) ?? 'pending';
+  phase: PhaseName,
+): PhaseDisplayStatus {
+  return state.phaseStatus.get(phaseKey(itemId, phase)) ?? 'pending';
 }
 
-export function getStepElapsed(
+export function getPhaseElapsed(
   state: PlanRuntimeState,
   itemId: string,
-  step: StepName,
+  phase: PhaseName,
   now: number,
 ): number {
-  const status = getStepStatus(state, itemId, step);
-  const startedAt = state.stepStarted.get(stepKey(itemId, step));
+  const status = getPhaseStatus(state, itemId, phase);
+  const startedAt = state.phaseStarted.get(phaseKey(itemId, phase));
   if (startedAt === undefined) return 0;
   if (status === 'running') return now - startedAt;
-  const finishedAt = state.stepFinished.get(stepKey(itemId, step));
+  const finishedAt = state.phaseFinished.get(phaseKey(itemId, phase));
   if (finishedAt === undefined) return 0;
   return finishedAt - startedAt;
 }

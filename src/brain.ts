@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { materializePrs } from './core/prs.js';
+import { materializeSteps } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
 import {
   ImplementingLocked,
@@ -246,6 +246,25 @@ function parsePlaceDecision(raw: unknown): PlaceDecision {
     return { kind: 'invalid', message: 'unknown brain decision' };
   }
   const reasoning = stringField(raw, 'reasoning');
+  if (raw.kind === 'merge') {
+    const targetSlug = stringField(raw, 'targetSlug');
+    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
+    const mergedTitle = stringField(raw, 'mergedTitle');
+    if (!targetSlug || !mergedMarkdown || !mergedTitle) {
+      return { kind: 'invalid', message: 'merge decision missing fields' };
+    }
+    return { kind: 'merge', targetSlug, mergedTitle, mergedMarkdown, reasoning };
+  }
+  if (raw.kind === 'insert') {
+    const position = parseInsertPosition(raw.position);
+    if (position === null) {
+      return { kind: 'invalid', message: 'insert decision missing valid position' };
+    }
+    return { kind: 'insert', position, reasoning };
+  }
+  if (raw.kind === 'invalid') {
+    return { kind: 'invalid', message: stringField(raw, 'message') || 'unknown brain decision' };
+  }
   if (raw.decision === 'merge') {
     const targetSlug = stringField(raw, 'merge_into');
     const mergedMarkdown = typeof raw.merged_markdown === 'string' ? raw.merged_markdown : '';
@@ -268,6 +287,31 @@ function parsePlaceDecision(raw: unknown): PlaceDecision {
 function parseOrganizeOp(raw: unknown): OrganizeDecisionOp {
   if (!isRecord(raw)) {
     return { kind: 'invalid', op: 'unknown', message: `skip unknown op: ${String(raw)}` };
+  }
+  if (raw.kind === 'merge') {
+    const into = stringField(raw, 'into');
+    const fromSlug = stringField(raw, 'fromSlug');
+    const mergedMarkdown = typeof raw.mergedMarkdown === 'string' ? raw.mergedMarkdown : '';
+    const mergedTitle = stringField(raw, 'mergedTitle');
+    if (!into || !fromSlug || !mergedMarkdown || !mergedTitle) {
+      return {
+        kind: 'invalid',
+        op: 'merge',
+        message: `skip merge (missing fields): ${JSON.stringify(raw)}`,
+      };
+    }
+    return { kind: 'merge', into, fromSlug, mergedTitle, mergedMarkdown };
+  }
+  if (raw.kind === 'reorder') {
+    const order = Array.isArray(raw.order) ? raw.order.map(String) : [];
+    return { kind: 'reorder', order };
+  }
+  if (raw.kind === 'invalid') {
+    return {
+      kind: 'invalid',
+      op: stringField(raw, 'op') || 'unknown',
+      message: stringField(raw, 'message') || 'skip unknown op: undefined',
+    };
   }
   if (raw.op === 'merge') {
     const into = stringField(raw, 'into');
@@ -323,7 +367,7 @@ export async function applyPlaceDecision(
         targetSlug: decision.targetSlug,
         fromSlug: newPlan.slug,
         newTitle: decision.mergedTitle,
-        newPrs: (target) => materializePrs(decision.mergedMarkdown, target.prs),
+        newSteps: (target) => materializeSteps(decision.mergedMarkdown, target.steps),
         bodyWriter: async (target) => {
           const targetPath = planFilePath(target);
           return replacePlanFileWithRollback(targetPath, decision.mergedMarkdown);
@@ -428,7 +472,7 @@ export async function applyOrganizeDecision(
           targetSlug: op.into,
           fromSlug: op.fromSlug,
           newTitle: op.mergedTitle,
-          newPrs: (target) => materializePrs(op.mergedMarkdown, target.prs),
+          newSteps: (target) => materializeSteps(op.mergedMarkdown, target.steps),
           bodyWriter: async (target) => {
             const targetPath = planFilePath(target);
             return replacePlanFileWithRollback(targetPath, op.mergedMarkdown);

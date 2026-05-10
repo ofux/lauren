@@ -3,7 +3,7 @@ import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
 import { VIBE_LOCK_PATH } from './core/paths.js';
-import { materializePrs, type PrEntry } from './core/prs.js';
+import { materializeSteps, type StepEntry } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
@@ -11,10 +11,17 @@ import {
   type Plan,
   type PlanFailure,
   PlanNotFound,
+  PlanPreconditionFailed,
   planFilePath,
 } from './core/types.js';
+import {
+  formatRepoList,
+  type ResolvedWorkspaceRepo,
+  resolveWorkspaceRepos,
+} from './core/workspace.js';
 import { RunFailure, runPlan } from './executor.js';
 import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
+import { workingTreeDirty } from './proc/git.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 
 export const IDLE_POLL_SECONDS = 3.0;
@@ -43,6 +50,10 @@ async function planFileExists(plan: Plan): Promise<boolean> {
   }
 }
 
+function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceRepo[] {
+  return repos.filter((repo) => workingTreeDirty(repo.root));
+}
+
 export async function tryAcquireVibeLock(): Promise<(() => Promise<void>) | null> {
   await fs.mkdir(path.dirname(VIBE_LOCK_PATH), { recursive: true });
   const fd = await fs.open(VIBE_LOCK_PATH, 'a');
@@ -58,23 +69,23 @@ export async function tryAcquireVibeLock(): Promise<(() => Promise<void>) | null
 }
 
 function runtimeItemsForPlan(plan: Plan): PlanItem[] {
-  if (plan.prs && plan.prs.length > 0) {
-    return plan.prs
-      .filter((pr) => pr.status !== 'orphaned')
-      .map((pr) => ({ id: pr.id, title: pr.title }));
+  if (plan.steps && plan.steps.length > 0) {
+    return plan.steps
+      .filter((step) => step.status !== 'orphaned')
+      .map((step) => ({ id: step.id, title: step.title }));
   }
   return [{ id: plan.slug, title: plan.title }];
 }
 
 function failureFromError(err: unknown): PlanFailure {
   if (err instanceof RunFailure) {
-    // Use rawMessage (without the "${step}: " prefix the Error constructor
-    // adds) — the TUI displays step separately and we don't want it twice.
-    return { step: err.step, pr_id: err.prId, message: err.rawMessage };
+    // Use rawMessage (without the "${phase}: " prefix the Error constructor
+    // adds) — the TUI displays phase separately and we don't want it twice.
+    return { phase: err.phase, step_id: err.stepId, message: err.rawMessage };
   }
   return {
-    step: 'unknown',
-    pr_id: null,
+    phase: 'unknown',
+    step_id: null,
     message: `unexpected error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
   };
 }
@@ -99,6 +110,39 @@ export async function markPlanFinal(
 }
 
 export type DaemonPhase = 'idle' | 'organizing' | 'implementing';
+
+/**
+ * Handle a SIGUSR2 cancellation request: abort the in-flight subprocess
+ * matching the current phase, but only if (a) there is an in-flight slug,
+ * (b) that slug actually has `cancel_requested=true` on disk, and (c) it's
+ * still the in-flight slug after the disk read.
+ *
+ * (c) is the load-bearing check: between capturing the slug and reading
+ * the store, the daemon can transition phase (organizing → idle →
+ * implementing of a different plan). Without the re-verify we'd dispatch
+ * the abort on the *current* phase/controller — which now belongs to an
+ * unrelated subprocess.
+ */
+export async function handleCancelSignal(
+  store: { find: (slug: string) => Promise<Plan | null> },
+  handles: WatcherLoopHandles,
+): Promise<void> {
+  const slug = handles.current.slug;
+  if (!slug) return;
+  let fresh: Plan | null;
+  try {
+    fresh = await store.find(slug);
+  } catch {
+    return;
+  }
+  if (!fresh?.cancel_requested) return;
+  if (handles.current.slug !== slug) return;
+  if (handles.phase.value === 'organizing') {
+    handles.brainState.controller?.abort();
+  } else if (handles.phase.value === 'implementing') {
+    handles.cancelController.ref?.abort();
+  }
+}
 
 export interface WatcherLoopHandles {
   /**
@@ -178,7 +222,32 @@ export async function watcherLoop(
 ): Promise<{ inFlight: Plan | null; cancelledSlug: string | null }> {
   let inFlight: Plan | null = null;
   let cancelledSlug: string | null = null;
+  let requireCleanWorkspaceAfterCancelling = false;
   while (!signal.aborted) {
+    const beforeDrain = await store.read();
+
+    // A 'cancelling' row means the user cancelled an implementing plan with
+    // intent='keep'. The working tree still has the partial work; vibe must
+    // pause before doing any other queue work until the user resolves the
+    // dirty state and flips status to 'cancelled'.
+    const cancellingBeforeDrain = beforeDrain.find((p) => p.status === 'cancelling');
+    if (cancellingBeforeDrain) {
+      requireCleanWorkspaceAfterCancelling = true;
+      runtime.setPausedCancelling(beforeDrain, cancellingBeforeDrain);
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
+
+    if (requireCleanWorkspaceAfterCancelling) {
+      const dirty = dirtyRepos(await resolveWorkspaceRepos());
+      if (dirty.length > 0) {
+        runtime.setPausedDirtyWorkspace(beforeDrain, formatRepoList(dirty));
+        await sleep(IDLE_POLL_SECONDS * 1000, signal);
+        continue;
+      }
+      requireCleanWorkspaceAfterCancelling = false;
+    }
+
     // Phase A: drain every enqueued plan before touching the ready queue.
     // New plans landing mid-implement will be placed on the next iteration.
     await drainEnqueued(runtime, store, signal, handles);
@@ -193,6 +262,18 @@ export async function watcherLoop(
       continue;
     }
 
+    // A 'cancelling' row means the user cancelled an implementing plan with
+    // intent='keep'. The working tree still has the partial work; vibe must
+    // pause until the user resolves the dirty state and flips status to
+    // 'cancelled'.
+    const stuck = plans.find((p) => p.status === 'cancelling');
+    if (stuck) {
+      requireCleanWorkspaceAfterCancelling = true;
+      runtime.setPausedCancelling(plans, stuck);
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
+
     const ready = plans.filter((p) => p.status === 'ready');
     if (ready.length === 0) {
       runtime.setIdle(plans);
@@ -202,13 +283,18 @@ export async function watcherLoop(
 
     const next = ready[0]!;
     if (next.cancel_requested) {
-      // User cancelled before we picked it up. Mark cancelled directly.
-      await markPlanFinal(store, next.slug, { status: 'cancelled', cancel_requested: false });
+      // User cancelled before we picked it up. No partial work exists, so
+      // regardless of intent there's nothing to revert/keep — just cancel.
+      await markPlanFinal(store, next.slug, {
+        status: 'cancelled',
+        cancel_requested: false,
+        cancel_intent: undefined,
+      });
       continue;
     }
     const missingFailure = (plan: Plan): PlanFailure => ({
-      step: 'implement',
-      pr_id: null,
+      phase: 'implement',
+      step_id: null,
       message: `plan file missing: ${plan.path}`,
     });
     if (!(await planFileExists(next))) {
@@ -230,22 +316,37 @@ export async function watcherLoop(
       throw err;
     }
 
-    // Re-parse PRs from the (possibly-edited) plan file and reconcile with
-    // stored state. This is the only place per-PR state is materialized at
-    // execution time — everything downstream trusts `claimed.prs`.
-    const reconciledPrs = materializePrs(planText, next.prs);
+    // Re-parse Steps from the (possibly-edited) plan file and reconcile with
+    // stored state. This is the only place per-step state is materialized at
+    // execution time — everything downstream trusts `claimed.steps`.
+    const reconciledSteps = materializeSteps(planText, next.steps);
 
     let claimed: Plan;
     try {
-      claimed = await store.update(next.slug, {
-        status: 'implementing',
-        started_at: nowIso(),
-        finished_at: null,
-        failure: null,
-        prs: reconciledPrs,
-      });
+      // Require the row to still be `ready` at lock time. Without this CAS,
+      // a concurrent cancel that flipped the row to `cancelled` between our
+      // read above and this update would be silently overwritten back to
+      // `implementing` — the cancellation lost without a trace.
+      claimed = await store.update(
+        next.slug,
+        {
+          status: 'implementing',
+          started_at: nowIso(),
+          finished_at: null,
+          failure: null,
+          steps: reconciledSteps,
+        },
+        {
+          precondition: (p) => p.status === 'ready',
+          preconditionDetail: 'row is no longer ready (likely cancelled concurrently)',
+        },
+      );
     } catch (err) {
-      if (err instanceof ImplementingLocked || err instanceof PlanNotFound) {
+      if (
+        err instanceof ImplementingLocked ||
+        err instanceof PlanNotFound ||
+        err instanceof PlanPreconditionFailed
+      ) {
         continue;
       }
       throw err;
@@ -267,9 +368,9 @@ export async function watcherLoop(
         planTitle: claimed.title,
       });
       runtime.setRunning(await store.read(), claimed, planProgress);
-      const onPrUpdate = async (prs: PrEntry[]): Promise<void> => {
+      const onStepUpdate = async (steps: StepEntry[]): Promise<void> => {
         try {
-          await store.update(claimed.slug, { prs }, { allowImplementing: true });
+          await store.update(claimed.slug, { steps }, { allowImplementing: true });
         } catch (err) {
           if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
             throw err;
@@ -281,14 +382,29 @@ export async function watcherLoop(
         dryRun: false,
         progress: runtime,
         signal: merged,
-        onPrUpdate,
+        onStepUpdate,
       });
     } catch (err) {
       handles.current.slug = null;
       handles.cancelController.ref = null;
       handles.phase.value = 'idle';
       if (cancelController.signal.aborted && !signal.aborted) {
-        // Per-plan cancellation: revert the working tree and mark cancelled.
+        // Per-plan cancellation. Branch by intent:
+        //   'keep' — leave the working tree untouched, demote to 'cancelling',
+        //            and let the outer loop pause on the cancelling row.
+        //   'revert' (default) — return to the caller so vibe-command can
+        //            revert + mark 'cancelled' and exit.
+        const cancelledPlan = await store.find(claimed.slug);
+        const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
+        if (cancelIntent === 'keep') {
+          await markPlanFinal(store, claimed.slug, {
+            status: 'cancelling',
+            cancel_requested: false,
+            cancel_intent: undefined,
+          });
+          inFlight = null;
+          continue;
+        }
         cancelledSlug = claimed.slug;
         return { inFlight: claimed, cancelledSlug };
       }

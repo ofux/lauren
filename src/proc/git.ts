@@ -50,7 +50,7 @@ export function slugHasLaurenHistory(slug: string, cwd: string = REPO): boolean 
     throw err;
   }
   return subjects.some((subject) => {
-    return subject.startsWith(`${slug}: PR `) || subject.startsWith(`${slug}: Plan `);
+    return subject.startsWith(`${slug}: Step `) || subject.startsWith(`${slug}: Plan `);
   });
 }
 

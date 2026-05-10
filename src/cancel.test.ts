@@ -21,7 +21,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     started_at: null,
     finished_at: null,
     failure: null,
-    prs: null,
+    steps: null,
     ...overrides,
   };
 }
@@ -89,11 +89,71 @@ describe('cancelPlan', () => {
 
     expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
     expect(plan.cancel_requested).toBe(true);
+    expect(plan.cancel_intent).toBe('revert');
     expect(store.update).toHaveBeenLastCalledWith(
       plan.slug,
-      { cancel_requested: true },
+      { cancel_requested: true, cancel_intent: 'revert' },
       { allowPreparing: true, allowImplementing: true },
     );
     expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
+  });
+
+  test("stamps cancel_intent='keep' when cancelling an implementing plan with intent=keep", async () => {
+    const plan = makePlan({ status: 'implementing' });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
+        Object.assign(plan, fields);
+        return plan;
+      }),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'keep' });
+
+    expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
+    expect(plan.cancel_requested).toBe(true);
+    expect(plan.cancel_intent).toBe('keep');
+    expect(store.update).toHaveBeenCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'keep' },
+      { allowPreparing: true, allowImplementing: true },
+    );
+    expect(outcome.kind === 'requested' && outcome.message).toMatch(/mark cancelling/);
+  });
+
+  test("defaults cancel_intent to 'revert' when cancelling an implementing plan with no intent", async () => {
+    const plan = makePlan({ status: 'implementing' });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
+        Object.assign(plan, fields);
+        return plan;
+      }),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
+    expect(plan.cancel_intent).toBe('revert');
+    expect(store.update).toHaveBeenCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'revert' },
+      { allowPreparing: true, allowImplementing: true },
+    );
+  });
+
+  test("is a no-op for a 'cancelling' plan", async () => {
+    const plan = makePlan({ status: 'cancelling' });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(),
+      remove: vi.fn(),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome.kind).toBe('noop');
+    expect(store.update).not.toHaveBeenCalled();
+    expect(store.remove).not.toHaveBeenCalled();
   });
 });

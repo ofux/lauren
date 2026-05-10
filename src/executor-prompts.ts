@@ -1,7 +1,7 @@
-import type { PR } from './core/prs.js';
+import type { Step } from './core/steps.js';
 import type { Plan } from './core/types.js';
 
-export type { PR };
+export type { Step };
 
 function repoInstruction(repoPaths: readonly string[]): string {
   if (repoPaths.length === 0) return '';
@@ -26,34 +26,38 @@ function reviewGitInstruction(repoPaths: readonly string[]): string {
 }
 
 export function implementPrompt(
-  pr: PR,
+  step: Step,
   planPath: string,
   repoPaths: readonly string[] = [],
 ): string {
   return (
-    `Implement PR ${pr.id} ("${pr.title}") as described in @${planPath}. ` +
+    `Implement Step ${step.id} ("${step.title}") as described in @${planPath}. ` +
     `You are running from the workspace root.${repoInstruction(repoPaths)} ` +
-    `Read the full PR section first, then implement everything listed under Scope. ` +
-    `Stay strictly within the PR scope — do not touch items listed under "Out of scope". ` +
+    `Read the full Step section first, then implement everything listed under Scope. ` +
+    `Stay strictly within the Step scope — do not touch items listed under "Out of scope". ` +
     `Stop when the scope is complete; do not commit (the orchestrator will commit).`
   );
 }
 
-export function reviewPrompt(pr: PR, planPath: string, repoPaths: readonly string[] = []): string {
+export function reviewPrompt(
+  step: Step,
+  planPath: string,
+  repoPaths: readonly string[] = [],
+): string {
   return (
-    `Review the uncommitted changes for PR ${pr.id} (${pr.title}). ` +
+    `Review the uncommitted changes for Step ${step.id} (${step.title}). ` +
     reviewGitInstruction(repoPaths) +
-    `The PR description is in @${planPath} (search for '### PR ${pr.id}'). ` +
-    `Check for: correctness, scope creep vs the PR's Scope/Out-of-scope sections, ` +
+    `The Step description is in @${planPath} (search for '### Step ${step.id}'). ` +
+    `Check for: correctness, scope creep vs the Step's Scope/Out-of-scope sections, ` +
     `bugs, security issues, and missing exit-criteria items. Be specific and actionable.`
   );
 }
 
-export function fixPrompt(pr: PR, reviewText: string): string {
+export function fixPrompt(step: Step, reviewText: string): string {
   return (
     `${reviewText}\n\n` +
     `---\n` +
-    `Above is review feedback on your uncommitted changes for PR ${pr.id} (${pr.title}). ` +
+    `Above is review feedback on your uncommitted changes for Step ${step.id} (${step.title}). ` +
     `For each comment, decide if it is legitimate. Implement the fixes you agree with. ` +
     `For nitpicks or comments you disagree with, skip them and at the end print a short ` +
     `list of what you skipped and why. Do not commit (the orchestrator will commit).`
@@ -96,8 +100,8 @@ export function fixPlanPrompt(plan: Plan, reviewText: string): string {
   );
 }
 
-export function prCommitMessage(plan: Plan, pr: PR): string {
-  return `${plan.slug}: PR ${pr.id} — ${pr.title}`;
+export function stepCommitMessage(plan: Plan, step: Step): string {
+  return `${plan.slug}: Step ${step.id} — ${step.title}`;
 }
 
 export function planCommitMessage(plan: Plan): string {

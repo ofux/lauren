@@ -170,10 +170,10 @@ description and the codebase you can explore.
 5. When the user approves, decide on plan shape:
    - **Single unit**: small enough to land in one commit. Write the
      plan with a Context section and a step list. Do NOT include
-     \`### PR X.Y\` headings.
-   - **Multi-PR**: larger work that needs multiple commits. Use
-     \`### PR X.Y — Title\` headings (regex \`^### PR (\\d+\\.\\d+) — (.+)$\`,
-     em-dash, not hyphen). Each PR section should include Goal, Scope,
+     \`### Step X.Y\` headings.
+   - **Multi-step**: larger work that needs multiple commits. Use
+     \`### Step X.Y — Title\` headings (regex \`^### Step (\\d+\\.\\d+) — (.+)$\`,
+     em-dash, not hyphen). Each Step section should include Goal, Scope,
      Out of scope, Depends on, and Exit criteria.
 
 6. Pick a kebab-case slug (2–4 words, descriptive). Examples:
@@ -228,7 +228,7 @@ description and the codebase you can explore.
 
 ## Plan content
 
-Whether single-unit or multi-PR, every plan must include:
+Whether single-unit or multi-step, every plan must include:
 
 - A **Context** section explaining why this change is being made.
 - A clear list of files to touch and what to change in each.
