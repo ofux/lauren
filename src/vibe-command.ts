@@ -3,6 +3,7 @@ import type { Command } from 'commander';
 import { render } from 'ink';
 import React from 'react';
 
+import { type LaurenConfig, LaurenConfigError, readLaurenConfig } from './core/config.js';
 import { displayPath, LAUREN_DIR, VIBE_LOCK_PATH, VIBE_PID_PATH } from './core/paths.js';
 import { PlanStore } from './core/store.js';
 import { type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
@@ -11,7 +12,7 @@ import {
   type ResolvedWorkspaceRepo,
   resolveWorkspaceRepos,
 } from './core/workspace.js';
-import { revertWorkingTree, workingTreeDirty } from './proc/git.js';
+import { getCurrentBranch, workingTreeDirty } from './proc/git.js';
 import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
 import { WatcherRuntime } from './tui/runtime.js';
@@ -22,40 +23,36 @@ import {
   type WatcherLoopHandles,
   watcherLoop,
 } from './watcher.js';
-
-async function resolveCancelledPlanRepos(plans: readonly Plan[]): Promise<ResolvedWorkspaceRepo[]> {
-  const reposByRoot = new Map<string, ResolvedWorkspaceRepo>();
-  for (const plan of plans) {
-    const repos = await resolveWorkspaceRepos(plan.target_repos);
-    for (const repo of repos) {
-      if (!reposByRoot.has(repo.root)) reposByRoot.set(repo.root, repo);
-    }
-  }
-  return Array.from(reposByRoot.values());
-}
+import { cleanupPlanWorktrees } from './worktree.js';
 
 export async function finalizeCancelledImplementingPlans(
   store: PlanStore,
   plans: Plan[],
 ): Promise<boolean> {
-  try {
-    const repos = await resolveCancelledPlanRepos(plans);
-    for (const repo of repos) {
-      revertWorkingTree(repo.root);
+  for (const plan of plans) {
+    try {
+      await cleanupPlanWorktrees(plan);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `error: failed to remove worktree for '${plan.slug}'; ` +
+          `leaving cancellation pending: ${msg}\n`,
+      );
+      return false;
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(
-      `error: failed to revert working tree; leaving cancellation pending: ${msg}\n`,
-    );
-    return false;
   }
 
   for (const plan of plans) {
-    await markPlanFinal(store, plan.slug, { status: 'cancelled', cancel_requested: false });
+    await markPlanFinal(store, plan.slug, {
+      status: 'cancelled',
+      cancel_requested: false,
+      cancel_intent: undefined,
+      worktrees: undefined,
+      pr_urls: undefined,
+    });
   }
   const slugs = plans.map((p) => p.slug).join(', ');
-  process.stdout.write(`cancelled '${slugs}'; reverted working tree.\n`);
+  process.stdout.write(`cancelled '${slugs}'; removed worktree(s).\n`);
   return true;
 }
 
@@ -63,9 +60,83 @@ function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceR
   return repos.filter((repo) => workingTreeDirty(repo.root));
 }
 
+export function allowsDirtyStartupRecovery(plans: readonly Plan[]): boolean {
+  return plans.some((p) => p.status === 'cancelling' || p.status === 'merging');
+}
+
+export async function recoverImplementingPlans(
+  store: PlanStore,
+  implementing: Plan[],
+): Promise<boolean> {
+  // Crash recovery for `implementing` rows. With worktrees in play, all
+  // partial work lives in the per-plan worktree (never the user's main
+  // checkout), so we can always clean up safely:
+  //   - cancel_requested + revert (or no intent) → tear down worktree,
+  //     mark cancelled.
+  //   - cancel_requested + keep → tear down nothing, mark cancelling
+  //     (user resolves on the lauren/<slug> branch manually).
+  //   - no cancel_requested → tear down worktree, demote to ready so
+  //     the loop re-claims with a fresh worktree.
+  const revertGroup = implementing.filter((p) => p.cancel_requested && p.cancel_intent !== 'keep');
+  const keepGroup = implementing.filter((p) => p.cancel_requested && p.cancel_intent === 'keep');
+  const orphanGroup = implementing.filter((p) => !p.cancel_requested);
+
+  if (revertGroup.length > 0) {
+    const finalized = await finalizeCancelledImplementingPlans(store, revertGroup);
+    if (!finalized) return false;
+  }
+  for (const p of keepGroup) {
+    await markPlanFinal(store, p.slug, {
+      status: 'cancelling',
+      cancel_requested: false,
+      cancel_intent: undefined,
+    });
+  }
+  for (const p of orphanGroup) {
+    try {
+      // Preserve `lauren/<slug>` so any Step commits already made on it
+      // survive the resume. The stored `steps[]` records which Steps
+      // already finished; deleting the branch here would silently drop
+      // those commits while the resume still skipped the Steps. The
+      // next run's setupPlanWorktrees reuses the existing branch.
+      await cleanupPlanWorktrees(p, { keepBranches: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`warning: failed to clean orphan worktree for '${p.slug}': ${msg}\n`);
+    }
+    try {
+      await store.update(
+        p.slug,
+        {
+          status: 'ready',
+          started_at: null,
+          finished_at: null,
+          failure: null,
+          worktrees: undefined,
+        },
+        { allowImplementing: true },
+      );
+    } catch (err) {
+      if (!(err instanceof PlanNotFound)) throw err;
+    }
+  }
+  return true;
+}
+
 async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   await fs.mkdir(LAUREN_DIR, { recursive: true });
   const store = new PlanStore();
+
+  let config: LaurenConfig;
+  try {
+    config = await readLaurenConfig();
+  } catch (err) {
+    if (err instanceof LaurenConfigError) {
+      process.stderr.write(`error: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
 
   if (opts.dryRun) {
     const plans = await store.read();
@@ -117,47 +188,10 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   const initialPlans = await store.read();
   const implementing = initialPlans.filter((p) => p.status === 'implementing');
   if (implementing.length > 0) {
-    const cancellable = implementing.filter((p) => p.cancel_requested);
-    if (cancellable.length === implementing.length) {
-      // Honor cancel_requested set while the prior process was down. Split
-      // by intent: revert-intent plans get the working tree reverted and
-      // are marked 'cancelled' (today's behavior); keep-intent plans are
-      // demoted to 'cancelling' inline (no tree change) and the loop will
-      // pause on them.
-      const revertGroup = cancellable.filter((p) => p.cancel_intent !== 'keep');
-      const keepGroup = cancellable.filter((p) => p.cancel_intent === 'keep');
-      if (revertGroup.length > 0) {
-        const finalized = await finalizeCancelledImplementingPlans(store, revertGroup);
-        if (!finalized) {
-          await releasePidFile().catch(() => undefined);
-          await releaseVibeLock().catch(() => undefined);
-          return 1;
-        }
-      }
-      for (const p of keepGroup) {
-        await markPlanFinal(store, p.slug, {
-          status: 'cancelling',
-          cancel_requested: false,
-          cancel_intent: undefined,
-        });
-      }
-      if (keepGroup.length === 0) {
-        await releasePidFile().catch(() => undefined);
-        await releaseVibeLock().catch(() => undefined);
-        return 0;
-      }
-      // Fall through: keep-intent plans are now 'cancelling'; the loop will
-      // enter the paused state on them.
-    } else {
+    const recovered = await recoverImplementingPlans(store, implementing);
+    if (!recovered) {
       await releasePidFile().catch(() => undefined);
-      await releaseVibeLock();
-      const slugs = implementing.map((p) => p.slug).join(', ');
-      process.stderr.write(
-        `error: plan(s) ${slugs} marked implementing (likely from a crashed run). ` +
-          `Inspect with \`git status\`, clean the working tree, then manually set ` +
-          `\`status: "ready"\` (and clear \`started_at\`/\`failure\`) for each row in ` +
-          `\`.lauren/plans.json\`.\n`,
-      );
+      await releaseVibeLock().catch(() => undefined);
       return 1;
     }
   }
@@ -176,21 +210,27 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     }
   }
 
-  // If any plan is 'cancelling', the working tree is expected to be dirty
-  // (the user kept the partial work). Skip the dirty-tree refusal — the
-  // watcher loop will enter the paused state and tell the user what to do.
-  const hasCancelling = (await store.read()).some((p) => p.status === 'cancelling');
-  if (!hasCancelling) {
-    let dirty: ResolvedWorkspaceRepo[];
-    try {
-      dirty = dirtyRepos(await resolveWorkspaceRepos());
-    } catch (err) {
-      await releasePidFile().catch(() => undefined);
-      await releaseVibeLock().catch(() => undefined);
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`error: ${msg}\n`);
-      return 1;
-    }
+  // Validate the user's main checkout: clean tree + on dev_branch, in every
+  // workspace repo. Worktrees keep partial pipeline state out of the user's
+  // tree, so a dirty main checkout means the user has their own work in
+  // progress — refuse to run rather than commit on top of it. The branch
+  // check is required for auto-merge to land where the user expects.
+  // (Cancelling rows can leave a keep-intent branch dirty; merging rows can
+  // leave an in-progress parent checkout merge after a crash.)
+  const allowDirtyStartup = allowsDirtyStartupRecovery(await store.read());
+  let workspaceRepos: ResolvedWorkspaceRepo[];
+  try {
+    workspaceRepos = await resolveWorkspaceRepos();
+  } catch (err) {
+    await releasePidFile().catch(() => undefined);
+    await releaseVibeLock().catch(() => undefined);
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`error: ${msg}\n`);
+    return 1;
+  }
+
+  if (!allowDirtyStartup) {
+    const dirty = dirtyRepos(workspaceRepos);
     if (dirty.length > 0) {
       await releasePidFile().catch(() => undefined);
       await releaseVibeLock().catch(() => undefined);
@@ -201,6 +241,30 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
       );
       return 1;
     }
+  }
+
+  const wrongBranch: { repo: string; branch: string }[] = [];
+  for (const repo of workspaceRepos) {
+    try {
+      const branch = getCurrentBranch(repo.root);
+      if (branch !== config.dev_branch) wrongBranch.push({ repo: repo.name, branch });
+    } catch (err) {
+      await releasePidFile().catch(() => undefined);
+      await releaseVibeLock().catch(() => undefined);
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`error: failed to read branch in ${repo.name}: ${msg}\n`);
+      return 1;
+    }
+  }
+  if (wrongBranch.length > 0) {
+    await releasePidFile().catch(() => undefined);
+    await releaseVibeLock().catch(() => undefined);
+    const detail = wrongBranch.map((w) => `${w.repo} is on '${w.branch}'`).join(', ');
+    process.stderr.write(
+      `error: each workspace repo must be on '${config.dev_branch}' for lauren vibe ` +
+        `to merge into it; ${detail}. Set 'dev_branch' in .lauren/config.json to override.\n`,
+    );
+    return 1;
   }
 
   process.stdout.write('✨ vibe watcher started. Ctrl-C to stop.\n\n');
@@ -243,7 +307,7 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   let cancelledSlug: string | null = null;
   let loopError: unknown = null;
   try {
-    const result = await watcherLoop(runtime, store, abortController.signal, handles);
+    const result = await watcherLoop(runtime, store, config, abortController.signal, handles);
     inFlight = result.inFlight;
     cancelledSlug = result.cancelledSlug;
   } catch (err) {
@@ -268,6 +332,9 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
       const finalized = await finalizeCancelledImplementingPlans(store, [inFlight]);
       exitCode = finalized ? 0 : 1;
     } else if (inFlight !== null) {
+      // Same reasoning as the orphan-recovery path above: keep
+      // `lauren/<slug>` so committed Steps survive the resume.
+      await cleanupPlanWorktrees(inFlight, { keepBranches: true }).catch(() => undefined);
       try {
         await store.update(
           inFlight.slug,
@@ -276,12 +343,12 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
             started_at: null,
             finished_at: null,
             failure: null,
+            worktrees: undefined,
           },
           { allowImplementing: true },
         );
         process.stdout.write(
-          `stopped during '${inFlight.slug}'; left as ready. ` +
-            `Run \`lauren vibe\` to resume (clean the working tree first).\n`,
+          `stopped during '${inFlight.slug}'; left as ready. Run \`lauren vibe\` to resume.\n`,
         );
       } catch {
         process.stdout.write('vibe stopped.\n');

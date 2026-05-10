@@ -7,6 +7,7 @@ export type PlanStatus =
   | 'preparing'
   | 'ready'
   | 'implementing'
+  | 'merging'
   | 'cancelling'
   | 'failed'
   | 'done'
@@ -28,6 +29,19 @@ export interface PlanFailure {
   phase: string;
   step_id: string | null;
   message: string;
+}
+
+/**
+ * Worktree created for a plan's implementation. `repo` is the workspace
+ * repo name; `null` for single-repo plans where the only worktree covers
+ * the whole repo. `parentRoot` is the path of the parent checkout from
+ * which the worktree was created (where the merge will eventually run).
+ */
+export interface PlanWorktree {
+  repo: string | null;
+  path: string;
+  branch: string;
+  parentRoot: string;
 }
 
 export interface Plan {
@@ -54,6 +68,18 @@ export interface Plan {
    * executor does not consult git history.
    */
   steps: StepEntry[] | null;
+  /**
+   * Worktrees created when the plan entered `implementing`. Persisted so
+   * the merger and crash-recovery sweeps can find them. Cleared when the
+   * worktrees are removed (success, cancel, or failure cleanup).
+   */
+  worktrees?: PlanWorktree[];
+  /**
+   * For github-pr merge mode: PR URLs keyed by worktree repo name (or the
+   * literal '.' for single-repo plans). Populated when the PR is opened;
+   * cleared when the plan finishes.
+   */
+  pr_urls?: Record<string, string>;
 }
 
 export interface TodoFile {
@@ -94,6 +120,15 @@ export class PreparingLocked extends Error {
   constructor(slug: string) {
     super(`plan '${slug}' is preparing and locked from non-brain mutations`);
     this.name = 'PreparingLocked';
+    this.slug = slug;
+  }
+}
+
+export class MergingLocked extends Error {
+  readonly slug: string;
+  constructor(slug: string) {
+    super(`plan '${slug}' is merging and locked from non-merger mutations`);
+    this.name = 'MergingLocked';
     this.slug = slug;
   }
 }

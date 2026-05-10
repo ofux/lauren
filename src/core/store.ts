@@ -6,6 +6,7 @@ import { DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
 import type { StepEntry } from './steps.js';
 import {
   ImplementingLocked,
+  MergingLocked,
   type Plan,
   PlanNotFound,
   PlanNotReady,
@@ -32,6 +33,7 @@ interface MergeBodyWrite {
 interface LockOptions {
   allowPreparing?: boolean;
   allowImplementing?: boolean;
+  allowMerging?: boolean;
 }
 
 interface UpdateOptions extends LockOptions {
@@ -74,6 +76,9 @@ function checkLock(plan: Plan, opts: LockOptions): void {
   if (plan.status === 'preparing' && !opts.allowPreparing) {
     throw new PreparingLocked(plan.slug);
   }
+  if (plan.status === 'merging' && !opts.allowMerging) {
+    throw new MergingLocked(plan.slug);
+  }
 }
 
 /**
@@ -87,6 +92,8 @@ function checkLock(plan: Plan, opts: LockOptions): void {
  *     to mutate them from elsewhere (only the watcher should).
  *   - `preparing` rows are owned by the brain phase — pass `allowPreparing`
  *     to mutate them from elsewhere (only the daemon's organize phase should).
+ *   - `merging` rows are owned by the merger — pass `allowMerging` to mutate
+ *     them from elsewhere (only the daemon's merge phase should).
  */
 export class PlanStore {
   readonly path: string;
@@ -307,6 +314,9 @@ export class PlanStore {
       const plan = plans[idx]!;
       if (plan.status === 'implementing' && !opts.allowImplementing) {
         throw new ImplementingLocked(slug);
+      }
+      if (plan.status === 'merging') {
+        throw new MergingLocked(slug);
       }
       plans.splice(idx, 1);
       if (opts.toFront) {

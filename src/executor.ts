@@ -167,13 +167,20 @@ interface RunUnitArgs {
   planText: string | null;
   parentLogDir: string;
   targetRepos: readonly ResolvedWorkspaceRepo[];
+  /**
+   * Working directory for claude/codex subprocesses. The executor never
+   * shells into the user's main checkout — this is the worktree root for
+   * the in-flight plan. Git commit operations use `targetRepos[i].root`
+   * (which the watcher has already rewritten to per-repo worktree paths).
+   */
+  cwd: string;
   dryRun: boolean;
   progress?: ProgressSink;
   signal?: AbortSignal;
 }
 
 async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
-  const { plan, step, planText, parentLogDir, targetRepos, dryRun, progress, signal } = args;
+  const { plan, step, planText, parentLogDir, targetRepos, cwd, dryRun, progress, signal } = args;
   const repoPaths = targetRepos.map((repo) => repo.path);
 
   const itemId = step ? step.id : plan.slug;
@@ -223,6 +230,7 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
     const rc = await streamSubprocess({
       cmd: implementCmd,
       logPath,
+      cwd,
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
       ...(signal !== undefined ? { signal } : {}),
       transformer: formatClaudeStreamLine,
@@ -263,6 +271,7 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
       prompt: reviewText0,
       outputPath: reviewMessagePath,
       logPath: path.join(logDir, '2-review.log'),
+      cwd,
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
       ...(signal !== undefined ? { signal } : {}),
     });
@@ -291,6 +300,7 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
     const rc = await streamSubprocess({
       cmd: fixCmd,
       logPath: path.join(logDir, '3-fix.log'),
+      cwd,
       ...(sinkArg !== undefined ? { sink: sinkArg } : {}),
       ...(signal !== undefined ? { signal } : {}),
       transformer: formatClaudeStreamLine,
@@ -347,6 +357,12 @@ export interface RunPlanOptions {
   plan: Plan;
   dryRun: boolean;
   targetRepos?: readonly ResolvedWorkspaceRepo[];
+  /**
+   * Working directory for claude/codex subprocesses. Defaults to the main
+   * repo root when omitted (dry-run paths). In real runs the watcher
+   * passes the plan's worktree root here.
+   */
+  cwd?: string;
   progress?: ProgressSink;
   signal?: AbortSignal;
   /**
@@ -383,6 +399,10 @@ function isRunnable(entry: StepEntry): boolean {
 export async function runPlan(opts: RunPlanOptions): Promise<void> {
   const { plan, dryRun, progress, signal, onStepUpdate } = opts;
   const targetRepos = opts.targetRepos ?? (await resolvePlanRepos(plan));
+  // Subprocess cwd: the worktree root passed by the watcher in real runs;
+  // falls back to the main repo for dry-run/test paths that don't allocate
+  // a worktree.
+  const cwd = opts.cwd ?? targetRepos[0]?.root ?? process.cwd();
   const planText = await fs.readFile(planFilePath(plan), 'utf8');
   const parentLogDir = planLogDir(plan);
   await fs.mkdir(parentLogDir, { recursive: true });
@@ -397,6 +417,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<void> {
         planText,
         parentLogDir,
         targetRepos,
+        cwd,
         dryRun,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),
@@ -441,6 +462,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<void> {
         planText: null,
         parentLogDir,
         targetRepos,
+        cwd,
         dryRun,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),

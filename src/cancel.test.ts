@@ -48,7 +48,7 @@ describe('cancelPlan', () => {
     expect(store.update).toHaveBeenCalledWith(
       plan.slug,
       { cancel_requested: true },
-      { allowPreparing: true, allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
     expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
   });
@@ -93,7 +93,7 @@ describe('cancelPlan', () => {
     expect(store.update).toHaveBeenLastCalledWith(
       plan.slug,
       { cancel_requested: true, cancel_intent: 'revert' },
-      { allowPreparing: true, allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
     expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
   });
@@ -116,7 +116,7 @@ describe('cancelPlan', () => {
     expect(store.update).toHaveBeenCalledWith(
       plan.slug,
       { cancel_requested: true, cancel_intent: 'keep' },
-      { allowPreparing: true, allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
     expect(outcome.kind === 'requested' && outcome.message).toMatch(/mark cancelling/);
   });
@@ -138,7 +138,7 @@ describe('cancelPlan', () => {
     expect(store.update).toHaveBeenCalledWith(
       plan.slug,
       { cancel_requested: true, cancel_intent: 'revert' },
-      { allowPreparing: true, allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
   });
 

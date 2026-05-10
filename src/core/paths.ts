@@ -18,6 +18,8 @@ export interface LaurenContext {
   laurenDir: string;
   logRoot: string;
   plansDir: string;
+  worktreesRoot: string;
+  configPath: string;
   plansStatePath: string;
   plansStateLockPath: string;
   vibeLockPath: string;
@@ -37,6 +39,8 @@ export function createLaurenContext(cwd: string = process.cwd()): LaurenContext 
     laurenDir,
     logRoot: path.join(laurenDir, 'logs'),
     plansDir: path.join(laurenDir, 'plans'),
+    worktreesRoot: path.join(laurenDir, 'worktrees'),
+    configPath: path.join(laurenDir, 'config.json'),
     plansStatePath: path.join(laurenDir, 'plans.json'),
     plansStateLockPath: path.join(laurenDir, 'plans.json.lock'),
     vibeLockPath: path.join(laurenDir, 'vibe.lock'),
@@ -55,8 +59,33 @@ export const REPO = DEFAULT_CONTEXT.repo;
 export const LAUREN_DIR = DEFAULT_CONTEXT.laurenDir;
 export const LOG_ROOT = DEFAULT_CONTEXT.logRoot;
 export const PLANS_DIR = DEFAULT_CONTEXT.plansDir;
+export const WORKTREES_ROOT = DEFAULT_CONTEXT.worktreesRoot;
+export const CONFIG_PATH = DEFAULT_CONTEXT.configPath;
 export const VIBE_LOCK_PATH = DEFAULT_CONTEXT.vibeLockPath;
 export const VIBE_PID_PATH = DEFAULT_CONTEXT.vibePidPath;
+
+/**
+ * Root directory under which all worktrees for a given plan live.
+ * For single-repo plans, the worktree is checked out directly at this path.
+ * For multi-repo plans, each sub-repo's worktree is `<root>/<repo-name>/`.
+ */
+export function worktreeRootPath(slug: string, context: LaurenContext = DEFAULT_CONTEXT): string {
+  return path.join(context.worktreesRoot, slug);
+}
+
+/**
+ * Path to a specific repo's worktree within a plan's worktree root.
+ * Pass `null` for `repoName` for the single-repo case (worktree IS the
+ * root). Pass the repo name for multi-repo (worktree is a child dir).
+ */
+export function worktreePath(
+  slug: string,
+  repoName: string | null,
+  context: LaurenContext = DEFAULT_CONTEXT,
+): string {
+  const root = worktreeRootPath(slug, context);
+  return repoName === null ? root : path.join(root, repoName);
+}
 
 export const DOCS_DIR = DEFAULT_CONTEXT.docsDir;
 export const PRD_PATH = DEFAULT_CONTEXT.prdPath;

@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
+import type { LaurenConfig } from './core/config.js';
 import { VIBE_LOCK_PATH } from './core/paths.js';
 import { materializeSteps, type StepEntry } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
@@ -20,9 +21,11 @@ import {
   resolveWorkspaceRepos,
 } from './core/workspace.js';
 import { RunFailure, runPlan } from './executor.js';
+import { finalizeMerge, mergePlanOnce, PR_POLL_INTERVAL_MS } from './merger.js';
 import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
 import { workingTreeDirty } from './proc/git.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
+import { cleanupPlanWorktrees, setupPlanWorktrees } from './worktree.js';
 
 export const IDLE_POLL_SECONDS = 3.0;
 
@@ -52,6 +55,12 @@ async function planFileExists(plan: Plan): Promise<boolean> {
 
 function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceRepo[] {
   return repos.filter((repo) => workingTreeDirty(repo.root));
+}
+
+function resetMergeHandles(handles: WatcherLoopHandles): void {
+  handles.current.slug = null;
+  handles.cancelController.ref = null;
+  handles.phase.value = 'idle';
 }
 
 export async function tryAcquireVibeLock(): Promise<(() => Promise<void>) | null> {
@@ -109,7 +118,7 @@ export async function markPlanFinal(
   }
 }
 
-export type DaemonPhase = 'idle' | 'organizing' | 'implementing';
+export type DaemonPhase = 'idle' | 'organizing' | 'implementing' | 'merging';
 
 /**
  * Handle a SIGUSR2 cancellation request: abort the in-flight subprocess
@@ -140,6 +149,8 @@ export async function handleCancelSignal(
   if (handles.phase.value === 'organizing') {
     handles.brainState.controller?.abort();
   } else if (handles.phase.value === 'implementing') {
+    handles.cancelController.ref?.abort();
+  } else if (handles.phase.value === 'merging') {
     handles.cancelController.ref?.abort();
   }
 }
@@ -214,9 +225,94 @@ async function drainEnqueued(
   }
 }
 
+async function drainMerging(
+  runtime: WatcherRuntime,
+  store: PlanStore,
+  config: LaurenConfig,
+  signal: AbortSignal,
+  handles: WatcherLoopHandles,
+): Promise<void> {
+  while (!signal.aborted) {
+    const plans = await store.read();
+    const merging = plans.find((p) => p.status === 'merging');
+    if (!merging) return;
+
+    handles.current.slug = merging.slug;
+    handles.phase.value = 'merging';
+
+    if (merging.cancel_requested) {
+      runtime.setMerging(plans, merging, config.merge_mode);
+      await cleanupPlanWorktrees(merging).catch(() => undefined);
+      await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+      resetMergeHandles(handles);
+      continue;
+    }
+
+    const cancelController = new AbortController();
+    handles.cancelController.ref = cancelController;
+    const merged = AbortSignal.any([signal, cancelController.signal]);
+
+    runtime.setMerging(plans, merging, config.merge_mode);
+
+    let result: Awaited<ReturnType<typeof mergePlanOnce>>;
+    try {
+      result = await mergePlanOnce({ plan: merging, store, config, signal: merged });
+    } catch (err) {
+      if (signal.aborted && !cancelController.signal.aborted) {
+        resetMergeHandles(handles);
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      await finalizeMerge(store, merging.slug, {
+        kind: 'failed',
+        failure: { phase: 'merge', step_id: null, message: msg },
+      });
+      resetMergeHandles(handles);
+      continue;
+    }
+
+    if (result.kind === 'done') {
+      await finalizeMerge(store, merging.slug, result);
+      resetMergeHandles(handles);
+      continue;
+    }
+
+    if (cancelController.signal.aborted && !signal.aborted) {
+      // User-initiated cancel of merging — clean up and mark cancelled.
+      await cleanupPlanWorktrees(merging).catch(() => undefined);
+      await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+      resetMergeHandles(handles);
+      continue;
+    }
+
+    if (result.kind === 'pending') {
+      await sleep(PR_POLL_INTERVAL_MS, merged);
+      if (cancelController.signal.aborted && !signal.aborted) {
+        // User-initiated cancel while waiting between PR polls.
+        await cleanupPlanWorktrees(merging).catch(() => undefined);
+        await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+        resetMergeHandles(handles);
+        continue;
+      }
+      resetMergeHandles(handles);
+      if (signal.aborted) return;
+      continue;
+    }
+
+    if (signal.aborted && !cancelController.signal.aborted) {
+      resetMergeHandles(handles);
+      return;
+    }
+
+    await finalizeMerge(store, merging.slug, result);
+    resetMergeHandles(handles);
+  }
+}
+
 export async function watcherLoop(
   runtime: WatcherRuntime,
   store: PlanStore,
+  config: LaurenConfig,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<{ inFlight: Plan | null; cancelledSlug: string | null }> {
@@ -224,6 +320,12 @@ export async function watcherLoop(
   let cancelledSlug: string | null = null;
   let requireCleanWorkspaceAfterCancelling = false;
   while (!signal.aborted) {
+    // Drain any in-flight merge before touching the rest of the queue.
+    // For github-pr mode this polls every PR_POLL_INTERVAL_MS until the PR
+    // resolves; the daemon does no other work in the meantime.
+    await drainMerging(runtime, store, config, signal, handles);
+    if (signal.aborted) break;
+
     const beforeDrain = await store.read();
 
     // A 'cancelling' row means the user cancelled an implementing plan with
@@ -321,6 +423,26 @@ export async function watcherLoop(
     // execution time — everything downstream trusts `claimed.steps`.
     const reconciledSteps = materializeSteps(planText, next.steps);
 
+    // Provision worktrees BEFORE flipping the row to `implementing` so that
+    // a crash between status-flip and worktree-create can't leave us with
+    // an implementing row pointing at non-existent worktrees. The worktree
+    // setup is idempotent (cleans up stale state from prior failed runs).
+    let execCtx: Awaited<ReturnType<typeof setupPlanWorktrees>>;
+    try {
+      execCtx = await setupPlanWorktrees(next, config);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await markPlanFinal(store, next.slug, {
+        status: 'failed',
+        failure: {
+          phase: 'implement',
+          step_id: null,
+          message: `failed to create worktree(s): ${msg}`,
+        },
+      });
+      continue;
+    }
+
     let claimed: Plan;
     try {
       // Require the row to still be `ready` at lock time. Without this CAS,
@@ -335,6 +457,7 @@ export async function watcherLoop(
           finished_at: null,
           failure: null,
           steps: reconciledSteps,
+          worktrees: execCtx.worktrees,
         },
         {
           precondition: (p) => p.status === 'ready',
@@ -342,6 +465,8 @@ export async function watcherLoop(
         },
       );
     } catch (err) {
+      // Roll back worktree allocation if the claim failed.
+      await cleanupPlanWorktrees({ ...next, worktrees: execCtx.worktrees }).catch(() => undefined);
       if (
         err instanceof ImplementingLocked ||
         err instanceof PlanNotFound ||
@@ -380,6 +505,8 @@ export async function watcherLoop(
       await runPlan({
         plan: claimed,
         dryRun: false,
+        targetRepos: execCtx.rewrittenRepos,
+        cwd: execCtx.rootCwd,
         progress: runtime,
         signal: merged,
         onStepUpdate,
@@ -390,10 +517,10 @@ export async function watcherLoop(
       handles.phase.value = 'idle';
       if (cancelController.signal.aborted && !signal.aborted) {
         // Per-plan cancellation. Branch by intent:
-        //   'keep' — leave the working tree untouched, demote to 'cancelling',
+        //   'keep' — leave the worktree intact, demote to 'cancelling',
         //            and let the outer loop pause on the cancelling row.
         //   'revert' (default) — return to the caller so vibe-command can
-        //            revert + mark 'cancelled' and exit.
+        //            tear down the worktree + mark 'cancelled' and exit.
         const cancelledPlan = await store.find(claimed.slug);
         const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
         if (cancelIntent === 'keep') {
@@ -422,10 +549,23 @@ export async function watcherLoop(
     handles.cancelController.ref = null;
     handles.phase.value = 'idle';
 
-    // Clear inFlight before marking done so an abort in the window below
-    // cannot demote a finished plan back to pending.
+    // Clear inFlight before marking the row so an abort in the window below
+    // cannot demote a finished plan back to pending. Transition to
+    // `merging` — the outer loop will pick it up at the top. `finished_at`
+    // is left null until the plan reaches its true terminal status (done /
+    // failed / cancelled).
     inFlight = null;
-    await markPlanFinal(store, claimed.slug, { status: 'done' });
+    try {
+      await store.update(
+        claimed.slug,
+        { status: 'merging', finished_at: null },
+        { allowImplementing: true },
+      );
+    } catch (err) {
+      if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+        throw err;
+      }
+    }
   }
 
   return { inFlight, cancelledSlug };

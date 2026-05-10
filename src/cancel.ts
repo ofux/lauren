@@ -21,18 +21,19 @@ export type CancelOutcome =
 async function requestDaemonCancellation(
   store: PlanStore,
   slug: string,
-  phase: 'preparing' | 'implementing',
+  phase: 'preparing' | 'implementing' | 'merging',
   intent?: CancelIntent,
 ): Promise<CancelOutcome> {
   try {
     await store.update(
       slug,
-      // Only stamp cancel_intent for implementing plans; the brain path
-      // doesn't need it (there's no working tree state to preserve).
+      // Only stamp cancel_intent for implementing plans; the brain and
+      // merge paths don't need it (there's no working tree state in the
+      // user's main checkout to preserve — the worktree is independent).
       phase === 'implementing'
         ? { cancel_requested: true, cancel_intent: intent ?? 'revert' }
         : { cancel_requested: true },
-      { allowPreparing: true, allowImplementing: true },
+      { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
   } catch (err) {
     if (err instanceof PlanNotFound) {
@@ -44,10 +45,12 @@ async function requestDaemonCancellation(
   let what: string;
   if (phase === 'preparing') {
     what = 'preparing; vibe signalled to abort brain';
+  } else if (phase === 'merging') {
+    what = 'merging; vibe signalled to stop and clean up';
   } else if (intent === 'keep') {
     what = 'implementing; vibe signalled to abort and mark cancelling';
   } else {
-    what = 'implementing; vibe signalled to abort and revert';
+    what = 'implementing; vibe signalled to abort and clean up worktree';
   }
   return {
     kind: 'requested',
@@ -65,10 +68,12 @@ async function requestDaemonCancellation(
  *                  vibe's brain phase aborts and removes the row
  *   ready        → set status='cancelled' directly
  *   implementing → set cancel_requested=true (+ cancel_intent), signal vibe;
- *                  vibe aborts the subprocess and either reverts the working
- *                  tree + marks 'cancelled' (intent='revert', the default)
- *                  or leaves the tree dirty + marks 'cancelling' and pauses
- *                  (intent='keep')
+ *                  vibe aborts the subprocess and either tears down the
+ *                  worktree + marks 'cancelled' (intent='revert', the default)
+ *                  or leaves the worktree intact + marks 'cancelling' and
+ *                  pauses (intent='keep')
+ *   merging      → set cancel_requested=true, signal vibe; vibe stops the
+ *                  merge/poll, cleans up the worktree, marks 'cancelled'
  *   else (failed/done/cancelled/cancelling) → no-op
  */
 export async function cancelPlan(args: {
@@ -125,6 +130,10 @@ export async function cancelPlan(args: {
     return requestDaemonCancellation(store, slug, 'implementing', intent);
   }
 
+  if (plan.status === 'merging') {
+    return requestDaemonCancellation(store, slug, 'merging');
+  }
+
   return { kind: 'noop', message: `'${slug}' is ${plan.status}; nothing to cancel.` };
 }
 
@@ -133,6 +142,7 @@ export function isCancellable(plan: Plan): boolean {
     plan.status === 'enqueued' ||
     plan.status === 'preparing' ||
     plan.status === 'ready' ||
-    plan.status === 'implementing'
+    plan.status === 'implementing' ||
+    plan.status === 'merging'
   );
 }

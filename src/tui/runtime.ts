@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 
+import type { MergeMode } from '../core/config.js';
 import { monotonicSeconds } from '../core/time.js';
 import type { Plan } from '../core/types.js';
 import {
@@ -13,7 +14,7 @@ import { stripAnsi } from '../util/ansi.js';
 
 export const LOG_TAIL_LINES = 8;
 
-export type RuntimeIdleState = 'idle' | 'paused' | 'running' | 'organizing';
+export type RuntimeIdleState = 'idle' | 'paused' | 'running' | 'organizing' | 'merging';
 export type ItemDisplayStatus = 'pending' | 'running' | 'done' | 'failed';
 export type PhaseDisplayStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed';
 
@@ -86,6 +87,8 @@ export class WatcherRuntime implements ProgressSink {
   currentPlan: Plan | null = null;
   organizingPlan: Plan | null = null;
   organizingNote: string | null = null;
+  mergingPlan: Plan | null = null;
+  mergingMode: MergeMode | null = null;
   planProgress: PlanRuntimeState | null = null;
   idleState: RuntimeIdleState = 'idle';
   idleMessage = 'starting…';
@@ -116,6 +119,8 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = plan;
     this.organizingPlan = null;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = progress;
     this.idleState = 'running';
     this.pausedSlug = null;
@@ -127,6 +132,8 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.organizingPlan = null;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = null;
     this.idleState = 'idle';
     this.pausedSlug = null;
@@ -140,8 +147,23 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.organizingPlan = inboxPlan;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = null;
     this.idleState = 'organizing';
+    this.pausedSlug = null;
+    this.notify();
+  }
+
+  setMerging(plans: Plan[], mergingPlan: Plan, mode: MergeMode): void {
+    this.plans = plans;
+    this.currentPlan = null;
+    this.organizingPlan = null;
+    this.organizingNote = null;
+    this.mergingPlan = mergingPlan;
+    this.mergingMode = mode;
+    this.planProgress = null;
+    this.idleState = 'merging';
     this.pausedSlug = null;
     this.notify();
   }
@@ -157,6 +179,8 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.organizingPlan = null;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = failedPlan.slug;
@@ -188,6 +212,8 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.organizingPlan = null;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = plan.slug;
@@ -207,6 +233,8 @@ export class WatcherRuntime implements ProgressSink {
     this.currentPlan = null;
     this.organizingPlan = null;
     this.organizingNote = null;
+    this.mergingPlan = null;
+    this.mergingMode = null;
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = '__dirty_workspace__';

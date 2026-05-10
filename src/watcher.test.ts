@@ -1,10 +1,12 @@
 import { promises as fs } from 'node:fs';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
+import { DEFAULT_CONFIG, type LaurenConfig } from './core/config.js';
 import type { PlanStore } from './core/store.js';
 import type { Plan } from './core/types.js';
 import { resolveWorkspaceRepos } from './core/workspace.js';
 import { runPlan } from './executor.js';
+import { finalizeMerge, mergePlanOnce } from './merger.js';
 import { processEnqueuedPlan } from './organize.js';
 import { workingTreeDirty } from './proc/git.js';
 import { WatcherRuntime } from './tui/runtime.js';
@@ -14,6 +16,9 @@ import {
   type WatcherLoopHandles,
   watcherLoop,
 } from './watcher.js';
+import { cleanupPlanWorktrees, setupPlanWorktrees } from './worktree.js';
+
+const TEST_CONFIG: LaurenConfig = { ...DEFAULT_CONFIG };
 
 vi.mock('./executor.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./executor.js')>();
@@ -47,11 +52,45 @@ vi.mock('./proc/git.js', async (importOriginal) => {
   };
 });
 
+vi.mock('./merger.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./merger.js')>();
+  return {
+    ...actual,
+    mergePlanOnce: vi.fn(),
+    finalizeMerge: vi.fn(),
+  };
+});
+
+vi.mock('./worktree.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./worktree.js')>();
+  return {
+    ...actual,
+    setupPlanWorktrees: vi.fn(async (plan: Plan) => ({
+      rootCwd: `/tmp/worktree/${plan.slug}`,
+      rewrittenRepos: [],
+      worktrees: [],
+    })),
+    cleanupPlanWorktrees: vi.fn(async () => undefined),
+  };
+});
+
 afterEach(() => {
   vi.mocked(runPlan).mockReset();
   vi.mocked(processEnqueuedPlan).mockReset();
   vi.mocked(resolveWorkspaceRepos).mockReset();
   vi.mocked(workingTreeDirty).mockReset();
+  vi.mocked(setupPlanWorktrees).mockReset();
+  vi.mocked(cleanupPlanWorktrees).mockReset();
+  vi.mocked(mergePlanOnce).mockReset();
+  vi.mocked(finalizeMerge).mockReset();
+  vi.mocked(setupPlanWorktrees).mockImplementation(async (plan: Plan) => ({
+    rootCwd: `/tmp/worktree/${plan.slug}`,
+    rewrittenRepos: [],
+    worktrees: [],
+  }));
+  vi.mocked(cleanupPlanWorktrees).mockResolvedValue(undefined);
+  vi.mocked(mergePlanOnce).mockResolvedValue({ kind: 'done' });
+  vi.mocked(finalizeMerge).mockResolvedValue(undefined);
 });
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
@@ -192,7 +231,7 @@ describe('watcherLoop pause-on-cancelling', () => {
     } as unknown as PlanStore;
 
     const handles = makeHandles();
-    const result = await watcherLoop(runtime, store, controller.signal, handles);
+    const result = await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, handles);
 
     expect(setPausedCancelling).toHaveBeenCalledWith([cancellingPlan, readyPlan], cancellingPlan);
     // No mutation of the ready row (would happen if the loop tried to claim).
@@ -230,7 +269,7 @@ describe('watcherLoop pause-on-cancelling', () => {
       update: vi.fn(),
     } as unknown as PlanStore;
 
-    const result = await watcherLoop(runtime, store, controller.signal, makeHandles());
+    const result = await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, makeHandles());
 
     expect(setPausedCancelling).toHaveBeenCalledWith(
       [cancellingPlan, enqueuedPlan],
@@ -278,16 +317,24 @@ describe('watcherLoop pause-on-cancelling', () => {
         controller.abort();
       });
 
-      const reads = [
-        [cancellingPlan, enqueuedPlan],
-        [cancelledPlan, enqueuedPlan],
-      ];
+      let cancellingActive = true;
+      setPausedCancelling.mockImplementation(() => {
+        cancellingActive = false;
+      });
       const store = {
-        read: vi.fn(async () => reads.shift() ?? [cancelledPlan, enqueuedPlan]),
+        read: vi.fn(async () =>
+          cancellingActive ? [cancellingPlan, enqueuedPlan] : [cancelledPlan, enqueuedPlan],
+        ),
         update: vi.fn(),
       } as unknown as PlanStore;
 
-      const resultPromise = watcherLoop(runtime, store, controller.signal, makeHandles());
+      const resultPromise = watcherLoop(
+        runtime,
+        store,
+        TEST_CONFIG,
+        controller.signal,
+        makeHandles(),
+      );
 
       await vi.waitFor(() => {
         expect(setPausedCancelling).toHaveBeenCalledWith(
@@ -354,7 +401,7 @@ describe('watcherLoop implementing cancellation', () => {
         throw new Error('aborted');
       });
 
-      const result = await watcherLoop(runtime, store, controller.signal, handles);
+      const result = await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, handles);
 
       expect(result.inFlight).toBeNull();
       expect(result.cancelledSlug).toBeNull();
@@ -366,5 +413,145 @@ describe('watcherLoop implementing cancellation', () => {
     } finally {
       await fs.unlink(path).catch(() => undefined);
     }
+  });
+});
+
+describe('watcherLoop merging cancellation', () => {
+  test('honors a persisted merge cancel request before polling or merging', async () => {
+    const mergingPlan = makePlan({
+      status: 'merging',
+      cancel_requested: true,
+      worktrees: [{ repo: null, path: '/wt/root', branch: 'lauren/demo', parentRoot: '/repo' }],
+    });
+    const runtime = new WatcherRuntime();
+    const controller = new AbortController();
+    vi.mocked(finalizeMerge).mockImplementation(async () => {
+      controller.abort();
+    });
+
+    const store = {
+      read: vi.fn(async () => [mergingPlan]),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, makeHandles());
+
+    expect(cleanupPlanWorktrees).toHaveBeenCalledWith(mergingPlan);
+    expect(finalizeMerge).toHaveBeenCalledWith(store, 'demo', { kind: 'cancelled' });
+    expect(mergePlanOnce).not.toHaveBeenCalled();
+  });
+
+  test('keeps merge cancellation active while waiting between PR polls', async () => {
+    vi.useFakeTimers();
+
+    try {
+      let mergingPlan = makePlan({
+        status: 'merging',
+        cancel_requested: false,
+        worktrees: [{ repo: null, path: '/wt/root', branch: 'lauren/demo', parentRoot: '/repo' }],
+      });
+      const controller = new AbortController();
+      const handles = makeHandles();
+      vi.mocked(mergePlanOnce).mockResolvedValue({ kind: 'pending' });
+      vi.mocked(finalizeMerge).mockImplementation(async () => {
+        controller.abort();
+      });
+
+      const store = {
+        read: vi.fn(async () => [mergingPlan]),
+        find: vi.fn(async () => mergingPlan),
+        update: vi.fn(),
+      } as unknown as PlanStore;
+
+      const loop = watcherLoop(
+        new WatcherRuntime(),
+        store,
+        TEST_CONFIG,
+        controller.signal,
+        handles,
+      );
+      await vi.waitFor(() => {
+        expect(mergePlanOnce).toHaveBeenCalledWith(
+          expect.objectContaining({ plan: mergingPlan, signal: expect.any(AbortSignal) }),
+        );
+        expect(handles.current.slug).toBe('demo');
+        expect(handles.phase.value).toBe('merging');
+        expect(handles.cancelController.ref).not.toBeNull();
+      });
+
+      mergingPlan = { ...mergingPlan, cancel_requested: true };
+      await handleCancelSignal(store, handles);
+
+      await vi.waitFor(() => {
+        expect(cleanupPlanWorktrees).toHaveBeenCalledWith(
+          expect.objectContaining({ slug: 'demo' }),
+        );
+        expect(finalizeMerge).toHaveBeenCalledWith(store, 'demo', { kind: 'cancelled' });
+      });
+      await loop;
+
+      expect(handles.current.slug).toBeNull();
+      expect(handles.cancelController.ref).toBeNull();
+      expect(handles.phase.value).toBe('idle');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('finalizes done when a user cancel arrives after merge completion', async () => {
+    const mergingPlan = makePlan({
+      status: 'merging',
+      cancel_requested: false,
+      worktrees: [{ repo: null, path: '/wt/root', branch: 'lauren/demo', parentRoot: '/repo' }],
+    });
+    const controller = new AbortController();
+    const handles = makeHandles();
+    vi.mocked(mergePlanOnce).mockImplementation(async () => {
+      handles.cancelController.ref?.abort();
+      return { kind: 'done' };
+    });
+    vi.mocked(finalizeMerge).mockImplementation(async () => {
+      controller.abort();
+    });
+
+    const store = {
+      read: vi.fn(async () => [mergingPlan]),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, handles);
+
+    expect(finalizeMerge).toHaveBeenCalledWith(store, 'demo', { kind: 'done' });
+    expect(cleanupPlanWorktrees).not.toHaveBeenCalled();
+    expect(handles.current.slug).toBeNull();
+    expect(handles.cancelController.ref).toBeNull();
+    expect(handles.phase.value).toBe('idle');
+  });
+
+  test('does not finalize cancelled when only the daemon shutdown signal aborted the merge', async () => {
+    const mergingPlan = makePlan({
+      status: 'merging',
+      cancel_requested: false,
+      worktrees: [{ repo: null, path: '/wt/root', branch: 'lauren/demo', parentRoot: '/repo' }],
+    });
+    const controller = new AbortController();
+    vi.mocked(mergePlanOnce).mockImplementation(async () => {
+      controller.abort();
+      return { kind: 'cancelled' };
+    });
+
+    const store = {
+      read: vi.fn(async () => [mergingPlan]),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    const handles = makeHandles();
+    await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, handles);
+
+    expect(finalizeMerge).not.toHaveBeenCalled();
+    expect(cleanupPlanWorktrees).not.toHaveBeenCalled();
+    expect(handles.current.slug).toBeNull();
+    expect(handles.cancelController.ref).toBeNull();
+    expect(handles.phase.value).toBe('idle');
   });
 });

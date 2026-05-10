@@ -5,7 +5,9 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
   gitAddAll,
+  gitBranchHasDiff,
   gitCommit,
+  hasUnresolvedMergeConflicts,
   revertWorkingTree,
   slugHasLaurenHistory,
   workingTreeDirty,
@@ -65,6 +67,43 @@ describe('git worktree helpers', () => {
     expect(git(repoDir, 'diff', '--cached', '--name-only').split('\n').filter(Boolean)).toEqual([
       'feature.txt',
     ]);
+  });
+
+  test('gitBranchHasDiff ignores lauren artifacts when comparing with base branch', async () => {
+    git(repoDir, 'checkout', '-q', '-b', 'lauren/demo');
+    await fs.mkdir(path.join(repoDir, '.lauren'), { recursive: true });
+    await fs.writeFile(path.join(repoDir, '.lauren', 'plans.json'), '{}\n', 'utf8');
+    git(repoDir, 'add', '.lauren/plans.json');
+    git(repoDir, 'commit', '-m', 'lauren artifact');
+
+    expect(gitBranchHasDiff({ cwd: repoDir, base: 'main' })).toBe(false);
+
+    await fs.writeFile(path.join(repoDir, 'feature.txt'), 'feature\n', 'utf8');
+    gitAddAll(repoDir);
+    git(repoDir, 'commit', '-m', 'feature');
+
+    expect(gitBranchHasDiff({ cwd: repoDir, base: 'main' })).toBe(true);
+  });
+
+  test('hasUnresolvedMergeConflicts ignores staged conflict resolutions', async () => {
+    git(repoDir, 'checkout', '-q', '-b', 'feature');
+    await fs.writeFile(path.join(repoDir, 'tracked.txt'), 'feature\n', 'utf8');
+    git(repoDir, 'add', 'tracked.txt');
+    git(repoDir, 'commit', '-m', 'feature edit');
+
+    git(repoDir, 'checkout', '-q', 'main');
+    await fs.writeFile(path.join(repoDir, 'tracked.txt'), 'main\n', 'utf8');
+    git(repoDir, 'add', 'tracked.txt');
+    git(repoDir, 'commit', '-m', 'main edit');
+
+    expect(() => git(repoDir, 'merge', 'feature')).toThrow();
+    expect(hasUnresolvedMergeConflicts(repoDir)).toBe(true);
+
+    await fs.writeFile(path.join(repoDir, 'tracked.txt'), 'resolved\n', 'utf8');
+    gitAddAll(repoDir);
+
+    expect(workingTreeDirty(repoDir)).toBe(true);
+    expect(hasUnresolvedMergeConflicts(repoDir)).toBe(false);
   });
 
   test('revertWorkingTree discards non-lauren changes without treating -- as a pathspec', async () => {

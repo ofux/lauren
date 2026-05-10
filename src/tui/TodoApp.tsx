@@ -41,6 +41,8 @@ function statusColor(status: PlanStatus): string | undefined {
       return 'red';
     case 'implementing':
       return 'cyan';
+    case 'merging':
+      return 'blue';
     case 'preparing':
       return 'magenta';
     case 'enqueued':

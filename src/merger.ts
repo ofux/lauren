@@ -1,0 +1,419 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+
+import type { LaurenConfig } from './core/config.js';
+import { displayPath } from './core/paths.js';
+import type { PlanStore } from './core/store.js';
+import { nowIso } from './core/time.js';
+import {
+  ImplementingLocked,
+  type Plan,
+  type PlanFailure,
+  PlanNotFound,
+  type PlanWorktree,
+  planFilePath,
+  planLogDir,
+} from './core/types.js';
+import { ghPrCreate, ghPrView } from './proc/gh.js';
+import {
+  getCurrentBranch,
+  gitAddAll,
+  gitBranchHasDiff,
+  gitCheckout,
+  gitFastForward,
+  gitFetchBranch,
+  gitMerge,
+  gitMergeAbort,
+  gitMergeContinue,
+  gitPush,
+  hasUnresolvedMergeConflicts,
+} from './proc/git.js';
+import { streamSubprocess } from './proc/stream.js';
+import { formatClaudeStreamLine } from './util/streamJson.js';
+import { cleanupPlanWorktrees } from './worktree.js';
+
+export type MergeResult =
+  | { kind: 'done' }
+  | { kind: 'cancelled' }
+  | { kind: 'failed'; failure: PlanFailure }
+  | { kind: 'pending' };
+
+export const PR_POLL_INTERVAL_MS = 30_000;
+
+function planTitleSubject(plan: Plan): string {
+  return `${plan.slug}: ${plan.title}`;
+}
+
+function buildPrBody(plan: Plan, planMarkdown: string): string {
+  return `Plan: \`${plan.slug}\`\n\n${planMarkdown}`;
+}
+
+function failure(message: string): PlanFailure {
+  return { phase: 'merge', step_id: null, message };
+}
+
+async function readPlanMarkdown(plan: Plan): Promise<string> {
+  try {
+    return await fs.readFile(planFilePath(plan), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Spawn `claude -p` inside the parent repo whose merge conflicted and ask
+ * it to resolve the conflicts. The caller commits the result with
+ * `git commit --no-edit`.
+ */
+async function runConflictResolver(args: {
+  plan: Plan;
+  parentRoot: string;
+  branch: string;
+  baseBranch: string;
+  logPath: string;
+  signal?: AbortSignal;
+}): Promise<number> {
+  const prompt =
+    `You are resolving a git merge conflict in ${args.parentRoot}.\n` +
+    `The merge of branch \`${args.branch}\` into \`${args.baseBranch}\` ` +
+    `produced conflicts.\n\n` +
+    `Run \`git status\` to list conflicting files, open each one, ` +
+    `pick the correct resolution (combining both sides as needed), and ` +
+    `\`git add\` the resolved files. Do NOT run \`git commit\` — the ` +
+    `orchestrator will commit once you finish.\n\n` +
+    `Stay strictly within conflict resolution. Do not modify unrelated files.`;
+  return streamSubprocess({
+    cmd: ['claude', '-p', '--output-format', 'stream-json', '--verbose', prompt],
+    logPath: args.logPath,
+    cwd: args.parentRoot,
+    ...(args.signal !== undefined ? { signal: args.signal } : {}),
+    transformer: formatClaudeStreamLine,
+  });
+}
+
+/**
+ * Auto-merge each worktree's branch into the configured dev_branch in its
+ * parent repo. On clean merge: cleanup worktrees + branches, return done.
+ * On conflict: launch claude to resolve, then commit. Any unrecoverable
+ * error returns `failed` with a message describing what to fix manually.
+ */
+async function autoMerge(args: {
+  plan: Plan;
+  config: LaurenConfig;
+  signal?: AbortSignal;
+}): Promise<MergeResult> {
+  const { plan, config, signal } = args;
+  const worktrees = plan.worktrees ?? [];
+  if (worktrees.length === 0) {
+    return { kind: 'failed', failure: failure('no worktrees recorded on plan row') };
+  }
+
+  for (const wt of worktrees) {
+    if (signal?.aborted) return { kind: 'cancelled' };
+
+    // Parent checkout must be on dev_branch for the merge to land where the
+    // user expects. The vibe-startup guard validates this, but a long-running
+    // daemon can drift if the user switches branches manually.
+    const currentBranch = getCurrentBranch(wt.parentRoot);
+    if (currentBranch !== config.dev_branch) {
+      try {
+        gitCheckout(config.dev_branch, wt.parentRoot);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          kind: 'failed',
+          failure: failure(
+            `cannot switch ${displayPath(wt.parentRoot)} to '${config.dev_branch}' (currently '${currentBranch}'): ${msg}`,
+          ),
+        };
+      }
+    }
+
+    const merge = gitMerge(wt.branch, wt.parentRoot);
+    if (merge.code === 0) continue;
+
+    if (!merge.hasConflicts) {
+      return {
+        kind: 'failed',
+        failure: failure(
+          `git merge ${wt.branch} into ${config.dev_branch} failed in ${displayPath(
+            wt.parentRoot,
+          )} (exit ${merge.code}): ${merge.stderr.trim().slice(0, 400)}`,
+        ),
+      };
+    }
+
+    // Conflict path: ask claude to resolve, then commit.
+    const conflictLogDir = planLogDir(plan);
+    await fs.mkdir(conflictLogDir, { recursive: true });
+    const logPath = path.join(conflictLogDir, `merge-${wt.repo ?? 'root'}.log`);
+    const claudeCode = await runConflictResolver({
+      plan,
+      parentRoot: wt.parentRoot,
+      branch: wt.branch,
+      baseBranch: config.dev_branch,
+      logPath,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+    if (claudeCode !== 0) {
+      gitMergeAbort(wt.parentRoot);
+      return {
+        kind: 'failed',
+        failure: failure(
+          `claude conflict resolver exited ${claudeCode} in ${displayPath(
+            wt.parentRoot,
+          )}; ran \`git merge --abort\`. See ${displayPath(logPath)}.`,
+        ),
+      };
+    }
+    // Stage any leftover unstaged files (claude usually `git add`s, but be
+    // defensive) and commit. Staged merge resolutions are expected here; only
+    // unresolved conflict entries should block the commit.
+    gitAddAll(wt.parentRoot);
+    if (hasUnresolvedMergeConflicts(wt.parentRoot)) {
+      gitMergeAbort(wt.parentRoot);
+      return {
+        kind: 'failed',
+        failure: failure(
+          `claude finished but ${displayPath(wt.parentRoot)} still has unresolved changes; ` +
+            `ran \`git merge --abort\`. See ${displayPath(logPath)}.`,
+        ),
+      };
+    }
+    const commit = gitMergeContinue(wt.parentRoot);
+    if (commit.code !== 0) {
+      gitMergeAbort(wt.parentRoot);
+      return {
+        kind: 'failed',
+        failure: failure(
+          `failed to commit conflict resolution in ${displayPath(
+            wt.parentRoot,
+          )} (exit ${commit.code}): ${commit.stderr.trim().slice(0, 400)}`,
+        ),
+      };
+    }
+  }
+
+  await cleanupPlanWorktrees(plan);
+  return { kind: 'done' };
+}
+
+function urlKey(wt: PlanWorktree): string {
+  return wt.repo ?? '.';
+}
+
+/**
+ * Open a PR for each worktree (idempotent — skips repos that already have
+ * a recorded `pr_urls[repo]`) and persist the URLs on the plan row. On
+ * the first call this also pushes the branch.
+ */
+async function ensurePrsOpen(args: {
+  plan: Plan;
+  store: PlanStore;
+  config: LaurenConfig;
+}): Promise<{ updated: Plan } | { failure: PlanFailure }> {
+  const { plan, store, config } = args;
+  const worktrees = plan.worktrees ?? [];
+  if (worktrees.length === 0) {
+    return { failure: failure('no worktrees recorded on plan row') };
+  }
+
+  const prUrls: Record<string, string> = { ...(plan.pr_urls ?? {}) };
+  let updatedPlan = plan;
+  const planMarkdown = await readPlanMarkdown(plan);
+  const title = planTitleSubject(plan);
+  const body = buildPrBody(plan, planMarkdown);
+
+  for (const wt of worktrees) {
+    const key = urlKey(wt);
+    if (prUrls[key]) continue;
+    if (!gitBranchHasDiff({ cwd: wt.path, base: config.dev_branch })) continue;
+
+    const push = gitPush({ cwd: wt.path, branch: wt.branch, setUpstream: true });
+    if (push.code !== 0 && !/up-to-date|already exists/i.test(push.stderr)) {
+      return {
+        failure: failure(
+          `git push -u origin ${wt.branch} failed in ${displayPath(wt.path)} (exit ${push.code}): ` +
+            push.stderr.trim().slice(0, 400),
+        ),
+      };
+    }
+    let url: string;
+    try {
+      url = ghPrCreate({
+        cwd: wt.path,
+        base: config.dev_branch,
+        head: wt.branch,
+        title,
+        body,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { failure: failure(`gh pr create failed for ${wt.branch}: ${msg}`) };
+    }
+    prUrls[key] = url;
+    try {
+      updatedPlan = await store.update(
+        plan.slug,
+        { pr_urls: { ...prUrls } },
+        { allowMerging: true },
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { failure: failure(`failed to persist PR URL for ${wt.branch}: ${msg}`) };
+    }
+  }
+
+  return { updated: updatedPlan };
+}
+
+/**
+ * Inspect each PR's current state. Returns the aggregate result:
+ *   - all merged → done
+ *   - any closed without merge → cancelled (cleanup branches/worktrees)
+ *   - else → pending
+ */
+function checkPrs(
+  plan: Plan,
+  config: LaurenConfig,
+): { kind: 'done' } | { kind: 'cancelled' } | { kind: 'pending' } {
+  const worktrees = plan.worktrees ?? [];
+  const urls = plan.pr_urls ?? {};
+  let allMerged = true;
+  for (const wt of worktrees) {
+    const url = urls[urlKey(wt)];
+    if (!url) {
+      if (!gitBranchHasDiff({ cwd: wt.path, base: config.dev_branch })) continue;
+      allMerged = false;
+      continue;
+    }
+    const status = ghPrView(url, wt.path);
+    if (status.state === 'CLOSED' && !status.merged) {
+      return { kind: 'cancelled' };
+    }
+    if (!status.merged) allMerged = false;
+  }
+  return allMerged ? { kind: 'done' } : { kind: 'pending' };
+}
+
+function uniqueParentWorktrees(worktrees: readonly PlanWorktree[]): PlanWorktree[] {
+  const seen = new Set<string>();
+  const unique: PlanWorktree[] = [];
+  for (const wt of worktrees) {
+    if (seen.has(wt.parentRoot)) continue;
+    seen.add(wt.parentRoot);
+    unique.push(wt);
+  }
+  return unique;
+}
+
+function fastForwardPrMergeTargets(plan: Plan, config: LaurenConfig): PlanFailure | null {
+  const worktrees = plan.worktrees ?? [];
+  for (const wt of uniqueParentWorktrees(worktrees)) {
+    const fetch = gitFetchBranch({ cwd: wt.parentRoot, branch: config.dev_branch });
+    if (fetch.code !== 0) {
+      return failure(
+        `git fetch origin ${config.dev_branch} failed in ${displayPath(wt.parentRoot)} ` +
+          `(exit ${fetch.code}): ${fetch.stderr.trim().slice(0, 400)}`,
+      );
+    }
+
+    const currentBranch = getCurrentBranch(wt.parentRoot);
+    if (currentBranch !== config.dev_branch) {
+      try {
+        gitCheckout(config.dev_branch, wt.parentRoot);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return failure(
+          `cannot switch ${displayPath(wt.parentRoot)} to '${config.dev_branch}' ` +
+            `(currently '${currentBranch}') before fast-forwarding merged PR: ${msg}`,
+        );
+      }
+    }
+
+    const ff = gitFastForward('FETCH_HEAD', wt.parentRoot);
+    if (ff.code !== 0) {
+      return failure(
+        `git merge --ff-only FETCH_HEAD failed in ${displayPath(wt.parentRoot)} ` +
+          `(exit ${ff.code}): ${ff.stderr.trim().slice(0, 400)}`,
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * Single attempt at draining a `merging` row. Caller polls every
+ * {@link PR_POLL_INTERVAL_MS} ms for github-pr mode; auto-merge is always
+ * terminal in one call.
+ */
+export async function mergePlanOnce(args: {
+  plan: Plan;
+  store: PlanStore;
+  config: LaurenConfig;
+  signal?: AbortSignal;
+}): Promise<MergeResult> {
+  const { plan, store, config, signal } = args;
+  if (signal?.aborted) return { kind: 'cancelled' };
+
+  if (config.merge_mode === 'auto') {
+    return autoMerge({ plan, config, ...(signal !== undefined ? { signal } : {}) });
+  }
+
+  // github-pr mode
+  const opened = await ensurePrsOpen({ plan, store, config });
+  if ('failure' in opened) return { kind: 'failed', failure: opened.failure };
+
+  let result: { kind: 'done' } | { kind: 'cancelled' } | { kind: 'pending' };
+  try {
+    result = checkPrs(opened.updated, config);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'failed', failure: failure(`gh pr view failed: ${msg}`) };
+  }
+  if (result.kind === 'done') {
+    const ffFailure = fastForwardPrMergeTargets(opened.updated, config);
+    if (ffFailure !== null) return { kind: 'failed', failure: ffFailure };
+    await cleanupPlanWorktrees(opened.updated);
+    return { kind: 'done' };
+  }
+  if (result.kind === 'cancelled') {
+    // PR was closed without merging — surface as cancelled and clean up.
+    await cleanupPlanWorktrees(opened.updated);
+    return { kind: 'cancelled' };
+  }
+  return { kind: 'pending' };
+}
+
+/**
+ * Apply a terminal merge result to the store, swallowing locking races
+ * that can occur if the daemon is shutting down concurrently.
+ */
+export async function finalizeMerge(
+  store: PlanStore,
+  slug: string,
+  result: Exclude<MergeResult, { kind: 'pending' }>,
+): Promise<void> {
+  const fields: Partial<Plan> =
+    result.kind === 'done'
+      ? { status: 'done', finished_at: nowIso(), pr_urls: undefined, worktrees: undefined }
+      : result.kind === 'cancelled'
+        ? {
+            status: 'cancelled',
+            finished_at: nowIso(),
+            cancel_requested: false,
+            cancel_intent: undefined,
+            pr_urls: undefined,
+            worktrees: undefined,
+          }
+        : {
+            status: 'failed',
+            failure: result.failure,
+            finished_at: nowIso(),
+          };
+  try {
+    await store.update(slug, fields, { allowMerging: true, allowImplementing: true });
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) throw err;
+  }
+}

@@ -27,6 +27,13 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         <Text> </Text>
       </>
     );
+  else if (plan.status === 'merging')
+    icon = (
+      <>
+        <Spinner />
+        <Text> </Text>
+      </>
+    );
   else if (plan.status === 'failed')
     icon = (
       <Text color="red" bold>
@@ -43,7 +50,7 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
   else icon = <Text dimColor>· </Text>;
 
   const titleProps: { bold?: boolean; color?: string; dimColor?: boolean } = {};
-  if (plan.status === 'implementing') titleProps.bold = true;
+  if (plan.status === 'implementing' || plan.status === 'merging') titleProps.bold = true;
   else if (plan.status === 'failed' || plan.status === 'cancelling') titleProps.color = 'red';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
@@ -87,6 +94,7 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     preparing: 0,
     ready: 0,
     implementing: 0,
+    merging: 0,
     cancelling: 0,
     done: 0,
     failed: 0,
@@ -111,6 +119,7 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
         {counts.implementing > 0 && (
           <Text color="cyan">{`  ·  ${counts.implementing} running`}</Text>
         )}
+        {counts.merging > 0 && <Text color="blue">{`  ·  ${counts.merging} merging`}</Text>}
         {counts.ready > 0 && <Text>{`  ·  ${counts.ready} ready`}</Text>}
         {counts.failed > 0 && <Text color="red" bold>{`  ·  ${counts.failed} failed`}</Text>}
         {counts.cancelled > 0 && <Text dimColor>{`  ·  ${counts.cancelled} cancelled`}</Text>}
@@ -155,6 +164,29 @@ export function WatcherProgress({ runtime }: Props): React.ReactElement {
               {runtime.organizingNote}
             </Text>
           )}
+        </Box>
+      ) : runtime.idleState === 'merging' && runtime.mergingPlan !== null ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="blue" paddingX={2}>
+          <Box>
+            <Spinner />
+            <Text> </Text>
+            <Text color="blue" bold>
+              {runtime.mergingMode === 'github-pr' ? 'merging (PR)' : 'merging'}
+            </Text>
+          </Box>
+          <Box>
+            <Text>{runtime.mergingPlan.slug}</Text>
+            <Text dimColor> — </Text>
+            <Text>{runtime.mergingPlan.title}</Text>
+          </Box>
+          {runtime.mergingMode === 'github-pr' &&
+            runtime.mergingPlan.pr_urls &&
+            Object.entries(runtime.mergingPlan.pr_urls).map(([repo, url]) => (
+              <Box key={`${repo}:${url}`}>
+                <Text dimColor>{repo === '.' ? 'PR:' : `${repo} PR:`}</Text>
+                <Text> {url}</Text>
+              </Box>
+            ))}
         </Box>
       ) : (
         <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2}>

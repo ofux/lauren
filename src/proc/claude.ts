@@ -47,6 +47,7 @@ export async function runClaudeOneshotJson(args: {
   systemPrompt: string;
   userPrompt: string;
   signal?: AbortSignal;
+  cwd?: string;
 }): Promise<unknown> {
   const combined = `${args.systemPrompt}\n\n---\n\n${args.userPrompt}`;
   const cmd = ['claude', '-p', '--output-format', 'stream-json', '--verbose', combined];
@@ -55,6 +56,7 @@ export async function runClaudeOneshotJson(args: {
 
   if (args.signal?.aborted) throw new ClaudeAborted();
 
+  const cwd = args.cwd ?? REPO;
   const result = await new Promise<{
     code: number;
     stdout: string;
@@ -62,7 +64,7 @@ export async function runClaudeOneshotJson(args: {
     aborted: boolean;
   }>((resolve, reject) => {
     const child = spawn(program, rest, {
-      cwd: REPO,
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
