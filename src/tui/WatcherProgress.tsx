@@ -187,6 +187,9 @@ export function WatcherProgress({ runtime }: Props): React.ReactElement {
                 <Text> {url}</Text>
               </Box>
             ))}
+          {runtime.mergingPlan.failure?.phase === 'cleanup' && (
+            <Text color="yellow">{runtime.mergingPlan.failure.message}</Text>
+          )}
         </Box>
       ) : (
         <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2}>

@@ -6,8 +6,13 @@ import { DEFAULT_CONFIG } from './core/config.js';
 import { worktreePath, worktreeRootPath } from './core/paths.js';
 import { type Plan, planFilePath } from './core/types.js';
 import { type ResolvedWorkspaceRepo, resolveWorkspaceRepos } from './core/workspace.js';
-import { gitWorktreeAdd, gitWorktreeRemove } from './proc/git.js';
-import { setupPlanWorktrees } from './worktree.js';
+import {
+  gitDeleteBranch,
+  gitWorktreeAdd,
+  gitWorktreeRemove,
+  workingTreeDirty,
+} from './proc/git.js';
+import { cleanupPlanWorktrees, setupPlanWorktrees } from './worktree.js';
 
 vi.mock('./core/workspace.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./core/workspace.js')>();
@@ -21,6 +26,7 @@ vi.mock('./proc/git.js', () => ({
   gitDeleteBranch: vi.fn(),
   gitWorktreeAdd: vi.fn(),
   gitWorktreeRemove: vi.fn(),
+  workingTreeDirty: vi.fn(),
 }));
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
@@ -42,8 +48,10 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
 
 afterEach(async () => {
   vi.mocked(resolveWorkspaceRepos).mockReset();
+  vi.mocked(gitDeleteBranch).mockReset();
   vi.mocked(gitWorktreeAdd).mockReset();
   vi.mocked(gitWorktreeRemove).mockReset();
+  vi.mocked(workingTreeDirty).mockReset();
   await fs.rm(worktreeRootPath('worktree-path-rewrite'), { recursive: true, force: true });
   await fs.rm(planFilePath(makePlan()), { force: true });
 });
@@ -98,5 +106,53 @@ describe('setupPlanWorktrees', () => {
     await expect(
       fs.readFile(path.join(ctx.rootCwd, '.lauren', 'plans', `${plan.slug}.md`), 'utf8'),
     ).resolves.toBe('# Worktree path rewrite\n');
+  });
+});
+
+describe('cleanupPlanWorktrees', () => {
+  test('refuses to remove any worktree when requireClean finds a dirty one', async () => {
+    const plan = makePlan({
+      worktrees: [
+        {
+          repo: null,
+          path: worktreeRootPath('worktree-path-rewrite'),
+          branch: 'lauren/worktree-path-rewrite',
+          parentRoot: '/workspace/app',
+        },
+      ],
+    });
+    await fs.mkdir(worktreeRootPath(plan.slug), { recursive: true });
+    vi.mocked(workingTreeDirty).mockReturnValue(true);
+
+    await expect(
+      cleanupPlanWorktrees(plan, { keepBranches: true, requireClean: true }),
+    ).rejects.toThrow('worktree(s) must be clean before removal');
+
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
+    expect(gitDeleteBranch).not.toHaveBeenCalled();
+  });
+
+  test('removes clean worktrees when requireClean passes', async () => {
+    const plan = makePlan({
+      worktrees: [
+        {
+          repo: null,
+          path: worktreeRootPath('worktree-path-rewrite'),
+          branch: 'lauren/worktree-path-rewrite',
+          parentRoot: '/workspace/app',
+        },
+      ],
+    });
+    await fs.mkdir(worktreeRootPath(plan.slug), { recursive: true });
+    vi.mocked(workingTreeDirty).mockReturnValue(false);
+
+    await cleanupPlanWorktrees(plan, { keepBranches: true, requireClean: true });
+
+    expect(workingTreeDirty).toHaveBeenCalledWith(worktreeRootPath(plan.slug));
+    expect(gitWorktreeRemove).toHaveBeenCalledWith({
+      repoRoot: '/workspace/app',
+      worktreePath: worktreeRootPath(plan.slug),
+    });
+    expect(gitDeleteBranch).not.toHaveBeenCalled();
   });
 });

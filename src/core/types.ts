@@ -29,6 +29,7 @@ export interface PlanFailure {
   phase: string;
   step_id: string | null;
   message: string;
+  cleanup_result?: 'done' | 'cancelled';
 }
 
 /**

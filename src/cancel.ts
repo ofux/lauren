@@ -6,8 +6,10 @@ import { nowIso } from './core/time.js';
 import {
   type CancelIntent,
   ImplementingLocked,
+  MergingLocked,
   type Plan,
   PlanNotFound,
+  PlanPreconditionFailed,
   PreparingLocked,
   planFilePath,
 } from './core/types.js';
@@ -24,20 +26,39 @@ async function requestDaemonCancellation(
   phase: 'preparing' | 'implementing' | 'merging',
   intent?: CancelIntent,
 ): Promise<CancelOutcome> {
+  // Stamp cancel_intent for both implementing and merging: a user who picks
+  // 'keep' on an implementing plan that races to merging would otherwise see
+  // their intent silently dropped, because the daemon's drainMerging cancel
+  // path consults cancel_intent and falls back to 'revert' when it's unset.
+  // Preparing rows have no work to preserve, so intent doesn't apply.
+  const stampIntent = phase === 'implementing' || phase === 'merging';
   try {
     await store.update(
       slug,
-      // Only stamp cancel_intent for implementing plans; the brain and
-      // merge paths don't need it (there's no working tree state in the
-      // user's main checkout to preserve — the worktree is independent).
-      phase === 'implementing'
+      stampIntent
         ? { cancel_requested: true, cancel_intent: intent ?? 'revert' }
         : { cancel_requested: true },
-      { allowPreparing: true, allowImplementing: true, allowMerging: true },
+      {
+        allowPreparing: true,
+        allowImplementing: true,
+        allowMerging: true,
+        ...(phase === 'merging'
+          ? {
+              precondition: (plan: Plan) => plan.failure?.phase !== 'cleanup',
+              preconditionDetail: 'cleanup is already pending',
+            }
+          : {}),
+      },
     );
   } catch (err) {
     if (err instanceof PlanNotFound) {
       return { kind: 'noop', message: `no row for '${slug}'` };
+    }
+    if (err instanceof PlanPreconditionFailed) {
+      return {
+        kind: 'noop',
+        message: `'${slug}' already merged; waiting for cleanup to finish.`,
+      };
     }
     throw err;
   }
@@ -46,7 +67,10 @@ async function requestDaemonCancellation(
   if (phase === 'preparing') {
     what = 'preparing; vibe signalled to abort brain';
   } else if (phase === 'merging') {
-    what = 'merging; vibe signalled to stop and clean up';
+    what =
+      intent === 'keep'
+        ? 'merging; vibe signalled to stop and mark cancelling'
+        : 'merging; vibe signalled to stop and clean up';
   } else if (intent === 'keep') {
     what = 'implementing; vibe signalled to abort and mark cancelling';
   } else {
@@ -72,14 +96,22 @@ async function requestDaemonCancellation(
  *                  worktree + marks 'cancelled' (intent='revert', the default)
  *                  or leaves the worktree intact + marks 'cancelling' and
  *                  pauses (intent='keep')
- *   merging      → set cancel_requested=true, signal vibe; vibe stops the
- *                  merge/poll, cleans up the worktree, marks 'cancelled'
+ *   merging      → set cancel_requested=true (+ cancel_intent), signal vibe;
+ *                  vibe stops the merge/poll and either tears down the
+ *                  worktree + marks 'cancelled' (intent='revert', default)
+ *                  or leaves the worktree intact + marks 'cancelling'
+ *                  (intent='keep' — preserves the lauren/<slug> branch's
+ *                  committed Step work for manual handling)
  *   else (failed/done/cancelled/cancelling) → no-op
  */
 export async function cancelPlan(args: {
   slug: string;
   store: PlanStore;
-  /** Only honored for implementing plans. Defaults to 'revert'. */
+  /**
+   * Honored for implementing and merging plans (including races where the
+   * row transitions implementing↔merging between TUI capture and this call).
+   * Defaults to 'revert'.
+   */
   intent?: CancelIntent;
 }): Promise<CancelOutcome> {
   const { slug, store, intent } = args;
@@ -118,6 +150,9 @@ export async function cancelPlan(args: {
       if (err instanceof ImplementingLocked) {
         return requestDaemonCancellation(store, slug, 'implementing', intent);
       }
+      if (err instanceof MergingLocked) {
+        return requestDaemonCancellation(store, slug, 'merging', intent);
+      }
       if (err instanceof PlanNotFound) {
         return { kind: 'noop', message: `no row for '${slug}'` };
       }
@@ -131,7 +166,13 @@ export async function cancelPlan(args: {
   }
 
   if (plan.status === 'merging') {
-    return requestDaemonCancellation(store, slug, 'merging');
+    if (plan.failure?.phase === 'cleanup') {
+      return {
+        kind: 'noop',
+        message: `'${slug}' already merged; waiting for cleanup to finish.`,
+      };
+    }
+    return requestDaemonCancellation(store, slug, 'merging', intent);
   }
 
   return { kind: 'noop', message: `'${slug}' is ${plan.status}; nothing to cancel.` };
@@ -143,6 +184,6 @@ export function isCancellable(plan: Plan): boolean {
     plan.status === 'preparing' ||
     plan.status === 'ready' ||
     plan.status === 'implementing' ||
-    plan.status === 'merging'
+    (plan.status === 'merging' && plan.failure?.phase !== 'cleanup')
   );
 }

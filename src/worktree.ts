@@ -5,7 +5,12 @@ import type { LaurenConfig } from './core/config.js';
 import { displayPath, worktreePath, worktreeRootPath } from './core/paths.js';
 import { type Plan, type PlanWorktree, planFilePath } from './core/types.js';
 import { type ResolvedWorkspaceRepo, resolveWorkspaceRepos } from './core/workspace.js';
-import { gitDeleteBranch, gitWorktreeAdd, gitWorktreeRemove } from './proc/git.js';
+import {
+  gitDeleteBranch,
+  gitWorktreeAdd,
+  gitWorktreeRemove,
+  workingTreeDirty,
+} from './proc/git.js';
 
 export interface PlanExecutionContext {
   /** Subprocess cwd (claude/codex) — always the worktree root for this plan. */
@@ -111,20 +116,45 @@ export async function setupPlanWorktrees(
  * When `keepBranches` is true, leaves the branches in place so the user can
  * inspect them later (used by github-pr success paths where the remote may
  * still need the local branch around for cleanup ordering).
+ *
+ * When `requireClean` is true, every existing worktree must be clean before
+ * any worktree is removed. This protects cancel-keep paths where uncommitted
+ * edits belong to the user until they explicitly resolve them.
  */
 export async function cleanupPlanWorktrees(
   plan: Plan,
-  opts: { keepBranches?: boolean } = {},
+  opts: { keepBranches?: boolean; requireClean?: boolean } = {},
 ): Promise<void> {
   const worktrees = plan.worktrees ?? [];
+  if (opts.requireClean) {
+    const dirtyWorktrees: string[] = [];
+    for (const wt of worktrees) {
+      try {
+        await fs.access(wt.path);
+      } catch {
+        continue;
+      }
+      if (workingTreeDirty(wt.path)) {
+        dirtyWorktrees.push(displayPath(wt.path));
+      }
+    }
+    if (dirtyWorktrees.length > 0) {
+      throw new Error(`worktree(s) must be clean before removal: ${dirtyWorktrees.join(', ')}`);
+    }
+  }
+
+  const removalFailures: string[] = [];
   for (const wt of worktrees) {
+    let removed = false;
     try {
       gitWorktreeRemove({ repoRoot: wt.parentRoot, worktreePath: wt.path });
+      removed = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`warning: failed to remove worktree ${displayPath(wt.path)}: ${msg}\n`);
+      removalFailures.push(`${displayPath(wt.path)}: ${msg}`);
     }
-    if (!opts.keepBranches) {
+    if (removed && !opts.keepBranches) {
       try {
         gitDeleteBranch(wt.branch, wt.parentRoot);
       } catch (err) {
@@ -132,6 +162,9 @@ export async function cleanupPlanWorktrees(
         process.stderr.write(`warning: failed to delete branch ${wt.branch}: ${msg}\n`);
       }
     }
+  }
+  if (removalFailures.length > 0) {
+    throw new Error(`failed to remove worktree(s): ${removalFailures.join('; ')}`);
   }
   if (worktrees.length > 0) {
     const root = worktreeRootPath(plan.slug);

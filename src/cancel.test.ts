@@ -1,13 +1,24 @@
-import { describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { cancelPlan } from './cancel.js';
+import { cancelPlan, isCancellable } from './cancel.js';
 import type { PlanStore } from './core/store.js';
-import { ImplementingLocked, type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
+import {
+  ImplementingLocked,
+  MergingLocked,
+  type Plan,
+  PlanNotFound,
+  PlanPreconditionFailed,
+  PreparingLocked,
+} from './core/types.js';
 import { signalDaemon } from './proc/pid.js';
 
 vi.mock('./proc/pid.js', () => ({
   signalDaemon: vi.fn(async () => true),
 }));
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
   return {
@@ -98,6 +109,107 @@ describe('cancelPlan', () => {
     expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
   });
 
+  test('signals vibe when a ready row races to merging during cancellation', async () => {
+    const plan = makePlan({ status: 'ready' });
+    let firstUpdate = true;
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(
+        async (_slug: string, fields: Partial<Plan>, opts?: { allowMerging?: boolean }) => {
+          if (firstUpdate && !opts?.allowMerging) {
+            firstUpdate = false;
+            plan.status = 'merging';
+            throw new MergingLocked(plan.slug);
+          }
+          Object.assign(plan, fields);
+          return plan;
+        },
+      ),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
+    expect(plan.cancel_requested).toBe(true);
+    // Defaults to 'revert' for merging cancellations with no explicit intent.
+    expect(plan.cancel_intent).toBe('revert');
+    expect(store.update).toHaveBeenLastCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'revert' },
+      expect.objectContaining({
+        allowPreparing: true,
+        allowImplementing: true,
+        allowMerging: true,
+      }),
+    );
+    expect(outcome.kind === 'requested' && outcome.message).toMatch(/was merging/);
+    expect(signalDaemon).toHaveBeenCalledWith(expect.stringContaining('vibe.pid'), 'SIGUSR2');
+  });
+
+  test("preserves intent='keep' when an implementing plan races to merging mid-cancel", async () => {
+    // User opened the TUI dialog while the row was 'implementing' and picked
+    // 'keep'. By the time cancel.ts's find() runs, the daemon has already
+    // transitioned the row to 'merging'. The intent must still land on the
+    // row, otherwise drainMerging will silently delete the lauren/<slug>
+    // branch and lose the committed Step work.
+    const plan = makePlan({ status: 'merging' });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
+        Object.assign(plan, fields);
+        return plan;
+      }),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'keep' });
+
+    expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
+    expect(plan.cancel_requested).toBe(true);
+    expect(plan.cancel_intent).toBe('keep');
+    expect(store.update).toHaveBeenCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'keep' },
+      expect.objectContaining({
+        allowPreparing: true,
+        allowImplementing: true,
+        allowMerging: true,
+      }),
+    );
+    expect(outcome.kind === 'requested' && outcome.message).toMatch(/mark cancelling/);
+  });
+
+  test("preserves intent='keep' through a ready→merging race", async () => {
+    // Variant of the race above where cancel.ts first read 'ready' and the
+    // store rejects the direct status='cancelled' update with MergingLocked.
+    // The redirect to requestDaemonCancellation must carry intent.
+    const plan = makePlan({ status: 'ready' });
+    let firstUpdate = true;
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(
+        async (_slug: string, fields: Partial<Plan>, opts?: { allowMerging?: boolean }) => {
+          if (firstUpdate && !opts?.allowMerging) {
+            firstUpdate = false;
+            plan.status = 'merging';
+            throw new MergingLocked(plan.slug);
+          }
+          Object.assign(plan, fields);
+          return plan;
+        },
+      ),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'keep' });
+
+    expect(outcome).toMatchObject({ kind: 'requested', daemonReachable: true });
+    expect(plan.cancel_intent).toBe('keep');
+    expect(store.update).toHaveBeenLastCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'keep' },
+      expect.objectContaining({ allowMerging: true }),
+    );
+  });
+
   test("stamps cancel_intent='keep' when cancelling an implementing plan with intent=keep", async () => {
     const plan = makePlan({ status: 'implementing' });
     const store = {
@@ -140,6 +252,64 @@ describe('cancelPlan', () => {
       { cancel_requested: true, cancel_intent: 'revert' },
       { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
+  });
+
+  test('does not cancel a cleanup-pending merge', async () => {
+    const plan = makePlan({
+      status: 'merging',
+      failure: {
+        phase: 'cleanup',
+        step_id: null,
+        message: 'merge landed, but cleanup failed: locked',
+        cleanup_result: 'done',
+      },
+    });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome).toEqual({
+      kind: 'noop',
+      message: `'${plan.slug}' already merged; waiting for cleanup to finish.`,
+    });
+    expect(store.update).not.toHaveBeenCalled();
+    expect(signalDaemon).not.toHaveBeenCalled();
+    expect(isCancellable(plan)).toBe(false);
+  });
+
+  test('does not cancel when a ready row races into cleanup-pending merge', async () => {
+    const plan = makePlan({ status: 'ready' });
+    let firstUpdate = true;
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(
+        async (_slug: string, _fields: Partial<Plan>, opts?: { allowMerging?: boolean }) => {
+          if (firstUpdate && !opts?.allowMerging) {
+            firstUpdate = false;
+            plan.status = 'merging';
+            plan.failure = {
+              phase: 'cleanup',
+              step_id: null,
+              message: 'merge landed, but cleanup failed: locked',
+              cleanup_result: 'done',
+            };
+            throw new MergingLocked(plan.slug);
+          }
+          throw new PlanPreconditionFailed(plan.slug, 'cleanup is already pending');
+        },
+      ),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome).toEqual({
+      kind: 'noop',
+      message: `'${plan.slug}' already merged; waiting for cleanup to finish.`,
+    });
+    expect(signalDaemon).not.toHaveBeenCalled();
   });
 
   test("is a no-op for a 'cancelling' plan", async () => {

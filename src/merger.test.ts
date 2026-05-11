@@ -130,6 +130,69 @@ describe('mergePlanOnce — auto mode', () => {
     expect(gitDeleteBranch).toHaveBeenCalledWith('lauren/demo', '/repo');
   });
 
+  test('returns cleanup_failed when cleanup fails after a clean merge', async () => {
+    vi.mocked(gitWorktreeRemove).mockImplementationOnce(() => {
+      throw new Error('locked');
+    });
+
+    const result = await mergePlanOnce({
+      plan: makePlan(),
+      store: makeStore(),
+      config: TEST_CONFIG,
+    });
+
+    expect(result.kind).toBe('cleanup_failed');
+    if (result.kind === 'cleanup_failed') {
+      expect(result.failure.phase).toBe('cleanup');
+      expect(result.failure.message).toContain('merge landed');
+      expect(result.failure.message).toContain('locked');
+    }
+    expect(gitDeleteBranch).not.toHaveBeenCalled();
+  });
+
+  test('retries cleanup directly for a cleanup-pending merge', async () => {
+    const result = await mergePlanOnce({
+      plan: makePlan({
+        failure: {
+          phase: 'cleanup',
+          step_id: null,
+          message: 'merge landed, but cleanup failed: locked',
+        },
+      }),
+      store: makeStore(),
+      config: TEST_CONFIG,
+    });
+
+    expect(result.kind).toBe('done');
+    expect(gitMerge).not.toHaveBeenCalled();
+    expect(gitWorktreeRemove).toHaveBeenCalledWith({
+      repoRoot: '/repo',
+      worktreePath: '/wt/root',
+    });
+  });
+
+  test('marks cleanup-pending PR cancellations cancelled after cleanup succeeds', async () => {
+    const result = await mergePlanOnce({
+      plan: makePlan({
+        failure: {
+          phase: 'cleanup',
+          step_id: null,
+          message: 'PR closed without merging, but cleanup failed: locked',
+          cleanup_result: 'cancelled',
+        },
+      }),
+      store: makeStore(),
+      config: TEST_CONFIG,
+    });
+
+    expect(result.kind).toBe('cancelled');
+    expect(gitMerge).not.toHaveBeenCalled();
+    expect(gitWorktreeRemove).toHaveBeenCalledWith({
+      repoRoot: '/repo',
+      worktreePath: '/wt/root',
+    });
+  });
+
   test('non-conflict merge failure returns failed without cleanup', async () => {
     vi.mocked(gitMerge).mockReturnValue({
       code: 1,
@@ -160,6 +223,22 @@ describe('mergePlanOnce — auto mode', () => {
     expect(result.kind).toBe('failed');
   });
 
+  test('returns aborted without treating a signal abort as plan cancellation', async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await mergePlanOnce({
+      plan: makePlan(),
+      store: makeStore(),
+      config: TEST_CONFIG,
+      signal: controller.signal,
+    });
+
+    expect(result.kind).toBe('aborted');
+    expect(gitMerge).not.toHaveBeenCalled();
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
+  });
+
   test('commits staged conflict resolutions after claude resolves conflicts', async () => {
     vi.mocked(gitMerge).mockReturnValue({
       code: 1,
@@ -180,6 +259,31 @@ describe('mergePlanOnce — auto mode', () => {
     expect(hasUnresolvedMergeConflicts).toHaveBeenCalledWith('/repo');
     expect(gitMergeContinue).toHaveBeenCalledWith('/repo');
     expect(gitMergeAbort).not.toHaveBeenCalled();
+  });
+
+  test('aborts an in-progress parent merge when the conflict resolver is interrupted', async () => {
+    const controller = new AbortController();
+    vi.mocked(gitMerge).mockReturnValue({
+      code: 1,
+      stdout: 'Auto-merging app.ts',
+      stderr: 'Automatic merge failed; fix conflicts and then commit the result.',
+      hasConflicts: true,
+    });
+    vi.mocked(streamSubprocess).mockImplementation(async () => {
+      controller.abort();
+      return 1;
+    });
+
+    const result = await mergePlanOnce({
+      plan: makePlan(),
+      store: makeStore(),
+      config: TEST_CONFIG,
+      signal: controller.signal,
+    });
+
+    expect(result.kind).toBe('aborted');
+    expect(gitMergeAbort).toHaveBeenCalledWith('/repo');
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
   });
 
   test('aborts when conflicts remain unresolved after claude runs', async () => {
@@ -248,6 +352,22 @@ describe('mergePlanOnce — github-pr mode', () => {
     expect(gitDeleteBranch).toHaveBeenCalled();
   });
 
+  test('returns cleanup_failed for a merged PR when cleanup fails', async () => {
+    vi.mocked(ghPrView).mockReturnValue({ state: 'MERGED', merged: true });
+    vi.mocked(gitWorktreeRemove).mockImplementationOnce(() => {
+      throw new Error('locked');
+    });
+    const plan = makePlan({ pr_urls: { '.': 'https://github.com/x/y/pull/1' } });
+
+    const result = await mergePlanOnce({ plan, store: makeStore(), config });
+
+    expect(result.kind).toBe('cleanup_failed');
+    if (result.kind === 'cleanup_failed') {
+      expect(result.failure.phase).toBe('cleanup');
+      expect(result.failure.message).toContain('locked');
+    }
+  });
+
   test('returns failed without cleanup when merged PR cannot fast-forward locally', async () => {
     vi.mocked(ghPrView).mockReturnValue({ state: 'MERGED', merged: true });
     vi.mocked(gitFastForward).mockReturnValue({
@@ -272,6 +392,24 @@ describe('mergePlanOnce — github-pr mode', () => {
 
     expect(result.kind).toBe('cancelled');
     expect(gitWorktreeRemove).toHaveBeenCalled();
+  });
+
+  test('keeps PR-closed cleanup failures retryable', async () => {
+    vi.mocked(ghPrView).mockReturnValue({ state: 'CLOSED', merged: false });
+    vi.mocked(gitWorktreeRemove).mockImplementationOnce(() => {
+      throw new Error('locked');
+    });
+    const plan = makePlan({ pr_urls: { '.': 'https://github.com/x/y/pull/1' } });
+
+    const result = await mergePlanOnce({ plan, store: makeStore(), config });
+
+    expect(result.kind).toBe('cleanup_failed');
+    if (result.kind === 'cleanup_failed') {
+      expect(result.failure.phase).toBe('cleanup');
+      expect(result.failure.cleanup_result).toBe('cancelled');
+      expect(result.failure.message).toContain('PR closed without merging');
+      expect(result.failure.message).toContain('locked');
+    }
   });
 
   test("doesn't recreate the PR when a URL is already on the row", async () => {
@@ -339,6 +477,7 @@ describe('finalizeMerge', () => {
       'demo',
       expect.objectContaining({
         status: 'done',
+        failure: null,
         pr_urls: undefined,
         worktrees: undefined,
       }),
@@ -353,6 +492,7 @@ describe('finalizeMerge', () => {
       'demo',
       expect.objectContaining({
         status: 'cancelled',
+        failure: null,
         cancel_requested: false,
         cancel_intent: undefined,
       }),

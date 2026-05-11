@@ -35,8 +35,10 @@ import { cleanupPlanWorktrees } from './worktree.js';
 export type MergeResult =
   | { kind: 'done' }
   | { kind: 'cancelled' }
+  | { kind: 'aborted' }
   | { kind: 'failed'; failure: PlanFailure }
-  | { kind: 'pending' };
+  | { kind: 'pending' }
+  | { kind: 'cleanup_failed'; failure: PlanFailure };
 
 export const PR_POLL_INTERVAL_MS = 30_000;
 
@@ -50,6 +52,29 @@ function buildPrBody(plan: Plan, planMarkdown: string): string {
 
 function failure(message: string): PlanFailure {
   return { phase: 'merge', step_id: null, message };
+}
+
+function cleanupFailure(err: unknown, cleanupResult: 'done' | 'cancelled'): PlanFailure {
+  const msg = err instanceof Error ? err.message : String(err);
+  const context = cleanupResult === 'cancelled' ? 'PR closed without merging' : 'merge landed';
+  return {
+    phase: 'cleanup',
+    step_id: null,
+    message: `${context}, but cleanup failed: ${msg}`,
+    cleanup_result: cleanupResult,
+  };
+}
+
+async function cleanupPlanWorktreesForResult(
+  plan: Plan,
+  cleanupResult: 'done' | 'cancelled',
+): Promise<MergeResult> {
+  try {
+    await cleanupPlanWorktrees(plan);
+  } catch (err) {
+    return { kind: 'cleanup_failed', failure: cleanupFailure(err, cleanupResult) };
+  }
+  return { kind: cleanupResult };
 }
 
 async function readPlanMarkdown(plan: Plan): Promise<string> {
@@ -109,7 +134,7 @@ async function autoMerge(args: {
   }
 
   for (const wt of worktrees) {
-    if (signal?.aborted) return { kind: 'cancelled' };
+    if (signal?.aborted) return { kind: 'aborted' };
 
     // Parent checkout must be on dev_branch for the merge to land where the
     // user expects. The vibe-startup guard validates this, but a long-running
@@ -157,6 +182,9 @@ async function autoMerge(args: {
     });
     if (claudeCode !== 0) {
       gitMergeAbort(wt.parentRoot);
+      if (signal?.aborted) {
+        return { kind: 'aborted' };
+      }
       return {
         kind: 'failed',
         failure: failure(
@@ -194,8 +222,7 @@ async function autoMerge(args: {
     }
   }
 
-  await cleanupPlanWorktrees(plan);
-  return { kind: 'done' };
+  return cleanupPlanWorktreesForResult(plan, 'done');
 }
 
 function urlKey(wt: PlanWorktree): string {
@@ -354,7 +381,11 @@ export async function mergePlanOnce(args: {
   signal?: AbortSignal;
 }): Promise<MergeResult> {
   const { plan, store, config, signal } = args;
-  if (signal?.aborted) return { kind: 'cancelled' };
+  if (signal?.aborted) return { kind: 'aborted' };
+
+  if (plan.failure?.phase === 'cleanup') {
+    return cleanupPlanWorktreesForResult(plan, plan.failure.cleanup_result ?? 'done');
+  }
 
   if (config.merge_mode === 'auto') {
     return autoMerge({ plan, config, ...(signal !== undefined ? { signal } : {}) });
@@ -374,13 +405,11 @@ export async function mergePlanOnce(args: {
   if (result.kind === 'done') {
     const ffFailure = fastForwardPrMergeTargets(opened.updated, config);
     if (ffFailure !== null) return { kind: 'failed', failure: ffFailure };
-    await cleanupPlanWorktrees(opened.updated);
-    return { kind: 'done' };
+    return cleanupPlanWorktreesForResult(opened.updated, 'done');
   }
   if (result.kind === 'cancelled') {
     // PR was closed without merging — surface as cancelled and clean up.
-    await cleanupPlanWorktrees(opened.updated);
-    return { kind: 'cancelled' };
+    return cleanupPlanWorktreesForResult(opened.updated, 'cancelled');
   }
   return { kind: 'pending' };
 }
@@ -392,15 +421,27 @@ export async function mergePlanOnce(args: {
 export async function finalizeMerge(
   store: PlanStore,
   slug: string,
-  result: Exclude<MergeResult, { kind: 'pending' }>,
+  result: Exclude<
+    MergeResult,
+    { kind: 'pending' } | { kind: 'cleanup_failed' } | { kind: 'aborted' }
+  >,
 ): Promise<void> {
   const fields: Partial<Plan> =
     result.kind === 'done'
-      ? { status: 'done', finished_at: nowIso(), pr_urls: undefined, worktrees: undefined }
+      ? {
+          status: 'done',
+          finished_at: nowIso(),
+          failure: null,
+          cancel_requested: false,
+          cancel_intent: undefined,
+          pr_urls: undefined,
+          worktrees: undefined,
+        }
       : result.kind === 'cancelled'
         ? {
             status: 'cancelled',
             finished_at: nowIso(),
+            failure: null,
             cancel_requested: false,
             cancel_intent: undefined,
             pr_urls: undefined,

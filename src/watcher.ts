@@ -100,9 +100,56 @@ function failureFromError(err: unknown): PlanFailure {
 }
 
 /**
- * Move a plan into a terminal status (done/failed/cancelled). Stamps
- * `finished_at` and swallows `ImplementingLocked` / `PlanNotFound` so a
- * concurrent cancel or removal during finalization doesn't propagate.
+ * Sweep cancelled rows that still have `worktrees` recorded and remove
+ * the on-disk worktrees. Branches (`lauren/<slug>`) are preserved so any
+ * committed Step work survives — the user explicitly chose to cancel-keep,
+ * and we don't know whether they've already merged the branch into
+ * dev_branch manually. Idempotent + best-effort: per-row failures are
+ * logged but don't propagate, so a leaked worktree never crashes the loop.
+ *
+ * Called when the watcher transitions out of a `cancelling` pause (the
+ * user resolved by flipping cancelling→cancelled) and on daemon startup.
+ */
+export async function cleanupCancelledLeftoverWorktrees(
+  store: PlanStore,
+  plans: readonly Plan[],
+): Promise<void> {
+  const candidates = plans.filter(
+    (p) => p.status === 'cancelled' && (p.worktrees?.length ?? 0) > 0,
+  );
+  for (const plan of candidates) {
+    try {
+      await cleanupPlanWorktrees(plan, { keepBranches: true, requireClean: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `warning: failed to clean leftover worktree for cancelled '${plan.slug}': ${msg}\n`,
+      );
+      continue;
+    }
+    try {
+      await store.update(
+        plan.slug,
+        { worktrees: undefined },
+        { allowImplementing: true, allowMerging: true },
+      );
+    } catch (err) {
+      if (!(err instanceof PlanNotFound)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `warning: failed to clear worktrees field on '${plan.slug}': ${msg}\n`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Move a plan into a terminal status (done/failed/cancelled) or the
+ * paused-`cancelling` state. Stamps `finished_at` and swallows
+ * `ImplementingLocked` / `PlanNotFound` so a concurrent cancel or removal
+ * during finalization doesn't propagate. `allowMerging` covers the
+ * merging→cancelling cancel-keep transition.
  */
 export async function markPlanFinal(
   store: PlanStore,
@@ -110,7 +157,11 @@ export async function markPlanFinal(
   fields: Partial<Omit<Plan, 'slug' | 'finished_at'>>,
 ): Promise<void> {
   try {
-    await store.update(slug, { ...fields, finished_at: nowIso() }, { allowImplementing: true });
+    await store.update(
+      slug,
+      { ...fields, finished_at: nowIso() },
+      { allowImplementing: true, allowMerging: true },
+    );
   } catch (err) {
     if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
       throw err;
@@ -225,6 +276,73 @@ async function drainEnqueued(
   }
 }
 
+/**
+ * Apply a cancellation request to a `merging` row, honoring `cancel_intent`.
+ *
+ *   - intent='keep' — preserve the worktree + `lauren/<slug>` branch (the
+ *     committed Step work) and mark the row 'cancelling' so the outer loop
+ *     pauses for manual resolution. Matches the implementing→cancelling
+ *     path (see `watcherLoop`'s implementing catch).
+ *   - intent='revert' (default) — tear down the worktree and finalize as
+ *     'cancelled'. If cleanup fails, persist `failure.phase='cleanup'`
+ *     with `cleanup_result='cancelled'` so the next drainMerging iteration
+ *     retries via `mergePlanOnce`'s cleanup-pending path. Without this
+ *     wrapping a thrown cleanup error would crash the daemon.
+ *
+ * Returns true when the failure was persisted as cleanup_pending (the
+ * caller should sleep before looping); false otherwise.
+ */
+async function applyMergingCancellation(args: {
+  store: PlanStore;
+  plan: Plan;
+  config: LaurenConfig;
+  runtime: WatcherRuntime;
+}): Promise<{ persistedCleanupFailure: boolean }> {
+  const { store, plan, config, runtime } = args;
+  // Re-read so we pick up cancel_intent that landed after the row was last
+  // read (cancel.ts may have written it during the merge attempt).
+  let fresh: Plan | null = null;
+  try {
+    fresh = await store.find(plan.slug);
+  } catch {
+    // best-effort re-read; fall back to the row we already have
+  }
+  const intent = fresh?.cancel_intent ?? plan.cancel_intent;
+  if (intent === 'keep') {
+    await markPlanFinal(store, plan.slug, {
+      status: 'cancelling',
+      cancel_requested: false,
+      cancel_intent: undefined,
+    });
+    return { persistedCleanupFailure: false };
+  }
+  try {
+    await cleanupPlanWorktrees(plan);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    try {
+      const updated = await store.update(
+        plan.slug,
+        {
+          failure: {
+            phase: 'cleanup',
+            step_id: null,
+            message: `cancel requested, but cleanup failed: ${msg}`,
+            cleanup_result: 'cancelled',
+          },
+        },
+        { allowMerging: true },
+      );
+      runtime.setMerging(await store.read(), updated, config.merge_mode);
+    } catch {
+      // best-effort UI refresh
+    }
+    return { persistedCleanupFailure: true };
+  }
+  await finalizeMerge(store, plan.slug, { kind: 'cancelled' });
+  return { persistedCleanupFailure: false };
+}
+
 async function drainMerging(
   runtime: WatcherRuntime,
   store: PlanStore,
@@ -239,26 +357,50 @@ async function drainMerging(
 
     handles.current.slug = merging.slug;
     handles.phase.value = 'merging';
+    const cleanupPending = merging.failure?.phase === 'cleanup';
 
-    if (merging.cancel_requested) {
+    if (merging.cancel_requested && !cleanupPending) {
       runtime.setMerging(plans, merging, config.merge_mode);
-      await cleanupPlanWorktrees(merging).catch(() => undefined);
-      await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+      const { persistedCleanupFailure } = await applyMergingCancellation({
+        store,
+        plan: merging,
+        config,
+        runtime,
+      });
       resetMergeHandles(handles);
+      if (persistedCleanupFailure) {
+        await sleep(PR_POLL_INTERVAL_MS, signal);
+        if (signal.aborted) return;
+      }
       continue;
     }
 
     const cancelController = new AbortController();
     handles.cancelController.ref = cancelController;
     const merged = AbortSignal.any([signal, cancelController.signal]);
+    const mergeSignal = cleanupPending ? signal : merged;
 
     runtime.setMerging(plans, merging, config.merge_mode);
 
     let result: Awaited<ReturnType<typeof mergePlanOnce>>;
     try {
-      result = await mergePlanOnce({ plan: merging, store, config, signal: merged });
+      result = await mergePlanOnce({ plan: merging, store, config, signal: mergeSignal });
     } catch (err) {
-      if (signal.aborted && !cancelController.signal.aborted) {
+      if (cancelController.signal.aborted && !cleanupPending) {
+        const { persistedCleanupFailure } = await applyMergingCancellation({
+          store,
+          plan: merging,
+          config,
+          runtime,
+        });
+        resetMergeHandles(handles);
+        if (persistedCleanupFailure) {
+          await sleep(PR_POLL_INTERVAL_MS, signal);
+          if (signal.aborted) return;
+        }
+        continue;
+      }
+      if (signal.aborted) {
         resetMergeHandles(handles);
         return;
       }
@@ -277,21 +419,54 @@ async function drainMerging(
       continue;
     }
 
-    if (cancelController.signal.aborted && !signal.aborted) {
-      // User-initiated cancel of merging — clean up and mark cancelled.
-      await cleanupPlanWorktrees(merging).catch(() => undefined);
-      await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+    if (result.kind === 'cleanup_failed') {
+      const updated = await store.update(
+        merging.slug,
+        { failure: result.failure },
+        { allowMerging: true },
+      );
+      runtime.setMerging(
+        plans.map((p) => (p.slug === updated.slug ? updated : p)),
+        updated,
+        config.merge_mode,
+      );
+      await sleep(PR_POLL_INTERVAL_MS, mergeSignal);
       resetMergeHandles(handles);
+      if (signal.aborted) return;
+      continue;
+    }
+
+    if (cancelController.signal.aborted && !cleanupPending) {
+      // User-initiated cancel of merging wins over a concurrent Ctrl-C.
+      const { persistedCleanupFailure } = await applyMergingCancellation({
+        store,
+        plan: merging,
+        config,
+        runtime,
+      });
+      resetMergeHandles(handles);
+      if (persistedCleanupFailure) {
+        await sleep(PR_POLL_INTERVAL_MS, signal);
+        if (signal.aborted) return;
+      }
       continue;
     }
 
     if (result.kind === 'pending') {
       await sleep(PR_POLL_INTERVAL_MS, merged);
-      if (cancelController.signal.aborted && !signal.aborted) {
+      if (cancelController.signal.aborted && !cleanupPending) {
         // User-initiated cancel while waiting between PR polls.
-        await cleanupPlanWorktrees(merging).catch(() => undefined);
-        await finalizeMerge(store, merging.slug, { kind: 'cancelled' });
+        const { persistedCleanupFailure } = await applyMergingCancellation({
+          store,
+          plan: merging,
+          config,
+          runtime,
+        });
         resetMergeHandles(handles);
+        if (persistedCleanupFailure) {
+          await sleep(PR_POLL_INTERVAL_MS, signal);
+          if (signal.aborted) return;
+        }
         continue;
       }
       resetMergeHandles(handles);
@@ -299,7 +474,7 @@ async function drainMerging(
       continue;
     }
 
-    if (signal.aborted && !cancelController.signal.aborted) {
+    if (result.kind === 'aborted' || signal.aborted) {
       resetMergeHandles(handles);
       return;
     }
@@ -347,6 +522,11 @@ export async function watcherLoop(
         await sleep(IDLE_POLL_SECONDS * 1000, signal);
         continue;
       }
+      // The user resolved cancelling→cancelled. The worktree was kept
+      // around for inspection; now that they've moved on, remove it so
+      // we don't leak `.lauren/worktrees/<slug>/` directories indefinitely.
+      // Branches are preserved (see cleanupCancelledLeftoverWorktrees).
+      await cleanupCancelledLeftoverWorktrees(store, beforeDrain);
       requireCleanWorkspaceAfterCancelling = false;
     }
 
@@ -515,7 +695,7 @@ export async function watcherLoop(
       handles.current.slug = null;
       handles.cancelController.ref = null;
       handles.phase.value = 'idle';
-      if (cancelController.signal.aborted && !signal.aborted) {
+      if (cancelController.signal.aborted) {
         // Per-plan cancellation. Branch by intent:
         //   'keep' — leave the worktree intact, demote to 'cancelling',
         //            and let the outer loop pause on the cancelling row.
@@ -554,14 +734,45 @@ export async function watcherLoop(
     // `merging` — the outer loop will pick it up at the top. `finished_at`
     // is left null until the plan reaches its true terminal status (done /
     // failed / cancelled).
+    //
+    // The precondition guards an implement→merge race: between the handles
+    // being cleared above and this update winning the lock, a TUI cancel
+    // (cancel.ts → requestDaemonCancellation) can stamp cancel_requested on
+    // the still-`implementing` row. Without the guard, cancel_requested would
+    // ride into `merging`, and drainMerging would honor it as a merging
+    // cancel — for intent='revert' (default) that means deleting the
+    // `lauren/<slug>` branch, destroying the just-committed Step work.
+    // The user clicked cancel on what they saw as `implementing`, so we
+    // honor the implementing-cancel semantics here instead.
     inFlight = null;
     try {
       await store.update(
         claimed.slug,
         { status: 'merging', finished_at: null },
-        { allowImplementing: true },
+        {
+          allowImplementing: true,
+          precondition: (p) => !p.cancel_requested,
+          preconditionDetail: 'cancel_requested landed during implement→merge transition',
+        },
       );
     } catch (err) {
+      if (err instanceof PlanPreconditionFailed) {
+        // Mirror the runPlan-throw branch above: re-read for the latest
+        // intent, then either pause on cancelling (keep) or hand back to
+        // vibe-command to finalize as cancelled (revert).
+        const cancelledPlan = await store.find(claimed.slug);
+        const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
+        if (cancelIntent === 'keep') {
+          await markPlanFinal(store, claimed.slug, {
+            status: 'cancelling',
+            cancel_requested: false,
+            cancel_intent: undefined,
+          });
+          continue;
+        }
+        cancelledSlug = claimed.slug;
+        return { inFlight: claimed, cancelledSlug };
+      }
       if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
         throw err;
       }

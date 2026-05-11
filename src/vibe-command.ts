@@ -17,6 +17,7 @@ import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
 import { WatcherRuntime } from './tui/runtime.js';
 import {
+  cleanupCancelledLeftoverWorktrees,
   handleCancelSignal,
   markPlanFinal,
   tryAcquireVibeLock,
@@ -103,6 +104,7 @@ export async function recoverImplementingPlans(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`warning: failed to clean orphan worktree for '${p.slug}': ${msg}\n`);
+      return false;
     }
     try {
       await store.update(
@@ -209,6 +211,12 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
       }
     }
   }
+
+  // Self-heal worktrees left over from a cancel-keep that the user already
+  // resolved (cancelling→cancelled) while the daemon was down. The runtime
+  // loop also runs this after each in-flight resolution; doing it here too
+  // catches the across-restart case.
+  await cleanupCancelledLeftoverWorktrees(store, await store.read());
 
   // Validate the user's main checkout: clean tree + on dev_branch, in every
   // workspace repo. Worktrees keep partial pipeline state out of the user's
@@ -334,24 +342,33 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     } else if (inFlight !== null) {
       // Same reasoning as the orphan-recovery path above: keep
       // `lauren/<slug>` so committed Steps survive the resume.
-      await cleanupPlanWorktrees(inFlight, { keepBranches: true }).catch(() => undefined);
       try {
-        await store.update(
-          inFlight.slug,
-          {
-            status: 'ready',
-            started_at: null,
-            finished_at: null,
-            failure: null,
-            worktrees: undefined,
-          },
-          { allowImplementing: true },
+        await cleanupPlanWorktrees(inFlight, { keepBranches: true });
+        try {
+          await store.update(
+            inFlight.slug,
+            {
+              status: 'ready',
+              started_at: null,
+              finished_at: null,
+              failure: null,
+              worktrees: undefined,
+            },
+            { allowImplementing: true },
+          );
+          process.stdout.write(
+            `stopped during '${inFlight.slug}'; left as ready. Run \`lauren vibe\` to resume.\n`,
+          );
+        } catch {
+          process.stdout.write('vibe stopped.\n');
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `error: failed to clean worktree for '${inFlight.slug}'; ` +
+            `left plan implementing for recovery: ${msg}\n`,
         );
-        process.stdout.write(
-          `stopped during '${inFlight.slug}'; left as ready. Run \`lauren vibe\` to resume.\n`,
-        );
-      } catch {
-        process.stdout.write('vibe stopped.\n');
+        exitCode = 1;
       }
     } else {
       process.stdout.write('vibe stopped.\n');

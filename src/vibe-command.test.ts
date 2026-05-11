@@ -55,6 +55,7 @@ describe('finalizeCancelledImplementingPlans', () => {
     vi.mocked(gitWorktreeRemove).mockReset();
     vi.mocked(gitDeleteBranch).mockReset();
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
 
   afterEach(() => {
@@ -115,6 +116,21 @@ describe('finalizeCancelledImplementingPlans', () => {
     expect(gitWorktreeRemove).not.toHaveBeenCalled();
     expect(gitDeleteBranch).not.toHaveBeenCalled();
   });
+
+  test('leaves cancellation pending when worktree removal fails', async () => {
+    vi.mocked(gitWorktreeRemove).mockImplementationOnce(() => {
+      throw new Error('locked');
+    });
+    const plan = makePlan({
+      worktrees: [worktree(null, '/repo')],
+    });
+    const store = makeStore();
+
+    await expect(finalizeCancelledImplementingPlans(store, [plan])).resolves.toBe(false);
+
+    expect(gitDeleteBranch).not.toHaveBeenCalled();
+    expect(store.update).not.toHaveBeenCalled();
+  });
 });
 
 describe('allowsDirtyStartupRecovery', () => {
@@ -148,6 +164,7 @@ describe('recoverImplementingPlans', () => {
   beforeEach(() => {
     vi.mocked(gitWorktreeRemove).mockReset();
     vi.mocked(gitDeleteBranch).mockReset();
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   });
 
   afterEach(() => {
@@ -186,5 +203,21 @@ describe('recoverImplementingPlans', () => {
       }),
       expect.objectContaining({ allowImplementing: true }),
     );
+  });
+
+  test('does not clear orphaned worktree metadata when cleanup fails', async () => {
+    vi.mocked(gitWorktreeRemove).mockImplementationOnce(() => {
+      throw new Error('locked');
+    });
+    const plan = makePlan({
+      cancel_requested: false,
+      worktrees: [worktree(null, '/repo')],
+    });
+    const store = makeStore();
+
+    await expect(recoverImplementingPlans(store, [plan])).resolves.toBe(false);
+
+    expect(gitDeleteBranch).not.toHaveBeenCalled();
+    expect(store.update).not.toHaveBeenCalled();
   });
 });
