@@ -55,7 +55,7 @@ describe('WatcherRuntime.setPaused', () => {
         'Pausing vibe until you fix it. Inspect the staged changes, address the error,',
         'then commit manually with this subject (so resume detects it):',
         '  feat-x: Step 1.2 - Add foo',
-        "Then press `t` on 'feat-x' in `lauren` to reset it to ready, or restart `lauren vibe`.",
+        "Then press `t` on 'feat-x' in `lauren` to reset it to ready.",
       ].join('\n'),
     );
 

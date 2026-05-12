@@ -76,25 +76,35 @@ export async function setupPlanWorktrees(
 
   const worktrees: PlanWorktree[] = [];
   const rewrittenRepos: ResolvedWorkspaceRepo[] = [];
-  for (const repo of repos) {
-    const wtPath = singleRepo ? rootDir : worktreePath(plan.slug, repo.name);
-    gitWorktreeAdd({
-      repoRoot: repo.root,
-      worktreePath: wtPath,
-      branch,
-      baseBranch: config.dev_branch,
-    });
-    worktrees.push({
-      repo: singleRepo ? null : repo.name,
-      path: wtPath,
-      branch,
-      parentRoot: repo.root,
-    });
-    rewrittenRepos.push({
-      name: repo.name,
-      path: singleRepo ? repo.path : repo.name,
-      root: wtPath,
-    });
+  try {
+    for (const repo of repos) {
+      const wtPath = singleRepo ? rootDir : worktreePath(plan.slug, repo.name);
+      gitWorktreeAdd({
+        repoRoot: repo.root,
+        worktreePath: wtPath,
+        branch,
+        baseBranch: config.dev_branch,
+      });
+      worktrees.push({
+        repo: singleRepo ? null : repo.name,
+        path: wtPath,
+        branch,
+        parentRoot: repo.root,
+      });
+      rewrittenRepos.push({
+        name: repo.name,
+        path: singleRepo ? repo.path : repo.name,
+        root: wtPath,
+      });
+    }
+  } catch (err) {
+    // Roll back any worktrees already created so a partial multi-repo
+    // setup doesn't leak. The lauren/<slug> branches were just created
+    // from dev_branch with no commits yet, so dropping them is safe.
+    if (worktrees.length > 0) {
+      await cleanupPlanWorktrees({ ...plan, worktrees }).catch(() => undefined);
+    }
+    throw err;
   }
 
   // Copy plan markdown into the worktree at the same relative path the

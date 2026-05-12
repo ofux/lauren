@@ -1,4 +1,5 @@
 import path from 'node:path';
+import type { CheckpointEntry } from './checkpoints.js';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
 import type { StepEntry } from './steps.js';
 
@@ -9,6 +10,7 @@ export type PlanStatus =
   | 'implementing'
   | 'merging'
   | 'cancelling'
+  | 'awaiting_human'
   | 'failed'
   | 'done'
   | 'cancelled';
@@ -69,6 +71,19 @@ export interface Plan {
    * executor does not consult git history.
    */
   steps: StepEntry[] | null;
+  /**
+   * Human checkpoints declared in the plan markdown. Absent or empty array
+   * means the plan has no manual pause points. Status transitions:
+   * `pending` → `done` (after the user acknowledges via the TUI). When any
+   * entry is `pending` and reachable at the current Step boundary, the
+   * plan transitions to `awaiting_human` and the watcher pauses.
+   */
+  checkpoints?: CheckpointEntry[];
+  /**
+   * Set when the plan is in `awaiting_human`: the id of the checkpoint
+   * that triggered the pause. Cleared on acknowledgment (back to ready).
+   */
+  current_checkpoint_id?: string | null;
   /**
    * Worktrees created when the plan entered `implementing`. Persisted so
    * the merger and crash-recovery sweeps can find them. Cleared when the

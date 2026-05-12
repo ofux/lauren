@@ -79,6 +79,40 @@ describe('setupPlanWorktrees', () => {
     });
   });
 
+  test('rolls back already-created worktrees when a later repo fails', async () => {
+    const plan = makePlan();
+    const repos: ResolvedWorkspaceRepo[] = [
+      { name: 'frontend', path: 'apps/frontend', root: '/workspace/apps/frontend' },
+      { name: 'api', path: 'services/api', root: '/workspace/services/api' },
+    ];
+    vi.mocked(resolveWorkspaceRepos).mockResolvedValue(repos);
+
+    await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+    await fs.writeFile(planFilePath(plan), '# Partial failure\n', 'utf8');
+
+    // Two pre-loop best-effort removes (one per repo) plus a rollback
+    // remove for the successfully-created frontend worktree.
+    vi.mocked(gitWorktreeRemove).mockImplementation(() => undefined);
+    vi.mocked(gitWorktreeAdd)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error('git worktree add exited 128: fatal');
+      });
+
+    await expect(setupPlanWorktrees(plan, DEFAULT_CONFIG)).rejects.toThrow(
+      'git worktree add exited 128: fatal',
+    );
+
+    expect(gitWorktreeRemove).toHaveBeenCalledWith({
+      repoRoot: '/workspace/apps/frontend',
+      worktreePath: worktreePath(plan.slug, 'frontend'),
+    });
+    expect(gitDeleteBranch).toHaveBeenCalledWith(
+      'lauren/worktree-path-rewrite',
+      '/workspace/apps/frontend',
+    );
+  });
+
   test('rewrites multi-repo paths to match worktree-relative directories', async () => {
     const plan = makePlan();
     const repos: ResolvedWorkspaceRepo[] = [

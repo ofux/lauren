@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 
-import { VIBE_PID_PATH } from './core/paths.js';
+import { REPO, VIBE_PID_PATH } from './core/paths.js';
 import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
@@ -14,6 +15,39 @@ import {
   planFilePath,
 } from './core/types.js';
 import { signalDaemon } from './proc/pid.js';
+import { cleanupPlanWorktrees } from './worktree.js';
+
+async function deleteCheckpointSidecars(plan: Plan): Promise<void> {
+  for (const cp of plan.checkpoints ?? []) {
+    const abs = path.isAbsolute(cp.html_path) ? cp.html_path : path.resolve(REPO, cp.html_path);
+    try {
+      await fs.unlink(abs);
+    } catch {
+      // best-effort — sidecar may already be gone
+    }
+  }
+}
+
+async function cleanupCancelledWorktrees(store: PlanStore, plan: Plan): Promise<void> {
+  if ((plan.worktrees?.length ?? 0) === 0) return;
+  try {
+    await cleanupPlanWorktrees(plan, { keepBranches: true, requireClean: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `warning: failed to clean leftover worktree for cancelled '${plan.slug}': ${msg}\n`,
+    );
+    return;
+  }
+  try {
+    await store.update(plan.slug, { worktrees: undefined }, { allowImplementing: true });
+  } catch (err) {
+    if (!(err instanceof PlanNotFound)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`warning: failed to clear worktrees field on '${plan.slug}': ${msg}\n`);
+    }
+  }
+}
 
 export type CancelOutcome =
   | { kind: 'removed'; message: string }
@@ -63,26 +97,33 @@ async function requestDaemonCancellation(
     throw err;
   }
   const reachable = await signalDaemon(VIBE_PID_PATH, 'SIGUSR2');
-  let what: string;
-  if (phase === 'preparing') {
-    what = 'preparing; vibe signalled to abort brain';
-  } else if (phase === 'merging') {
-    what =
-      intent === 'keep'
-        ? 'merging; vibe signalled to stop and mark cancelling'
-        : 'merging; vibe signalled to stop and clean up';
-  } else if (intent === 'keep') {
-    what = 'implementing; vibe signalled to abort and mark cancelling';
-  } else {
-    what = 'implementing; vibe signalled to abort and clean up worktree';
+  if (!reachable) {
+    return {
+      kind: 'requested',
+      daemonReachable: reachable,
+      message: `cancel_requested set on '${slug}', but vibe daemon not reachable — start \`lauren vibe\` to finalize.`,
+    };
   }
-  return {
-    kind: 'requested',
-    daemonReachable: reachable,
-    message: reachable
-      ? `cancelling '${slug}' (was ${what})`
-      : `cancel_requested set on '${slug}', but vibe daemon not reachable — start \`lauren vibe\` to finalize.`,
-  };
+  let message: string;
+  if (phase === 'preparing') {
+    message = `cancelling '${slug}' (was preparing; vibe signalled to abort brain)`;
+  } else if (phase === 'merging') {
+    // The merge can complete (e.g. PR merged on GitHub) between SIGUSR2 firing
+    // and drainMerging's next check, in which case finalizeMerge for `done`
+    // clears cancel_requested and the request is silently dropped. Don't
+    // promise cancellation here — describe the request and the two outcomes.
+    const ifNotLanded =
+      intent === 'keep' ? 'mark cancelling and pause' : 'clean up the worktree and mark cancelled';
+    message =
+      `cancel requested for '${slug}' (was merging); ` +
+      `if the merge has not landed, vibe will ${ifNotLanded}; ` +
+      `otherwise the plan finalizes as done`;
+  } else if (intent === 'keep') {
+    message = `cancelling '${slug}' (was implementing; vibe signalled to abort and mark cancelling)`;
+  } else {
+    message = `cancelling '${slug}' (was implementing; vibe signalled to abort and clean up worktree)`;
+  }
+  return { kind: 'requested', daemonReachable: reachable, message };
 }
 
 /**
@@ -102,6 +143,8 @@ async function requestDaemonCancellation(
  *                  or leaves the worktree intact + marks 'cancelling'
  *                  (intent='keep' — preserves the lauren/<slug> branch's
  *                  committed Step work for manual handling)
+ *   awaiting_human → set status='cancelled' directly. Committed Steps stay
+ *                  on the lauren/<slug> branch.
  *   else (failed/done/cancelled/cancelling) → no-op
  */
 export async function cancelPlan(args: {
@@ -115,7 +158,7 @@ export async function cancelPlan(args: {
   intent?: CancelIntent;
 }): Promise<CancelOutcome> {
   const { slug, store, intent } = args;
-  const plan = await store.find(slug).catch(() => null);
+  const plan = await store.find(slug);
   if (plan === null) return { kind: 'noop', message: `no row for '${slug}'` };
 
   if (plan.status === 'enqueued') {
@@ -136,6 +179,7 @@ export async function cancelPlan(args: {
     } catch {
       // ignore — plan file may have been cleaned up already
     }
+    await deleteCheckpointSidecars(removed);
     return { kind: 'removed', message: `cancelled '${slug}' (was enqueued; removed)` };
   }
 
@@ -161,6 +205,27 @@ export async function cancelPlan(args: {
     return { kind: 'removed', message: `cancelled '${slug}' (was ready)` };
   }
 
+  if (plan.status === 'awaiting_human') {
+    // The daemon is paused at a Human Checkpoint. Earlier commits already
+    // landed on the lauren/<slug> branch; finalize as 'cancelled', then
+    // remove any clean worktrees while preserving the branch for inspection.
+    let cancelled: Plan;
+    try {
+      cancelled = await store.update(slug, {
+        status: 'cancelled',
+        finished_at: nowIso(),
+        current_checkpoint_id: null,
+      });
+    } catch (err) {
+      if (err instanceof PlanNotFound) {
+        return { kind: 'noop', message: `no row for '${slug}'` };
+      }
+      throw err;
+    }
+    await cleanupCancelledWorktrees(store, cancelled);
+    return { kind: 'removed', message: `cancelled '${slug}' (was awaiting_human)` };
+  }
+
   if (plan.status === 'implementing') {
     return requestDaemonCancellation(store, slug, 'implementing', intent);
   }
@@ -184,6 +249,7 @@ export function isCancellable(plan: Plan): boolean {
     plan.status === 'preparing' ||
     plan.status === 'ready' ||
     plan.status === 'implementing' ||
+    plan.status === 'awaiting_human' ||
     (plan.status === 'merging' && plan.failure?.phase !== 'cleanup')
   );
 }

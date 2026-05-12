@@ -13,6 +13,7 @@ import { WatcherRuntime } from './tui/runtime.js';
 import {
   handleCancelSignal,
   IDLE_POLL_SECONDS,
+  markPlanFinal,
   type WatcherLoopHandles,
   watcherLoop,
 } from './watcher.js';
@@ -119,6 +120,29 @@ function makeHandles(overrides: Partial<WatcherLoopHandles> = {}): WatcherLoopHa
     ...overrides,
   };
 }
+
+describe('markPlanFinal', () => {
+  test("does not stamp finished_at when moving to the paused 'cancelling' state", async () => {
+    const update = vi.fn(async () => undefined);
+    const store = { update } as unknown as PlanStore;
+
+    await markPlanFinal(store, 'demo', {
+      status: 'cancelling',
+      cancel_requested: false,
+      cancel_intent: undefined,
+    });
+
+    expect(update).toHaveBeenCalledWith(
+      'demo',
+      {
+        status: 'cancelling',
+        cancel_requested: false,
+        cancel_intent: undefined,
+      },
+      { allowImplementing: true, allowMerging: true },
+    );
+  });
+});
 
 describe('handleCancelSignal', () => {
   test('aborts the implementing controller when the in-flight plan was cancelled', async () => {
@@ -562,6 +586,7 @@ describe('watcherLoop implementing cancellation', () => {
         // cleared by the time SIGUSR2 would fire, so the abort is a no-op
         // and only the row-side flag remains.
         plan = { ...plan, cancel_requested: true, cancel_intent: 'revert' };
+        return { kind: 'completed' };
       });
 
       const result = await watcherLoop(
@@ -632,6 +657,7 @@ describe('watcherLoop implementing cancellation', () => {
 
       vi.mocked(runPlan).mockImplementation(async () => {
         plan = { ...plan, cancel_requested: true, cancel_intent: 'keep' };
+        return { kind: 'completed' };
       });
 
       const result = await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, handles);
@@ -644,6 +670,69 @@ describe('watcherLoop implementing cancellation', () => {
       // Branches must survive — that's the whole point of intent='keep'.
       expect(cleanupPlanWorktrees).not.toHaveBeenCalled();
       expect(setPausedCancelling).toHaveBeenCalled();
+    } finally {
+      await fs.unlink(path).catch(() => undefined);
+    }
+  });
+
+  test('preserves branches when a ready claim loses the CAS after worktree setup', async () => {
+    const slug = `watcher-claim-race-${Date.now()}`;
+    const path = `.lauren/plans/${slug}.md`;
+    await fs.mkdir('.lauren/plans', { recursive: true });
+    await fs.writeFile(path, '# Demo\n', 'utf8');
+
+    try {
+      const worktree = {
+        repo: null,
+        path: `/tmp/worktree/${slug}`,
+        branch: `lauren/${slug}`,
+        parentRoot: '/repo',
+      };
+      vi.mocked(setupPlanWorktrees).mockResolvedValue({
+        rootCwd: worktree.path,
+        rewrittenRepos: [],
+        worktrees: [worktree],
+      });
+
+      let plan = makePlan({
+        slug,
+        path,
+        status: 'ready',
+        cancel_requested: false,
+        cancel_intent: undefined,
+        started_at: null,
+        worktrees: undefined,
+      });
+      const controller = new AbortController();
+      const store = {
+        read: vi.fn(async () => [plan]),
+        update: vi.fn(
+          async (
+            _slug: string,
+            fields: Partial<Plan>,
+            opts?: {
+              precondition?: (p: Plan) => boolean;
+              preconditionDetail?: string;
+            },
+          ) => {
+            if (opts?.precondition) {
+              plan = { ...plan, status: 'cancelled', finished_at: '2026-05-08T12:10:00Z' };
+              controller.abort();
+              throw new PlanPreconditionFailed(plan.slug, opts.preconditionDetail ?? '');
+            }
+            plan = { ...plan, ...fields };
+            return { ...plan };
+          },
+        ),
+      } as unknown as PlanStore;
+
+      await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, makeHandles());
+
+      expect(cleanupPlanWorktrees).toHaveBeenCalledWith(
+        expect.objectContaining({ slug, worktrees: [worktree] }),
+        { keepBranches: true },
+      );
+      expect(runPlan).not.toHaveBeenCalled();
     } finally {
       await fs.unlink(path).catch(() => undefined);
     }

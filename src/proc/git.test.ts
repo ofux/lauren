@@ -8,7 +8,6 @@ import {
   gitBranchHasDiff,
   gitCommit,
   hasUnresolvedMergeConflicts,
-  revertWorkingTree,
   slugHasLaurenHistory,
   workingTreeDirty,
 } from './git.js';
@@ -104,21 +103,6 @@ describe('git worktree helpers', () => {
 
     expect(workingTreeDirty(repoDir)).toBe(true);
     expect(hasUnresolvedMergeConflicts(repoDir)).toBe(false);
-  });
-
-  test('revertWorkingTree discards non-lauren changes without treating -- as a pathspec', async () => {
-    await fs.mkdir(path.join(repoDir, '.lauren'), { recursive: true });
-    await fs.writeFile(path.join(repoDir, 'tracked.txt'), 'changed\n', 'utf8');
-    await fs.writeFile(path.join(repoDir, 'feature.txt'), 'feature\n', 'utf8');
-    await fs.writeFile(path.join(repoDir, '.lauren', 'plans.json'), '{}\n', 'utf8');
-
-    revertWorkingTree(repoDir);
-
-    await expect(fs.readFile(path.join(repoDir, 'tracked.txt'), 'utf8')).resolves.toBe('initial\n');
-    await expect(fs.access(path.join(repoDir, 'feature.txt'))).rejects.toThrow();
-    await expect(fs.readFile(path.join(repoDir, '.lauren', 'plans.json'), 'utf8')).resolves.toBe(
-      '{}\n',
-    );
   });
 
   test('slugHasLaurenHistory detects prior Step and plan commits for a slug', () => {

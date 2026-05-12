@@ -69,26 +69,6 @@ export function gitAddAll(cwd: string = REPO): void {
   }
 }
 
-/**
- * Drop uncommitted changes in the working tree (excluding `.lauren/` so
- * we don't blow away log files mid-cancellation). Used when a plan is
- * cancelled while implementing — vibe must revert the partial work
- * before marking the plan as cancelled.
- *
- * Two steps: `git checkout -- <pathspecs>` to discard tracked changes,
- * then `git clean -fd <pathspecs>` to remove untracked files.
- */
-export function revertWorkingTree(cwd: string = REPO): void {
-  const checkout = runSync(['git', 'checkout', ...WORKTREE_PATHSPECS], cwd);
-  if (checkout.code !== 0) {
-    throw new Error(`git checkout -- exited ${checkout.code}: ${checkout.stderr.trim()}`);
-  }
-  const clean = runSync(['git', 'clean', '-fd', ...WORKTREE_PATHSPECS], cwd);
-  if (clean.code !== 0) {
-    throw new Error(`git clean -fd exited ${clean.code}: ${clean.stderr.trim()}`);
-  }
-}
-
 export function getCurrentBranch(cwd: string = REPO): string {
   const r = runSync(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd);
   if (r.code !== 0) {

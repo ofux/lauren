@@ -1,16 +1,19 @@
 import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { Box, Text, useApp, useInput } from 'ink';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { applyOrganizeDecision, brainOrganizeQueue, summarizeOrganizeDecision } from '../brain.js';
 import { cancelPlan, isCancellable } from '../cancel.js';
-import { VIBE_PID_PATH } from '../core/paths.js';
+import { acknowledgeCheckpoint, isAwaitingHuman } from '../checkpoint.js';
+import { REPO, VIBE_PID_PATH } from '../core/paths.js';
 import type { PlanStore } from '../core/store.js';
 import { fmtAge } from '../core/time.js';
 import { type Plan, type PlanStatus, planFilePath } from '../core/types.js';
 import { readLivePid } from '../proc/pid.js';
 import { isRetryable, retryPlan } from '../retry.js';
+import { openInBrowser } from '../util/openInBrowser.js';
 import { parsePlanFrontmatter } from '../util/planFrontmatter.js';
 import { Spinner } from './Spinner.js';
 
@@ -44,6 +47,8 @@ function statusColor(status: PlanStatus): string | undefined {
     case 'merging':
       return 'blue';
     case 'preparing':
+      return 'magenta';
+    case 'awaiting_human':
       return 'magenta';
     case 'enqueued':
       return 'yellow';
@@ -179,11 +184,13 @@ function HelpFooter({
   hasPlans,
   selectedCancellable,
   selectedRetryable,
+  selectedAwaitingHuman,
   canReorganize,
 }: {
   hasPlans: boolean;
   selectedCancellable: boolean;
   selectedRetryable: boolean;
+  selectedAwaitingHuman: boolean;
   canReorganize: boolean;
 }): React.ReactElement {
   if (!hasPlans) {
@@ -194,6 +201,7 @@ function HelpFooter({
     );
   }
   const hints: string[] = ['↑/↓ navigate'];
+  if (selectedAwaitingHuman) hints.push('o open instructions', 'd mark done');
   if (selectedCancellable) hints.push('Enter or c cancel');
   if (selectedRetryable) hints.push('t reset to ready');
   if (canReorganize) hints.push('r reorganize');
@@ -391,6 +399,38 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
       setView({ kind: 'confirm-retry', plan });
       return;
     }
+    if (input === 'o' || input === 'O') {
+      const plan = plans[selectedIndex];
+      if (!plan || !isAwaitingHuman(plan)) return;
+      const cp = (plan.checkpoints ?? []).find((c) => c.id === plan.current_checkpoint_id);
+      if (!cp) {
+        setView({
+          kind: 'message',
+          message: `no checkpoint metadata on '${plan.slug}'; check .lauren/plans.json`,
+        });
+        return;
+      }
+      const target = path.isAbsolute(cp.html_path)
+        ? cp.html_path
+        : path.resolve(REPO, cp.html_path);
+      openInBrowser(target);
+      return;
+    }
+    if (input === 'd' || input === 'D') {
+      const plan = plans[selectedIndex];
+      if (!plan || !isAwaitingHuman(plan)) return;
+      void (async () => {
+        try {
+          const outcome = await acknowledgeCheckpoint({ slug: plan.slug, store });
+          setView({ kind: 'message', message: outcome.message });
+          await refresh();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setError(msg);
+        }
+      })();
+      return;
+    }
     if (input === 'r') {
       if (!canReorganize) return;
       setView({ kind: 'reorganize-loading' });
@@ -421,6 +461,7 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
   const current = plans[selectedIndex];
   const selectedCancellable = current ? isCancellable(current) : false;
   const selectedRetryable = current ? isRetryable(current) : false;
+  const selectedAwaitingHuman = current ? isAwaitingHuman(current) : false;
 
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -447,6 +488,7 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
         hasPlans={plans.length > 0}
         selectedCancellable={selectedCancellable}
         selectedRetryable={selectedRetryable}
+        selectedAwaitingHuman={selectedAwaitingHuman}
         canReorganize={canReorganize}
       />
       {view.kind === 'confirm-cancel' &&

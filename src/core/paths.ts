@@ -127,3 +127,22 @@ export function normalizePlanPath(s: string, context: LaurenContext = DEFAULT_CO
   const resolved = assertPlanPathInsideLaurenPlans(s, context);
   return path.relative(context.repo, resolved);
 }
+
+export function resolvePlanSidecarPath(
+  s: string,
+  planPath: string,
+  context: LaurenContext = DEFAULT_CONTEXT,
+): string {
+  const planAbs = assertPlanPathInsideLaurenPlans(planPath, context);
+  const planDir = path.dirname(planAbs);
+  const resolved = path.isAbsolute(s) ? path.resolve(s) : path.resolve(planDir, s);
+  if (!isPathInside(context.plansDir, resolved) || path.dirname(resolved) !== planDir) {
+    throw new Error(
+      `sidecar path must be next to ${displayPath(planAbs, context)} under ${displayPath(
+        context.plansDir,
+        context,
+      )}: ${displayPath(resolved, context)}`,
+    );
+  }
+  return resolved;
+}
