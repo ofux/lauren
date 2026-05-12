@@ -238,42 +238,6 @@ Whether single-unit or multi-step, every plan must include:
 - References to exact file paths and existing functions/utilities to
   reuse.
 
-## Human Checkpoints (use sparingly)
-
-The default is zero checkpoints. Only add a Human Checkpoint when an
-agent genuinely cannot complete the task on its own: creating an
-external account, configuring a paid subscription, flipping a flag in a
-hosted dashboard, plugging in hardware, running a manual smoke test in
-a deployed environment, etc. If a step can be automated, automate it
-instead — checkpoints stop the autonomous loop and require the human
-to come back.
-
-Format:
-
-    ### Human Checkpoint — <short title>
-
-    [Instructions](./<slug>.cp<N>.html)
-
-Rules:
-- Heading regex: \`^### Human Checkpoint — (.+)$\` (em-dash).
-- The section body MUST contain a markdown link \`[<label>](<path>)\`.
-  The link target is the sidecar HTML file. The first link in the
-  section wins.
-- Author the sidecar at the linked path. It MUST be a single
-  self-contained HTML page (no external CSS/JS/images) so the user
-  can open it offline. Name it \`<slug>.cp<N>.html\` next to the plan.
-- Placement:
-  - Multi-step plans: a checkpoint can appear before the first
-    \`### Step\`, between any two Steps, or after the last Step. Each
-    Step's commit must be authored to land before the checkpoint
-    triggers — checkpoints never run mid-Step.
-  - Single-unit plans: at most one checkpoint, and the section must
-    be the last \`###\` block in the file (so the implementation
-    commit lands before the pause).
-- A few sentences in the section body explaining what the user is
-  expected to do is welcome, but the HTML file is the canonical
-  instructions — link to it, don't duplicate it.
-
 ## Style
 
 - Specific over generic. Name files, functions, libraries, versions.

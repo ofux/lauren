@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process';
 
-import type { CheckpointEntry } from '../core/checkpoints.js';
 import type { MergeMode } from '../core/config.js';
 import { monotonicSeconds } from '../core/time.js';
 import type { Plan } from '../core/types.js';
@@ -15,13 +14,7 @@ import { stripAnsi } from '../util/ansi.js';
 
 export const LOG_TAIL_LINES = 8;
 
-export type RuntimeIdleState =
-  | 'idle'
-  | 'paused'
-  | 'running'
-  | 'organizing'
-  | 'merging'
-  | 'awaiting_human';
+export type RuntimeIdleState = 'idle' | 'paused' | 'running' | 'organizing' | 'merging';
 export type ItemDisplayStatus = 'pending' | 'running' | 'done' | 'failed';
 export type PhaseDisplayStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed';
 
@@ -99,7 +92,6 @@ export class WatcherRuntime implements ProgressSink {
   planProgress: PlanRuntimeState | null = null;
   idleState: RuntimeIdleState = 'idle';
   idleMessage = 'starting…';
-  awaitingCheckpoint: { plan: Plan; checkpoint: CheckpointEntry } | null = null;
 
   /** Slug of the failed plan we most recently transitioned-into-paused for.
    *  Used to dedup notification beeps when setPaused fires repeatedly while
@@ -132,7 +124,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = progress;
     this.idleState = 'running';
     this.pausedSlug = null;
-    this.awaitingCheckpoint = null;
     this.notify();
   }
 
@@ -146,7 +137,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'idle';
     this.pausedSlug = null;
-    this.awaitingCheckpoint = null;
     this.idleMessage =
       'waiting for plans…\n' + '  Run `lauren plan` (in another terminal) to add work.';
     this.notify();
@@ -162,7 +152,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'organizing';
     this.pausedSlug = null;
-    this.awaitingCheckpoint = null;
     this.notify();
   }
 
@@ -176,23 +165,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'merging';
     this.pausedSlug = null;
-    this.awaitingCheckpoint = null;
-    this.notify();
-  }
-
-  setAwaitingCheckpoint(plans: Plan[], plan: Plan, checkpoint: CheckpointEntry): void {
-    const isNewPause = this.pausedSlug !== `__cp__:${plan.slug}:${checkpoint.id}`;
-    this.plans = plans;
-    this.currentPlan = null;
-    this.organizingPlan = null;
-    this.organizingNote = null;
-    this.mergingPlan = null;
-    this.mergingMode = null;
-    this.planProgress = null;
-    this.idleState = 'awaiting_human';
-    this.pausedSlug = `__cp__:${plan.slug}:${checkpoint.id}`;
-    this.awaitingCheckpoint = { plan, checkpoint };
-    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -212,7 +184,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = failedPlan.slug;
-    this.awaitingCheckpoint = null;
     const f = failedPlan.failure;
     const phase = f ? f.phase : '?';
     const msg = f ? f.message : '(no message)';
@@ -246,7 +217,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = plan.slug;
-    this.awaitingCheckpoint = null;
     const ready = plans.filter((p) => p.status === 'ready').length;
     this.idleMessage =
       `PAUSED: plan '${plan.slug}' is cancelling — uncommitted changes left on disk.\n` +
@@ -268,7 +238,6 @@ export class WatcherRuntime implements ProgressSink {
     this.planProgress = null;
     this.idleState = 'paused';
     this.pausedSlug = '__dirty_workspace__';
-    this.awaitingCheckpoint = null;
     const ready = plans.filter((p) => p.status === 'ready').length;
     this.idleMessage =
       `PAUSED: working tree is dirty after cancellation cleared.\n` +

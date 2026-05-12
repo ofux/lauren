@@ -11,14 +11,9 @@ import {
   PreparingLocked,
 } from './core/types.js';
 import { signalDaemon } from './proc/pid.js';
-import { cleanupPlanWorktrees } from './worktree.js';
 
 vi.mock('./proc/pid.js', () => ({
   signalDaemon: vi.fn(async () => true),
-}));
-
-vi.mock('./worktree.js', () => ({
-  cleanupPlanWorktrees: vi.fn(async () => undefined),
 }));
 
 afterEach(() => {
@@ -257,49 +252,6 @@ describe('cancelPlan', () => {
       { cancel_requested: true, cancel_intent: 'revert' },
       { allowPreparing: true, allowImplementing: true, allowMerging: true },
     );
-  });
-
-  test('cleans recorded worktrees when cancelling an awaiting checkpoint plan', async () => {
-    let plan = makePlan({
-      status: 'awaiting_human',
-      current_checkpoint_id: 'cp-1',
-      worktrees: [
-        {
-          repo: null,
-          path: '/workspace/.lauren/worktrees/demo-plan',
-          branch: 'lauren/demo-plan',
-          parentRoot: '/workspace',
-        },
-      ],
-    });
-    const store = {
-      find: vi.fn(async () => plan),
-      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
-        plan = { ...plan, ...fields };
-        return plan;
-      }),
-    } as unknown as PlanStore;
-
-    const outcome = await cancelPlan({ slug: plan.slug, store });
-
-    expect(outcome).toEqual({
-      kind: 'removed',
-      message: `cancelled '${plan.slug}' (was awaiting_human)`,
-    });
-    expect(cleanupPlanWorktrees).toHaveBeenCalledWith(
-      expect.objectContaining({
-        slug: plan.slug,
-        status: 'cancelled',
-        worktrees: expect.any(Array),
-      }),
-      { keepBranches: true, requireClean: true },
-    );
-    expect(store.update).toHaveBeenLastCalledWith(
-      plan.slug,
-      { worktrees: undefined },
-      { allowImplementing: true },
-    );
-    expect(plan.worktrees).toBeUndefined();
   });
 
   test('does not cancel a cleanup-pending merge', async () => {

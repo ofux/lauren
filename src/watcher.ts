@@ -541,21 +541,6 @@ export async function watcherLoop(
       continue;
     }
 
-    // An `awaiting_human` row pauses the daemon at a checkpoint boundary.
-    // The user opens the linked HTML, performs the manual step, then
-    // acknowledges via the TUI which flips the row back to `ready`.
-    const awaiting = plans.find((p) => p.status === 'awaiting_human');
-    if (awaiting) {
-      const cp = (awaiting.checkpoints ?? []).find((c) => c.id === awaiting.current_checkpoint_id);
-      if (cp) {
-        runtime.setAwaitingCheckpoint(plans, awaiting, cp);
-      } else {
-        runtime.setIdle(plans);
-      }
-      await sleep(IDLE_POLL_SECONDS * 1000, signal);
-      continue;
-    }
-
     // A 'cancelling' row means the user cancelled an implementing plan with
     // intent='keep'. The working tree still has the partial work; vibe must
     // pause until the user resolves the dirty state and flips status to
@@ -682,7 +667,6 @@ export async function watcherLoop(
     // a Ctrl-C OR a per-plan cancel both interrupt the in-flight subprocess.
     const merged = AbortSignal.any([signal, cancelController.signal]);
 
-    let runResult: Awaited<ReturnType<typeof runPlan>>;
     try {
       const planProgress = newPlanRuntimeState({
         items: runtimeItemsForPlan(claimed),
@@ -698,7 +682,7 @@ export async function watcherLoop(
           }
         }
       };
-      runResult = await runPlan({
+      await runPlan({
         plan: claimed,
         dryRun: false,
         targetRepos: execCtx.rewrittenRepos,
@@ -761,52 +745,6 @@ export async function watcherLoop(
     // The user clicked cancel on what they saw as `implementing`, so we
     // honor the implementing-cancel semantics here instead.
     inFlight = null;
-    if (runResult.kind === 'paused-at-checkpoint') {
-      // The executor committed every Step it could and hit a pending Human
-      // Checkpoint. Demote the row to `awaiting_human` and stop. The outer
-      // loop will detect the awaiting row at the head of the queue and
-      // pause (mirroring the failed/cancelling pause). The user
-      // acknowledges via the TUI, which flips the row back to `ready`.
-      // The implement→awaiting precondition matches the implement→merge
-      // one above: if a cancel landed in the gap, drop into the cancel
-      // branch instead.
-      const checkpointId = runResult.checkpoint_id;
-      try {
-        await store.update(
-          claimed.slug,
-          {
-            status: 'awaiting_human',
-            current_checkpoint_id: checkpointId,
-            started_at: null,
-            finished_at: null,
-          },
-          {
-            allowImplementing: true,
-            precondition: (p) => !p.cancel_requested,
-            preconditionDetail: 'cancel_requested landed during implement→awaiting transition',
-          },
-        );
-      } catch (err) {
-        if (err instanceof PlanPreconditionFailed) {
-          const cancelledPlan = await store.find(claimed.slug);
-          const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
-          if (cancelIntent === 'keep') {
-            await markPlanFinal(store, claimed.slug, {
-              status: 'cancelling',
-              cancel_requested: false,
-              cancel_intent: undefined,
-            });
-            continue;
-          }
-          cancelledSlug = claimed.slug;
-          return { inFlight: claimed, cancelledSlug };
-        }
-        if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
-          throw err;
-        }
-      }
-      continue;
-    }
     try {
       await store.update(
         claimed.slug,

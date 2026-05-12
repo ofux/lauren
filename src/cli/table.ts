@@ -20,8 +20,6 @@ function statusCell(status: PlanStatus): { plain: string; rendered: string } {
       return { plain: 'implementing', rendered: `${BOLD}${CYAN}implementing${RESET}` };
     case 'preparing':
       return { plain: 'preparing', rendered: `${BOLD}${MAGENTA}preparing${RESET}` };
-    case 'awaiting_human':
-      return { plain: 'awaiting_human', rendered: `${BOLD}${MAGENTA}awaiting_human${RESET}` };
     case 'enqueued':
       return { plain: 'enqueued', rendered: `${YELLOW}enqueued${RESET}` };
     case 'ready':

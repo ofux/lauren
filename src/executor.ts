@@ -1,7 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { nextPendingCheckpointAfter } from './core/checkpoints.js';
 import { displayPath } from './core/paths.js';
 import type { Step, StepEntry } from './core/steps.js';
 import { type Plan, planFilePath, planLogDir } from './core/types.js';
@@ -382,18 +381,6 @@ export interface RunPlanOptions {
   onStepUpdate?: (steps: StepEntry[]) => Promise<void>;
 }
 
-/**
- * Outcome of a `runPlan` call. `completed` is the happy path; the watcher
- * transitions the row to `merging` (or `done` for single-unit) on this.
- * `paused-at-checkpoint` means the executor committed all the work it
- * could and then hit a pending Human Checkpoint — the watcher should
- * transition the row to `awaiting_human` and stop without finalizing. The
- * failure path still throws.
- */
-export type RunPlanResult =
-  | { kind: 'completed' }
-  | { kind: 'paused-at-checkpoint'; checkpoint_id: string };
-
 async function resolvePlanRepos(plan: Plan): Promise<ResolvedWorkspaceRepo[]> {
   try {
     return await resolveWorkspaceRepos(plan.target_repos);
@@ -416,13 +403,7 @@ function isRunnable(entry: StepEntry): boolean {
   return entry.status !== 'done' && entry.status !== 'orphaned';
 }
 
-function hasCompletedSingleUnitCheckpoint(plan: Plan): boolean {
-  return (
-    plan.checkpoints?.some((cp) => cp.after_step_id === '__unit__' && cp.status === 'done') ?? false
-  );
-}
-
-export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
+export async function runPlan(opts: RunPlanOptions): Promise<void> {
   const { plan, dryRun, progress, signal, onStepUpdate } = opts;
   const targetRepos = opts.targetRepos ?? (await resolvePlanRepos(plan));
   // Subprocess cwd: the worktree root passed by the watcher in real runs;
@@ -435,9 +416,6 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
 
   const storedSteps = plan.steps;
   if (storedSteps === null || storedSteps.length === 0) {
-    if (hasCompletedSingleUnitCheckpoint(plan)) {
-      return { kind: 'completed' };
-    }
     progress?.beginItem(plan.slug);
     try {
       await runUnit({
@@ -456,20 +434,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
       throw err;
     }
     progress?.endItem(plan.slug, 'done');
-    // Single-unit: honor a trailing checkpoint if present. The whole plan
-    // body just landed as one commit; pause now before declaring complete.
-    const trailingSingleUnit = nextPendingCheckpointAfter(plan.checkpoints, '__unit__');
-    if (trailingSingleUnit) {
-      return { kind: 'paused-at-checkpoint', checkpoint_id: trailingSingleUnit.id };
-    }
-    return { kind: 'completed' };
-  }
-
-  // Leading checkpoint (multi-step): pause before running the first Step.
-  // Skip if there are no Steps left to run anyway.
-  const leadingCheckpoint = nextPendingCheckpointAfter(plan.checkpoints, null);
-  if (leadingCheckpoint && storedSteps.some(isRunnable)) {
-    return { kind: 'paused-at-checkpoint', checkpoint_id: leadingCheckpoint.id };
+    return;
   }
 
   // Take a mutable working copy. `onStepUpdate` persists this list after every
@@ -484,15 +449,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
 
   for (let i = 0; i < steps.length; i++) {
     const entry = steps[i]!;
-    if (!isRunnable(entry)) {
-      if (entry.status === 'done') {
-        const nextCp = nextPendingCheckpointAfter(plan.checkpoints, entry.id);
-        if (nextCp) {
-          return { kind: 'paused-at-checkpoint', checkpoint_id: nextCp.id };
-        }
-      }
-      continue;
-    }
+    if (!isRunnable(entry)) continue;
     const startedAt = nowIso();
     steps[i] = {
       ...entry,
@@ -531,15 +488,5 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
     };
     await onStepUpdate?.(steps);
     progress?.endItem(entry.id, 'done');
-
-    // Pause if a checkpoint sits immediately after this Step's commit.
-    // The match is `after_step_id === entry.id`. Catches the post-last-step
-    // case naturally since the last Step's id equals after_step_id there.
-    const nextCp = nextPendingCheckpointAfter(plan.checkpoints, entry.id);
-    if (nextCp) {
-      return { kind: 'paused-at-checkpoint', checkpoint_id: nextCp.id };
-    }
   }
-
-  return { kind: 'completed' };
 }
