@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { CLAUDE_ASSETS } from './claude-assets.js';
 import { resolveRepoRoot } from './core/paths.js';
+import { PLAN_SYSTEM_PROMPT } from './lauren-prompts.js';
 
 export interface InitClaudeOptions {
   force: boolean;
@@ -46,6 +47,12 @@ export async function cmdInitClaude(opts: InitClaudeOptions): Promise<number> {
   out.write(
     '\nRestart your Claude Code session to load the `lauren` skill and the `/lauren` slash command.\n',
   );
+  return 0;
+}
+
+export function cmdPlanPrompt(out: NodeJS.WritableStream = process.stdout): number {
+  out.write(PLAN_SYSTEM_PROMPT);
+  if (!PLAN_SYSTEM_PROMPT.endsWith('\n')) out.write('\n');
   return 0;
 }
 
