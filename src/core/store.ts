@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 
+import type { CheckpointEntry } from './checkpoints.js';
 import { DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
 import type { StepEntry } from './steps.js';
 import {
@@ -267,6 +268,11 @@ export class PlanStore {
      * Omit to leave the target's Step list unchanged.
      */
     newSteps?: StepEntry[] | null | ((target: Plan) => StepEntry[] | null);
+    /**
+     * Replacement checkpoint list. Same shape as `newSteps`. Omit to leave
+     * the target's checkpoints unchanged.
+     */
+    newCheckpoints?: CheckpointEntry[] | ((target: Plan) => CheckpointEntry[]);
     bodyWriter: (target: Plan) => Promise<MergeBodyWrite | undefined>;
   }): Promise<{ target: Plan; from: Plan }> {
     if (args.targetSlug === args.fromSlug) {
@@ -287,11 +293,16 @@ export class PlanStore {
       const bodyWrite = await args.bodyWriter(target);
       const resolvedSteps =
         typeof args.newSteps === 'function' ? args.newSteps(target) : args.newSteps;
+      const resolvedCheckpoints =
+        typeof args.newCheckpoints === 'function'
+          ? args.newCheckpoints(target)
+          : args.newCheckpoints;
       const updatedTarget: Plan = {
         ...target,
         title: args.newTitle,
         target_repos: mergeTargetRepos(target.target_repos, from.target_repos),
         ...(args.newSteps !== undefined ? { steps: resolvedSteps ?? null } : {}),
+        ...(args.newCheckpoints !== undefined ? { checkpoints: resolvedCheckpoints } : {}),
       };
       try {
         plans[tIdx] = updatedTarget;

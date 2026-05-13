@@ -13,6 +13,8 @@
  * the queue without losing per-step progress.
  */
 
+import { type ParsedCheckpoint, SINGLE_UNIT_AFTER } from './checkpoints.js';
+
 export type StepStatus = 'pending' | 'done' | 'failed' | 'orphaned';
 
 export interface Step {
@@ -31,6 +33,8 @@ export interface StepEntry {
 }
 
 const STEP_HEADING_RE = /^### Step (\d+\.\d+) — (.+?)\s*$/;
+const CHECKPOINT_HEADING_RE = /^### Human Checkpoint — (.+?)\s*$/;
+const MARKDOWN_LINK_RE = /\[[^\]]+\]\(([^)]+)\)/;
 
 export function parseSteps(text: string): Step[] {
   const seen = new Set<string>();
@@ -117,4 +121,154 @@ export function materializeSteps(
   const parsed = parseSteps(planText);
   if (parsed.length === 0 && (existing === null || existing.length === 0)) return null;
   return reconcileSteps(parsed, existing);
+}
+
+/**
+ * Issues that make a checkpoint section unparseable. Returned alongside the
+ * parsed list so `_register` can reject the plan with a precise message and
+ * the parser stays pure (no thrown errors mid-traversal).
+ */
+export type CheckpointParseError =
+  | { kind: 'no-link'; title: string }
+  | { kind: 'multiple-checkpoints-in-single-unit'; titles: string[] }
+  | { kind: 'non-trailing-checkpoint-in-single-unit'; title: string }
+  | { kind: 'multiple-checkpoints-at-boundary'; after_step_id: string | null; titles: string[] };
+
+export interface ParseCheckpointsResult {
+  checkpoints: ParsedCheckpoint[];
+  errors: CheckpointParseError[];
+  /** True iff the markdown contains any `### Step X.Y` heading. */
+  multiStep: boolean;
+}
+
+/**
+ * Walk the plan markdown collecting both Step and Human Checkpoint headings
+ * in source order. Each checkpoint records the id of the most recent Step
+ * heading seen above it (or `null` for a leading checkpoint).
+ *
+ * The section body for a checkpoint must contain a markdown link `[label](path)`;
+ * the first such link's target becomes the sidecar `html_path`. Sections
+ * without a link are surfaced as a `no-link` error rather than silently
+ * dropped.
+ */
+export function parseCheckpoints(text: string): ParseCheckpointsResult {
+  type Section =
+    | { kind: 'step'; id: string }
+    | { kind: 'checkpoint'; title: string; bodyLines: string[]; followedByPeerHeading: boolean };
+
+  const sections: Section[] = [];
+  const seenStepIds = new Set<string>();
+  const lines = text.split('\n');
+  let current: Section | null = null;
+  const closeCheckpointForHeading = () => {
+    if (current?.kind === 'checkpoint') current.followedByPeerHeading = true;
+    current = null;
+  };
+  for (const line of lines) {
+    const stepMatch = STEP_HEADING_RE.exec(line);
+    if (stepMatch) {
+      closeCheckpointForHeading();
+      const [, id] = stepMatch;
+      if (id !== undefined && !seenStepIds.has(id)) {
+        seenStepIds.add(id);
+        sections.push({ kind: 'step', id });
+      }
+      continue;
+    }
+    const cpMatch = CHECKPOINT_HEADING_RE.exec(line);
+    if (cpMatch) {
+      closeCheckpointForHeading();
+      const [, rawTitle] = cpMatch;
+      if (rawTitle === undefined) continue;
+      const section: Section = {
+        kind: 'checkpoint',
+        title: rawTitle.trim(),
+        bodyLines: [],
+        followedByPeerHeading: false,
+      };
+      sections.push(section);
+      current = section;
+      continue;
+    }
+    // Any other `###`-or-shallower heading closes the current checkpoint
+    // section. Body lines accumulate into the last open checkpoint.
+    if (/^#{1,3}\s/.test(line)) {
+      closeCheckpointForHeading();
+      continue;
+    }
+    if (current?.kind === 'checkpoint') current.bodyLines.push(line);
+  }
+
+  type ParsedCheckpointWithPosition = ParsedCheckpoint & { trailing: boolean };
+  const checkpoints: ParsedCheckpointWithPosition[] = [];
+  const errors: CheckpointParseError[] = [];
+  let lastStepId: string | null = null;
+  let cpIndex = 0;
+  for (const section of sections) {
+    if (section.kind === 'step') {
+      lastStepId = section.id;
+      continue;
+    }
+    cpIndex += 1;
+    const linkMatch = section.bodyLines
+      .map((l) => MARKDOWN_LINK_RE.exec(l))
+      .find((m) => m !== null);
+    if (!linkMatch) {
+      errors.push({ kind: 'no-link', title: section.title });
+      continue;
+    }
+    const linkTarget = linkMatch[1];
+    if (linkTarget === undefined || linkTarget.trim() === '') {
+      errors.push({ kind: 'no-link', title: section.title });
+      continue;
+    }
+    checkpoints.push({
+      id: `cp-${cpIndex}`,
+      title: section.title,
+      html_path: linkTarget.trim(),
+      after_step_id: lastStepId,
+      trailing: !section.followedByPeerHeading,
+    });
+  }
+
+  const multiStep = seenStepIds.size > 0;
+  if (!multiStep) {
+    if (checkpoints.length > 1) {
+      errors.push({
+        kind: 'multiple-checkpoints-in-single-unit',
+        titles: checkpoints.map((c) => c.title),
+      });
+    }
+    for (const cp of checkpoints) {
+      if (!cp.trailing) {
+        errors.push({ kind: 'non-trailing-checkpoint-in-single-unit', title: cp.title });
+      }
+    }
+    // In a single-unit plan there is only one implementation commit, so any
+    // checkpoint is trailing. Rewrite `after_step_id` to the sentinel so the
+    // executor can match against it after the single commit lands.
+    for (const cp of checkpoints) cp.after_step_id = SINGLE_UNIT_AFTER;
+  } else {
+    const byBoundary = new Map<string, typeof checkpoints>();
+    for (const cp of checkpoints) {
+      const key = cp.after_step_id ?? '__leading__';
+      const existing = byBoundary.get(key);
+      if (existing === undefined) byBoundary.set(key, [cp]);
+      else existing.push(cp);
+    }
+    for (const grouped of byBoundary.values()) {
+      if (grouped.length <= 1) continue;
+      errors.push({
+        kind: 'multiple-checkpoints-at-boundary',
+        after_step_id: grouped[0]?.after_step_id ?? null,
+        titles: grouped.map((cp) => cp.title),
+      });
+    }
+  }
+
+  return {
+    checkpoints: checkpoints.map(({ trailing: _trailing, ...cp }) => cp),
+    errors,
+    multiStep,
+  };
 }

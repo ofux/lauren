@@ -11,6 +11,7 @@ import {
   ImplementingLocked,
   type Plan,
   type PlanFailure,
+  type PlanMergeBlock,
   PlanNotFound,
   PlanPreconditionFailed,
   planFilePath,
@@ -23,7 +24,7 @@ import {
 import { RunFailure, runPlan } from './executor.js';
 import { finalizeMerge, mergePlanOnce, PR_POLL_INTERVAL_MS } from './merger.js';
 import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
-import { workingTreeDirty } from './proc/git.js';
+import { dirtyPaths, workingTreeDirty } from './proc/git.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 import { cleanupPlanWorktrees, setupPlanWorktrees } from './worktree.js';
 
@@ -340,6 +341,98 @@ async function applyMergingCancellation(args: {
   return { persistedCleanupFailure: false };
 }
 
+/**
+ * Persist a 'merge_blocked' transition: stamp the block info on the row
+ * and surface the pause to the TUI (which fires the user notification).
+ * Swallows ImplementingLocked/PlanNotFound the same way markPlanFinal
+ * does, so a concurrent cancel between the merge attempt and this write
+ * doesn't propagate.
+ */
+async function stampMergeBlocked(
+  store: PlanStore,
+  runtime: WatcherRuntime,
+  plan: Plan,
+  block: PlanMergeBlock,
+  mode: 'auto' | 'github-pr',
+): Promise<void> {
+  try {
+    const updated = await store.update(
+      plan.slug,
+      { status: 'merge_blocked', merge_block: block },
+      { allowMerging: true },
+    );
+    runtime.setPausedMergeBlocked(await store.read(), updated, block, mode);
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) throw err;
+  }
+}
+
+/**
+ * Sweep every 'merge_blocked' row and check whether its parent checkout
+ * is now clean. If so, clear the block and promote back to 'merging' —
+ * the next drainMerging tick picks it up and retries autoMerge from the
+ * top. Best-effort: per-row failures log and continue (a leaked block is
+ * just slow, not catastrophic).
+ */
+async function promoteUnblockedMerges(store: PlanStore, plans: readonly Plan[]): Promise<boolean> {
+  let promotedAny = false;
+  for (const plan of plans) {
+    if (plan.status !== 'merge_blocked') continue;
+    const block = plan.merge_block;
+    if (!block) {
+      // Defensive: a merge_blocked row without merge_block is malformed.
+      // Clear the status so the daemon doesn't get stuck. Treat as
+      // returning to 'merging' — autoMerge will re-detect any block.
+      try {
+        await store.update(plan.slug, { status: 'merging' });
+        promotedAny = true;
+      } catch (err) {
+        if (!(err instanceof PlanNotFound)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`warning: failed to clear merge_block on '${plan.slug}': ${msg}\n`);
+        }
+      }
+      continue;
+    }
+    if (!plan.cancel_requested) {
+      // Recheck only the specific files git named in its refusal. Unrelated
+      // WIP elsewhere in the repo doesn't keep the pause active — that's
+      // the whole point of letting git decide what counts as a conflict.
+      // If block.files is empty/missing (defensive fallback), promote
+      // unconditionally; the next autoMerge attempt will re-stamp if git
+      // still refuses.
+      if (block.files && block.files.length > 0) {
+        let stillDirty: string[];
+        try {
+          stillDirty = dirtyPaths(block.parent_root, block.files);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `warning: failed to recheck dirty paths for '${plan.slug}' at ${block.parent_root}: ${msg}\n`,
+          );
+          continue;
+        }
+        if (stillDirty.length > 0) continue;
+      }
+    }
+    // Either the named files are clean again, or the user cancelled —
+    // promote back to 'merging' so drainMerging picks it up and either
+    // retries the merge or honors the cancel (intent=keep/revert).
+    try {
+      await store.update(plan.slug, { status: 'merging', merge_block: null });
+      promotedAny = true;
+    } catch (err) {
+      if (!(err instanceof PlanNotFound)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `warning: failed to promote merge_blocked '${plan.slug}' to merging: ${msg}\n`,
+        );
+      }
+    }
+  }
+  return promotedAny;
+}
+
 async function drainMerging(
   runtime: WatcherRuntime,
   store: PlanStore,
@@ -414,6 +507,17 @@ async function drainMerging(
       await finalizeMerge(store, merging.slug, result);
       resetMergeHandles(handles);
       continue;
+    }
+
+    if (result.kind === 'paused') {
+      // Auto-merge precondition (clean parent checkout) failed. Demote to
+      // 'merge_blocked' and bail out of drainMerging so the outer loop can
+      // pause-and-poll until the user resolves the dirty tree. The watcher
+      // will promote merge_blocked → merging once the precondition clears
+      // (see promoteUnblockedMerges below).
+      await stampMergeBlocked(store, runtime, merging, result.block, config.merge_mode);
+      resetMergeHandles(handles);
+      return;
     }
 
     if (result.kind === 'cleanup_failed') {
@@ -492,6 +596,10 @@ export async function watcherLoop(
   let cancelledSlug: string | null = null;
   let requireCleanWorkspaceAfterCancelling = false;
   while (!signal.aborted) {
+    // Promote any 'merge_blocked' rows whose parent checkout has been
+    // cleaned up by the user (back to 'merging'), then drain merging.
+    await promoteUnblockedMerges(store, await store.read());
+
     // Drain any in-flight merge before touching the rest of the queue.
     // For github-pr mode this polls every PR_POLL_INTERVAL_MS until the PR
     // resolves; the daemon does no other work in the meantime.
@@ -499,6 +607,23 @@ export async function watcherLoop(
     if (signal.aborted) break;
 
     const beforeDrain = await store.read();
+
+    // A 'merge_blocked' row at the front of the queue: surface the pause
+    // banner and poll. The merger emits this when autoMerge can't proceed
+    // on a dirty parent checkout; promoteUnblockedMerges (top of loop)
+    // resumes it once the user commits/stashes. Out-of-order completion
+    // is avoided by short-circuiting the rest of the queue here.
+    const merge_blocked = beforeDrain.find((p) => p.status === 'merge_blocked');
+    if (merge_blocked) {
+      const block = merge_blocked.merge_block;
+      if (block) {
+        runtime.setPausedMergeBlocked(beforeDrain, merge_blocked, block, config.merge_mode);
+      } else {
+        runtime.setIdle(beforeDrain);
+      }
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
 
     // A 'cancelling' row means the user cancelled an implementing plan with
     // intent='keep'. The working tree still has the partial work; vibe must
@@ -537,6 +662,21 @@ export async function watcherLoop(
     const failed = plans.find((p) => p.status === 'failed');
     if (failed) {
       runtime.setPaused(plans, failed);
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
+
+    // An `awaiting_human` row pauses the daemon at a checkpoint boundary.
+    // The user opens the linked HTML, performs the manual step, then
+    // acknowledges via the TUI which flips the row back to `ready`.
+    const awaiting = plans.find((p) => p.status === 'awaiting_human');
+    if (awaiting) {
+      const cp = (awaiting.checkpoints ?? []).find((c) => c.id === awaiting.current_checkpoint_id);
+      if (cp) {
+        runtime.setAwaitingCheckpoint(plans, awaiting, cp);
+      } else {
+        runtime.setIdle(plans);
+      }
       await sleep(IDLE_POLL_SECONDS * 1000, signal);
       continue;
     }
@@ -667,6 +807,7 @@ export async function watcherLoop(
     // a Ctrl-C OR a per-plan cancel both interrupt the in-flight subprocess.
     const merged = AbortSignal.any([signal, cancelController.signal]);
 
+    let runResult: Awaited<ReturnType<typeof runPlan>>;
     try {
       const planProgress = newPlanRuntimeState({
         items: runtimeItemsForPlan(claimed),
@@ -682,7 +823,7 @@ export async function watcherLoop(
           }
         }
       };
-      await runPlan({
+      runResult = await runPlan({
         plan: claimed,
         dryRun: false,
         targetRepos: execCtx.rewrittenRepos,
@@ -745,6 +886,52 @@ export async function watcherLoop(
     // The user clicked cancel on what they saw as `implementing`, so we
     // honor the implementing-cancel semantics here instead.
     inFlight = null;
+    if (runResult.kind === 'paused-at-checkpoint') {
+      // The executor committed every Step it could and hit a pending Human
+      // Checkpoint. Demote the row to `awaiting_human` and stop. The outer
+      // loop will detect the awaiting row at the head of the queue and
+      // pause (mirroring the failed/cancelling pause). The user
+      // acknowledges via the TUI, which flips the row back to `ready`.
+      // The implement→awaiting precondition matches the implement→merge
+      // one above: if a cancel landed in the gap, drop into the cancel
+      // branch instead.
+      const checkpointId = runResult.checkpoint_id;
+      try {
+        await store.update(
+          claimed.slug,
+          {
+            status: 'awaiting_human',
+            current_checkpoint_id: checkpointId,
+            started_at: null,
+            finished_at: null,
+          },
+          {
+            allowImplementing: true,
+            precondition: (p) => !p.cancel_requested,
+            preconditionDetail: 'cancel_requested landed during implement→awaiting transition',
+          },
+        );
+      } catch (err) {
+        if (err instanceof PlanPreconditionFailed) {
+          const cancelledPlan = await store.find(claimed.slug);
+          const cancelIntent = cancelledPlan?.cancel_intent ?? claimed.cancel_intent;
+          if (cancelIntent === 'keep') {
+            await markPlanFinal(store, claimed.slug, {
+              status: 'cancelling',
+              cancel_requested: false,
+              cancel_intent: undefined,
+            });
+            continue;
+          }
+          cancelledSlug = claimed.slug;
+          return { inFlight: claimed, cancelledSlug };
+        }
+        if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) {
+          throw err;
+        }
+      }
+      continue;
+    }
     try {
       await store.update(
         claimed.slug,

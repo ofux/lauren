@@ -586,6 +586,7 @@ describe('watcherLoop implementing cancellation', () => {
         // cleared by the time SIGUSR2 would fire, so the abort is a no-op
         // and only the row-side flag remains.
         plan = { ...plan, cancel_requested: true, cancel_intent: 'revert' };
+        return { kind: 'completed' };
       });
 
       const result = await watcherLoop(
@@ -656,6 +657,7 @@ describe('watcherLoop implementing cancellation', () => {
 
       vi.mocked(runPlan).mockImplementation(async () => {
         plan = { ...plan, cancel_requested: true, cancel_intent: 'keep' };
+        return { kind: 'completed' };
       });
 
       const result = await watcherLoop(runtime, store, TEST_CONFIG, controller.signal, handles);

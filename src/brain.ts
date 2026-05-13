@@ -1,6 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { materializeSteps } from './core/steps.js';
+import { type CheckpointEntry, reconcileCheckpoints } from './core/checkpoints.js';
+import { REPO } from './core/paths.js';
+import { materializeSteps, parseCheckpoints } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
 import {
   ImplementingLocked,
@@ -13,6 +15,29 @@ import {
 import { BRAIN_ORGANIZE_PROMPT, BRAIN_PLACE_PROMPT } from './lauren-prompts.js';
 import { runClaudeOneshotJson } from './proc/claude.js';
 import { parsePlanFrontmatter } from './util/planFrontmatter.js';
+
+/**
+ * Re-parse checkpoint sections from rewritten plan markdown and reconcile
+ * with the target's stored checkpoint list, so brain merges don't drop
+ * previously-acknowledged checkpoints. Resolves each checkpoint's link
+ * target to a repo-relative `html_path` (same convention as `_register`).
+ * Parse errors (missing link, multiple checkpoints in single-unit) are
+ * tolerated here — the merge already passed `_register` validation upstream
+ * for both inputs, so any error from the merged markdown means the brain
+ * produced malformed output; we drop the offending entries silently rather
+ * than failing the merge.
+ */
+function reconcileCheckpointsForMerge(target: Plan, mergedMarkdown: string): CheckpointEntry[] {
+  const parsed = parseCheckpoints(mergedMarkdown);
+  const targetDir = path.dirname(planFilePath(target));
+  const resolved = parsed.checkpoints.map((cp) => {
+    const abs = path.isAbsolute(cp.html_path)
+      ? cp.html_path
+      : path.resolve(targetDir, cp.html_path);
+    return { ...cp, html_path: path.relative(REPO, abs) };
+  });
+  return reconcileCheckpoints(resolved, target.checkpoints ?? null);
+}
 
 interface ReadySummary {
   plan: Plan;
@@ -368,6 +393,7 @@ export async function applyPlaceDecision(
         fromSlug: newPlan.slug,
         newTitle: decision.mergedTitle,
         newSteps: (target) => materializeSteps(decision.mergedMarkdown, target.steps),
+        newCheckpoints: (target) => reconcileCheckpointsForMerge(target, decision.mergedMarkdown),
         bodyWriter: async (target) => {
           const targetPath = planFilePath(target);
           return replacePlanFileWithRollback(targetPath, decision.mergedMarkdown);
@@ -473,6 +499,7 @@ export async function applyOrganizeDecision(
           fromSlug: op.fromSlug,
           newTitle: op.mergedTitle,
           newSteps: (target) => materializeSteps(op.mergedMarkdown, target.steps),
+          newCheckpoints: (target) => reconcileCheckpointsForMerge(target, op.mergedMarkdown),
           bodyWriter: async (target) => {
             const targetPath = planFilePath(target);
             return replacePlanFileWithRollback(targetPath, op.mergedMarkdown);

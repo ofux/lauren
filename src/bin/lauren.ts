@@ -7,6 +7,7 @@ import { render } from 'ink';
 import React from 'react';
 
 import { printTodoTable } from '../cli/table.js';
+import type { CheckpointEntry } from '../core/checkpoints.js';
 import {
   ARCH_PATH,
   DOCS_DIR,
@@ -15,14 +16,18 @@ import {
   normalizePlanPath,
   PLANS_DIR,
   PRD_PATH,
+  REPO,
   resolvePlanPath,
+  resolvePlanSidecarPath,
   TESTING_PATH,
 } from '../core/paths.js';
 import { validateSlug } from '../core/slug.js';
+import { parseCheckpoints } from '../core/steps.js';
 import { PlanStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
+import { cmdInitClaude } from '../init-claude.js';
 import { PLAN_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT } from '../lauren-prompts.js';
 import { runClaudeInteractive } from '../proc/claude.js';
 import { slugHasLaurenHistory } from '../proc/git.js';
@@ -194,6 +199,83 @@ async function cmdRegister(args: {
     return 1;
   }
 
+  const parsedCheckpoints = parseCheckpoints(rawBody);
+  if (parsedCheckpoints.errors.length > 0) {
+    for (const err of parsedCheckpoints.errors) {
+      if (err.kind === 'no-link') {
+        process.stderr.write(
+          `error: \`### Human Checkpoint — ${err.title}\` in ${plan.path} has no ` +
+            `markdown link to a sidecar HTML file. Add one like ` +
+            `\`[Instructions](./${args.slug}.cp1.html)\` inside the section, then retry.\n`,
+        );
+      } else if (err.kind === 'multiple-checkpoints-in-single-unit') {
+        process.stderr.write(
+          `error: ${plan.path} has ${err.titles.length} Human Checkpoint sections but no ` +
+            `\`### Step X.Y\` headings. Single-unit plans accept at most one (trailing) ` +
+            `checkpoint. Convert the plan to multi-step or merge the checkpoints, then retry.\n`,
+        );
+      } else if (err.kind === 'non-trailing-checkpoint-in-single-unit') {
+        process.stderr.write(
+          `error: \`### Human Checkpoint — ${err.title}\` in ${plan.path} is followed by ` +
+            `another \`###\` section, but single-unit checkpoints must be the final ` +
+            `\`###\` block. Move it to the end or convert the plan to multi-step, then retry.\n`,
+        );
+      } else if (err.kind === 'multiple-checkpoints-at-boundary') {
+        const boundary =
+          err.after_step_id === null ? 'before the first Step' : `after Step ${err.after_step_id}`;
+        process.stderr.write(
+          `error: ${plan.path} has ${err.titles.length} Human Checkpoint sections ${boundary}. ` +
+            `Only one checkpoint is allowed per Step boundary. Merge or move them, then retry.\n`,
+        );
+      }
+    }
+    return 1;
+  }
+  const checkpointEntries: CheckpointEntry[] = [];
+  const planFileAbsPath = planFilePath(plan);
+  for (const cp of parsedCheckpoints.checkpoints) {
+    let resolvedHtml: string;
+    try {
+      resolvedHtml = resolvePlanSidecarPath(cp.html_path, planFileAbsPath);
+    } catch {
+      process.stderr.write(
+        `error: checkpoint '${cp.title}' in ${plan.path} links to ` +
+          `${cp.html_path}, which is outside the plan directory. Author the sidecar as ` +
+          `\`<slug>.cp<N>.html\` next to the plan, then retry.\n`,
+      );
+      return 1;
+    }
+    if (path.extname(resolvedHtml) !== '.html') {
+      process.stderr.write(
+        `error: checkpoint '${cp.title}' in ${plan.path} links to ` +
+          `${cp.html_path}, which is not a .html file. Author the sidecar as ` +
+          `\`<slug>.cp<N>.html\` next to the plan, then retry.\n`,
+      );
+      return 1;
+    }
+    try {
+      await fs.access(resolvedHtml);
+    } catch {
+      process.stderr.write(
+        `error: checkpoint '${cp.title}' in ${plan.path} references missing file ` +
+          `${displayPath(resolvedHtml)}. Create the HTML sidecar (single self-contained ` +
+          `page, no external assets), then retry.\n`,
+      );
+      return 1;
+    }
+    checkpointEntries.push({
+      id: cp.id,
+      title: cp.title,
+      html_path: path.relative(REPO, resolvedHtml),
+      after_step_id: cp.after_step_id,
+      status: 'pending',
+      acknowledged_at: null,
+    });
+  }
+  if (checkpointEntries.length > 0) {
+    plan.checkpoints = checkpointEntries;
+  }
+
   const store = new PlanStore();
   try {
     await store.add(plan);
@@ -289,6 +371,20 @@ async function main(): Promise<void> {
           path: opts.path,
           title: opts.title,
           repos: opts.repo,
+        }),
+      );
+    });
+
+  program
+    .command('init')
+    .description('install the `lauren` skill and /lauren slash command for Claude Code')
+    .option('--global', 'install to ~/.claude/ instead of ./.claude/')
+    .option('--force', 'overwrite existing files')
+    .action(async (opts: { global?: boolean; force?: boolean }) => {
+      process.exit(
+        await cmdInitClaude({
+          global: opts.global ?? false,
+          force: opts.force ?? false,
         }),
       );
     });

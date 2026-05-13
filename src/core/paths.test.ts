@@ -9,6 +9,7 @@ import {
   PLANS_DIR,
   REPO,
   resolvePlanPath,
+  resolvePlanSidecarPath,
   resolveRepoRoot,
 } from './paths.js';
 
@@ -34,6 +35,7 @@ describe('LaurenContext', () => {
     laurenDir,
     logRoot: path.join(laurenDir, 'logs'),
     plansDir: path.join(laurenDir, 'plans'),
+    worktreesRoot: path.join(laurenDir, 'worktrees'),
     plansStatePath: path.join(laurenDir, 'plans.json'),
     plansStateLockPath: path.join(laurenDir, 'plans.json.lock'),
     vibeLockPath: path.join(laurenDir, 'vibe.lock'),
@@ -85,6 +87,23 @@ describe('plan path validation', () => {
 
   test('rejects non-markdown files inside .lauren/plans', () => {
     expect(() => normalizePlanPath('.lauren/plans/demo.txt')).toThrow(/\.md file/);
+  });
+});
+
+describe('resolvePlanSidecarPath', () => {
+  test('resolves sidecars next to the plan file', () => {
+    expect(resolvePlanSidecarPath('./demo.cp1.html', '.lauren/plans/demo.md')).toBe(
+      path.join(PLANS_DIR, 'demo.cp1.html'),
+    );
+  });
+
+  test('rejects checkpoint sidecars outside the plan directory', () => {
+    expect(() => resolvePlanSidecarPath('../outside.html', '.lauren/plans/demo.md')).toThrow(
+      /sidecar path must be next to/,
+    );
+    expect(() =>
+      resolvePlanSidecarPath(path.join(REPO, 'docs', 'outside.html'), '.lauren/plans/demo.md'),
+    ).toThrow(/sidecar path must be next to/);
   });
 });
 

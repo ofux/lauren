@@ -11,9 +11,14 @@ import {
   PreparingLocked,
 } from './core/types.js';
 import { signalDaemon } from './proc/pid.js';
+import { cleanupPlanWorktrees } from './worktree.js';
 
 vi.mock('./proc/pid.js', () => ({
   signalDaemon: vi.fn(async () => true),
+}));
+
+vi.mock('./worktree.js', () => ({
+  cleanupPlanWorktrees: vi.fn(async () => undefined),
 }));
 
 afterEach(() => {
@@ -254,6 +259,49 @@ describe('cancelPlan', () => {
     );
   });
 
+  test('cleans recorded worktrees when cancelling an awaiting checkpoint plan', async () => {
+    let plan = makePlan({
+      status: 'awaiting_human',
+      current_checkpoint_id: 'cp-1',
+      worktrees: [
+        {
+          repo: null,
+          path: '/workspace/.lauren/worktrees/demo-plan',
+          branch: 'lauren/demo-plan',
+          parentRoot: '/workspace',
+        },
+      ],
+    });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
+        plan = { ...plan, ...fields };
+        return plan;
+      }),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store });
+
+    expect(outcome).toEqual({
+      kind: 'removed',
+      message: `cancelled '${plan.slug}' (was awaiting_human)`,
+    });
+    expect(cleanupPlanWorktrees).toHaveBeenCalledWith(
+      expect.objectContaining({
+        slug: plan.slug,
+        status: 'cancelled',
+        worktrees: expect.any(Array),
+      }),
+      { keepBranches: true, requireClean: true },
+    );
+    expect(store.update).toHaveBeenLastCalledWith(
+      plan.slug,
+      { worktrees: undefined },
+      { allowImplementing: true },
+    );
+    expect(plan.worktrees).toBeUndefined();
+  });
+
   test('does not cancel a cleanup-pending merge', async () => {
     const plan = makePlan({
       status: 'merging',
@@ -325,5 +373,108 @@ describe('cancelPlan', () => {
     expect(outcome.kind).toBe('noop');
     expect(store.update).not.toHaveBeenCalled();
     expect(store.remove).not.toHaveBeenCalled();
+  });
+
+  test("stamps cancel_intent on a 'merge_blocked' plan and signals the daemon", async () => {
+    const plan = makePlan({
+      status: 'merge_blocked',
+      merge_block: {
+        reason: 'dirty-merge',
+        repo: null,
+        parent_root: '/workspace',
+        detected_at: '2026-05-08T12:00:00Z',
+        message: '/workspace has uncommitted changes',
+      },
+    });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
+        Object.assign(plan, fields);
+        return plan;
+      }),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'keep' });
+
+    expect(outcome.kind).toBe('requested');
+    expect(plan.cancel_requested).toBe(true);
+    expect(plan.cancel_intent).toBe('keep');
+    expect(store.update).toHaveBeenCalledWith(
+      plan.slug,
+      { cancel_requested: true, cancel_intent: 'keep' },
+      expect.objectContaining({ allowMerging: true }),
+    );
+  });
+
+  test("does not cancel a 'merge_blocked' plan after an earlier parent merged", async () => {
+    const plan = makePlan({
+      status: 'merge_blocked',
+      worktrees: [
+        {
+          repo: 'frontend',
+          path: '/workspace/apps/frontend/.lauren/worktrees/demo-plan',
+          branch: 'lauren/demo-plan',
+          parentRoot: '/workspace/apps/frontend',
+        },
+        {
+          repo: 'backend',
+          path: '/workspace/backend/.lauren/worktrees/demo-plan',
+          branch: 'lauren/demo-plan',
+          parentRoot: '/workspace/backend',
+        },
+      ],
+      merge_block: {
+        reason: 'dirty-merge',
+        repo: 'backend',
+        parent_root: '/workspace/backend',
+        detected_at: '2026-05-08T12:00:00Z',
+        message: '/workspace/backend has uncommitted changes',
+      },
+    });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'revert' });
+
+    expect(outcome).toEqual({
+      kind: 'noop',
+      message:
+        `'${plan.slug}' already merged into an earlier parent checkout; clean the blocked checkout ` +
+        `so vibe can finish the remaining merge.`,
+    });
+    expect(isCancellable(plan)).toBe(false);
+    expect(store.update).not.toHaveBeenCalled();
+    expect(signalDaemon).not.toHaveBeenCalled();
+  });
+
+  test("does not cancel a 'merge_blocked' dirty fast-forward", async () => {
+    const plan = makePlan({
+      status: 'merge_blocked',
+      merge_block: {
+        reason: 'dirty-fast-forward',
+        repo: null,
+        parent_root: '/workspace',
+        detected_at: '2026-05-08T12:00:00Z',
+        message: '/workspace has uncommitted changes',
+      },
+    });
+    const store = {
+      find: vi.fn(async () => plan),
+      update: vi.fn(),
+    } as unknown as PlanStore;
+
+    const outcome = await cancelPlan({ slug: plan.slug, store, intent: 'revert' });
+
+    expect(outcome).toEqual({
+      kind: 'noop',
+      message:
+        `'${plan.slug}' already merged remotely; clean the blocked checkout ` +
+        `so vibe can finish the local fast-forward.`,
+    });
+    expect(isCancellable(plan)).toBe(false);
+    expect(store.update).not.toHaveBeenCalled();
+    expect(signalDaemon).not.toHaveBeenCalled();
   });
 });

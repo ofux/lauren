@@ -46,12 +46,26 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         ⊘{' '}
       </Text>
     );
+  else if (plan.status === 'merge_blocked')
+    icon = (
+      <Text color="yellow" bold>
+        ⏸{' '}
+      </Text>
+    );
+  else if (plan.status === 'awaiting_human')
+    icon = (
+      <Text color="magenta" bold>
+        🚦{' '}
+      </Text>
+    );
   else if (plan.status === 'cancelled') icon = <Text dimColor>⊘ </Text>;
   else icon = <Text dimColor>· </Text>;
 
   const titleProps: { bold?: boolean; color?: string; dimColor?: boolean } = {};
   if (plan.status === 'implementing' || plan.status === 'merging') titleProps.bold = true;
   else if (plan.status === 'failed' || plan.status === 'cancelling') titleProps.color = 'red';
+  else if (plan.status === 'merge_blocked') titleProps.color = 'yellow';
+  else if (plan.status === 'awaiting_human') titleProps.color = 'magenta';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
   const age = fmtAge(plan.created_at);
@@ -95,7 +109,9 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     ready: 0,
     implementing: 0,
     merging: 0,
+    merge_blocked: 0,
     cancelling: 0,
+    awaiting_human: 0,
     done: 0,
     failed: 0,
     cancelled: 0,
@@ -120,8 +136,14 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
           <Text color="cyan">{`  ·  ${counts.implementing} running`}</Text>
         )}
         {counts.merging > 0 && <Text color="blue">{`  ·  ${counts.merging} merging`}</Text>}
+        {counts.merge_blocked > 0 && (
+          <Text color="yellow" bold>{`  ·  ${counts.merge_blocked} merge blocked`}</Text>
+        )}
         {counts.ready > 0 && <Text>{`  ·  ${counts.ready} ready`}</Text>}
         {counts.failed > 0 && <Text color="red" bold>{`  ·  ${counts.failed} failed`}</Text>}
+        {counts.awaiting_human > 0 && (
+          <Text color="magenta" bold>{`  ·  ${counts.awaiting_human} awaiting human`}</Text>
+        )}
         {counts.cancelled > 0 && <Text dimColor>{`  ·  ${counts.cancelled} cancelled`}</Text>}
         <Text dimColor>{`  ·  uptime ${fmtDuration(elapsed)}`}</Text>
       </Box>
@@ -135,6 +157,26 @@ export function WatcherProgress({ runtime }: Props): React.ReactElement {
       <QueuePanel runtime={runtime} />
       {runtime.idleState === 'running' && runtime.planProgress !== null ? (
         <PlanProgress state={runtime.planProgress} />
+      ) : runtime.idleState === 'awaiting_human' && runtime.awaitingCheckpoint !== null ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={2}>
+          <Text color="magenta" bold>
+            🚦 AWAITING HUMAN
+          </Text>
+          <Box>
+            <Text>{runtime.awaitingCheckpoint.plan.slug}</Text>
+            <Text dimColor> — </Text>
+            <Text>{runtime.awaitingCheckpoint.plan.title}</Text>
+          </Box>
+          <Text bold>{runtime.awaitingCheckpoint.checkpoint.title}</Text>
+          <Text
+            dimColor
+          >{`  instructions: ${runtime.awaitingCheckpoint.checkpoint.html_path}`}</Text>
+          <Box marginTop={1}>
+            <Text>
+              Press <Text bold>o</Text> to open instructions, <Text bold>d</Text> when done.
+            </Text>
+          </Box>
+        </Box>
       ) : runtime.idleState === 'paused' ? (
         <Box flexDirection="column" borderStyle="round" borderColor="red" paddingX={2}>
           <Text color="red" bold>

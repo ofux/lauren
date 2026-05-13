@@ -15,7 +15,7 @@ export function isRetryable(plan: Plan): boolean {
  */
 export async function retryPlan(args: { slug: string; store: PlanStore }): Promise<RetryOutcome> {
   const { slug, store } = args;
-  const plan = await store.find(slug).catch(() => null);
+  const plan = await store.find(slug);
   if (plan === null) return { kind: 'noop', message: `no row for '${slug}'` };
   if (plan.status !== 'failed') {
     return {
