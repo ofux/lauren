@@ -23,6 +23,24 @@ export interface PlanExecutionContext {
   rewrittenRepos: ResolvedWorkspaceRepo[];
   /** Persisted on the plan row so cancellation + recovery can find them. */
   worktrees: PlanWorktree[];
+  /**
+   * True when the plan declared commit-phase resume (failed_phase /
+   * last_failed_phase === 'commit') but the persisted worktree was missing
+   * on disk, so we fell through to a fresh setup. The implement+fix diff
+   * that justified the resume is gone — the caller must scrub
+   * failed_phase / last_failed_phase before transitioning to `implementing`,
+   * otherwise the executor would see the new clean tree, take the
+   * "user committed manually" branch, and silently mark the unit done
+   * without rerunning implement. False in every other case (no resume
+   * claim, or resume claim honored by reuse).
+   */
+  commitResumeStale: boolean;
+  /**
+   * True when setup returned persisted worktrees from a commit-phase resume
+   * instead of allocating new ones. Callers must not roll these back on
+   * claim races because they may contain the preserved implement+fix diff.
+   */
+  reusedWorktrees: boolean;
 }
 
 /**
@@ -43,6 +61,55 @@ function isSingleRepoPlan(repos: readonly ResolvedWorkspaceRepo[]): boolean {
 }
 
 /**
+ * True when the plan has a known commit-phase failure to resume from —
+ * either a single-unit plan with last_failed_phase==='commit', or any
+ * Step with failed_phase==='commit'. In that case the existing worktree
+ * holds the implement+fix diff we want to preserve, so {@link setupPlanWorktrees}
+ * reuses it instead of recreating from `dev_branch`.
+ */
+function planResumesAtCommit(plan: Plan): boolean {
+  if (plan.last_failed_phase === 'commit') return true;
+  return (plan.steps ?? []).some((s) => s.failed_phase === 'commit');
+}
+
+async function copyPlanMarkdownIntoWorktree(plan: Plan, rootDir: string): Promise<void> {
+  // The prompt references this path (`@.lauren/plans/<slug>.md`) from the
+  // worktree root. `.lauren/` is gitignored so it won't leak into commits.
+  const planSrc = planFilePath(plan);
+  const planDst = path.join(rootDir, '.lauren', 'plans', `${plan.slug}.md`);
+  await fs.mkdir(path.dirname(planDst), { recursive: true });
+  await fs.copyFile(planSrc, planDst);
+}
+
+async function reusableWorktrees(plan: Plan): Promise<PlanExecutionContext | null> {
+  const persisted = plan.worktrees ?? [];
+  if (persisted.length === 0) return null;
+  for (const wt of persisted) {
+    try {
+      const st = await fs.stat(wt.path);
+      if (!st.isDirectory()) return null;
+    } catch {
+      return null;
+    }
+  }
+  const singleRepo = persisted.length === 1 && persisted[0]!.repo === null;
+  const rootDir = singleRepo ? persisted[0]!.path : worktreeRootPath(plan.slug);
+  const rewrittenRepos: ResolvedWorkspaceRepo[] = persisted.map((wt) => ({
+    name: wt.repo ?? '.',
+    path: wt.repo === null ? '.' : wt.repo,
+    root: wt.path,
+  }));
+  await copyPlanMarkdownIntoWorktree(plan, rootDir);
+  return {
+    rootCwd: rootDir,
+    rewrittenRepos,
+    worktrees: persisted,
+    commitResumeStale: false,
+    reusedWorktrees: true,
+  };
+}
+
+/**
  * Create the worktrees needed for a plan to enter `implementing`, copy the
  * plan markdown into each worktree, and return the execution context the
  * executor needs to run inside them.
@@ -50,11 +117,28 @@ function isSingleRepoPlan(repos: readonly ResolvedWorkspaceRepo[]): boolean {
  * Idempotent against partial prior state: if a worktree already exists at
  * the expected path (from a crashed run that left state behind), it is
  * removed first so the new run starts on a clean tree.
+ *
+ * Exception — commit-phase resume: when {@link planResumesAtCommit} holds
+ * and every persisted worktree still exists on disk, we reuse the existing
+ * worktrees as-is. The implement+fix diff sits uncommitted in them, and
+ * the executor will skip phases 1-3 and re-run commit only.
  */
 export async function setupPlanWorktrees(
   plan: Plan,
   config: LaurenConfig,
 ): Promise<PlanExecutionContext> {
+  let commitResumeStale = false;
+  if (planResumesAtCommit(plan)) {
+    const reused = await reusableWorktrees(plan);
+    if (reused !== null) return reused;
+    // Worktree(s) missing on disk — the diff that justified the resume is
+    // gone. Fall through to a fresh setup AND flag commitResumeStale so
+    // the caller scrubs failed_phase / last_failed_phase. Otherwise the
+    // executor would take the resume path, see the fresh worktree clean,
+    // and silently mark the unit done without rerunning implement.
+    commitResumeStale = true;
+  }
+
   const repos = await resolveWorkspaceRepos(plan.target_repos);
   const singleRepo = isSingleRepoPlan(repos);
   const branch = planBranchName(plan.slug);
@@ -107,15 +191,9 @@ export async function setupPlanWorktrees(
     throw err;
   }
 
-  // Copy plan markdown into the worktree at the same relative path the
-  // prompt references (`@.lauren/plans/<slug>.md`). `.lauren/` is gitignored
-  // so this doesn't leak into the commit.
-  const planSrc = planFilePath(plan);
-  const planDst = path.join(rootDir, '.lauren', 'plans', `${plan.slug}.md`);
-  await fs.mkdir(path.dirname(planDst), { recursive: true });
-  await fs.copyFile(planSrc, planDst);
+  await copyPlanMarkdownIntoWorktree(plan, rootDir);
 
-  return { rootCwd: rootDir, rewrittenRepos, worktrees };
+  return { rootCwd: rootDir, rewrittenRepos, worktrees, commitResumeStale, reusedWorktrees: false };
 }
 
 /**

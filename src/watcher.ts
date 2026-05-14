@@ -4,7 +4,7 @@ import lockfile from 'proper-lockfile';
 
 import type { LaurenConfig } from './core/config.js';
 import { VIBE_LOCK_PATH } from './core/paths.js';
-import { materializeSteps, type StepEntry } from './core/steps.js';
+import { materializeSteps, type StepEntry, type StepPhase } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
@@ -21,7 +21,7 @@ import {
   type ResolvedWorkspaceRepo,
   resolveWorkspaceRepos,
 } from './core/workspace.js';
-import { RunFailure, runPlan } from './executor.js';
+import { RunFailure, resumePhaseForFailure, runPlan } from './executor.js';
 import { finalizeMerge, mergePlanOnce, PR_POLL_INTERVAL_MS } from './merger.js';
 import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
 import { dirtyPaths, workingTreeDirty } from './proc/git.js';
@@ -85,6 +85,12 @@ function runtimeItemsForPlan(plan: Plan): PlanItem[] {
       .map((step) => ({ id: step.id, title: step.title }));
   }
   return [{ id: plan.slug, title: plan.title }];
+}
+
+const STEP_PHASE_SET: ReadonlySet<string> = new Set(['implement', 'review', 'fix', 'commit']);
+
+function isStepPhase(phase: string): phase is StepPhase {
+  return STEP_PHASE_SET.has(phase);
 }
 
 function failureFromError(err: unknown): PlanFailure {
@@ -738,7 +744,7 @@ export async function watcherLoop(
     // Re-parse Steps from the (possibly-edited) plan file and reconcile with
     // stored state. This is the only place per-step state is materialized at
     // execution time — everything downstream trusts `claimed.steps`.
-    const reconciledSteps = materializeSteps(planText, next.steps);
+    let reconciledSteps = materializeSteps(planText, next.steps);
 
     // Provision worktrees BEFORE flipping the row to `implementing` so that
     // a crash between status-flip and worktree-create can't leave us with
@@ -760,6 +766,20 @@ export async function watcherLoop(
       continue;
     }
 
+    // commitResumeStale: a prior run's worktree was missing on disk so we
+    // had to recreate it. The implement+fix diff is gone — scrub the
+    // commit-resume hints so the executor reruns from implement instead of
+    // taking the "clean tree = manual commit" shortcut on the fresh tree.
+    let nextLastFailedPhase: Plan['last_failed_phase'] = next.last_failed_phase ?? null;
+    if (execCtx.commitResumeStale) {
+      if (reconciledSteps !== null) {
+        reconciledSteps = reconciledSteps.map((entry) =>
+          entry.failed_phase === 'commit' ? { ...entry, failed_phase: null } : entry,
+        );
+      }
+      nextLastFailedPhase = null;
+    }
+
     let claimed: Plan;
     try {
       // Require the row to still be `ready` at lock time. Without this CAS,
@@ -775,6 +795,7 @@ export async function watcherLoop(
           failure: null,
           steps: reconciledSteps,
           worktrees: execCtx.worktrees,
+          last_failed_phase: nextLastFailedPhase,
         },
         {
           precondition: (p) => p.status === 'ready',
@@ -782,11 +803,14 @@ export async function watcherLoop(
         },
       );
     } catch (err) {
-      // Roll back worktree allocation if the claim failed.
-      await cleanupPlanWorktrees(
-        { ...next, worktrees: execCtx.worktrees },
-        { keepBranches: true },
-      ).catch(() => undefined);
+      // Roll back only worktrees allocated for this claim. Reused
+      // commit-resume worktrees may contain preserved uncommitted diffs.
+      if (!execCtx.reusedWorktrees) {
+        await cleanupPlanWorktrees(
+          { ...next, worktrees: execCtx.worktrees },
+          { keepBranches: true },
+        ).catch(() => undefined);
+      }
       if (
         err instanceof ImplementingLocked ||
         err instanceof PlanNotFound ||
@@ -859,9 +883,18 @@ export async function watcherLoop(
       if (signal.aborted) {
         return { inFlight, cancelledSlug };
       }
+      const resumePhase = resumePhaseForFailure(err);
+      const failure = failureFromError(err);
+      // Persist the failed phase for resume hints. Multi-step plans already
+      // got per-step `failed_phase` written by the executor's onStepUpdate
+      // callback before the throw; the plan-level field handles the
+      // single-unit case. Hard zero-diff commit failures intentionally get
+      // no hint because there is no preserved diff to commit on retry.
+      const planFailedPhase = resumePhase !== null && isStepPhase(resumePhase) ? resumePhase : null;
       await markPlanFinal(store, claimed.slug, {
         status: 'failed',
-        failure: failureFromError(err),
+        failure,
+        last_failed_phase: planFailedPhase,
       });
       inFlight = null;
       continue;

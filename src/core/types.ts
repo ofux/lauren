@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { CheckpointEntry } from './checkpoints.js';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
-import type { StepEntry } from './steps.js';
+import type { StepEntry, StepPhase } from './steps.js';
 
 export type PlanStatus =
   | 'enqueued'
@@ -104,6 +104,15 @@ export interface Plan {
    * on each poll. Cleared when the plan is promoted back to 'merging'.
    */
   merge_block?: PlanMergeBlock | null;
+  /**
+   * Single-unit equivalent of {@link StepEntry.failed_phase}. Set when the
+   * plan's single execution unit failed at a known phase; survives the
+   * retry transition (unlike `failure`, which is cleared on retry) so the
+   * executor can skip phases on resume. Currently load-bearing for
+   * `'commit'`: on retry the worktree is preserved and only the commit
+   * phase is re-run. Absent / null = no resume hint.
+   */
+  last_failed_phase?: StepPhase | null;
 }
 
 /**

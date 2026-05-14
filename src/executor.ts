@@ -21,7 +21,7 @@ import {
   stepCommitMessage,
 } from './executor-prompts.js';
 import { runCodexReview } from './proc/codex.js';
-import { type GitCommitResult, gitAddAll, gitCommit, workingTreeDirty } from './proc/git.js';
+import { gitAddAll, gitCommit, workingTreeDirty } from './proc/git.js';
 import { streamSubprocess } from './proc/stream.js';
 import { formatClaudeStreamLine } from './util/streamJson.js';
 
@@ -30,6 +30,13 @@ export type PhaseStatus = 'done' | 'failed' | 'skipped';
 export type ItemStatus = 'done' | 'failed';
 
 export const STEP_PHASES: readonly PhaseName[] = ['implement', 'review', 'fix', 'commit'] as const;
+export const NO_TARGET_REPO_CHANGES_TO_COMMIT = 'no target repo has changes to commit';
+
+const PHASE_NAME_SET: ReadonlySet<string> = new Set(STEP_PHASES);
+
+function isPhaseName(name: string): name is PhaseName {
+  return PHASE_NAME_SET.has(name);
+}
 
 export class RunFailure extends Error {
   readonly phase: PhaseName | 'unknown';
@@ -43,6 +50,14 @@ export class RunFailure extends Error {
     this.stepId = stepId;
     this.rawMessage = message;
   }
+}
+
+export function resumePhaseForFailure(err: unknown): PhaseName | null {
+  if (!(err instanceof RunFailure) || !isPhaseName(err.phase)) return null;
+  if (err.phase === 'commit' && err.rawMessage === NO_TARGET_REPO_CHANGES_TO_COMMIT) {
+    return null;
+  }
+  return err.phase;
 }
 
 /**
@@ -93,29 +108,46 @@ function commitGitTail(commit: { stdout?: string; stderr?: string }): string {
 
 /**
  * Human-readable message stored on `failure.message` (and surfaced in the TUI's
- * paused panel) when one of the per-repo commits fails mid-multi-repo. The
- * message has to stand on its own — there's no separate "what to do" UI — so it
- * names the repo, quotes the exact commit subject, and tells the user how to
- * resume after committing manually. Exported for unit testing.
+ * paused panel) when staging or committing fails for a repo. The message has
+ * to stand on its own — there's no separate "what to do" UI — so it names the
+ * repo, gives the exact worktree path to cd into, quotes the commit subject,
+ * and tells the user how to resume.
+ *
+ * Resume options for the user:
+ *  - Just press `t` on the row in `lauren` — the executor will skip
+ *    implement/review/fix (which already ran) and retry the commit phase on
+ *    the worktree as-is. Use this once the underlying staging/commit issue
+ *    is fixed.
+ *  - Or commit manually in the worktree with the quoted subject and then
+ *    press `t` — the executor will detect the clean tree and mark the step
+ *    done without re-running anything.
+ *
+ * Exported for unit testing.
  */
 export function formatCommitFailureMessage(args: {
   repoName: string;
   repoPath: string;
+  worktreePath: string;
   commitSubject: string;
   slug: string;
-  exitCode: number;
-  gitTail: string;
+  detail: string;
 }): string {
-  const { repoName, repoPath, commitSubject, slug, exitCode, gitTail } = args;
-  const tailPart = gitTail.length > 0 ? `: ${gitTail}` : '';
+  const { repoName, repoPath, worktreePath, commitSubject, slug, detail } = args;
   return [
-    `failed to commit changes in repo '${repoName}' (${repoPath}). ` +
-      `git exited ${exitCode}${tailPart}`,
-    'Pausing vibe until you fix it. Inspect the staged changes, address the error,',
-    'then commit manually with this subject (so resume detects it):',
+    `failed to commit changes in repo '${repoName}' (${repoPath}): ${detail}`,
+    'Pausing vibe. The implement+fix work is preserved in the worktree:',
+    `  ${worktreePath}`,
+    `To recover: cd into the worktree, resolve the issue, then press \`t\` on '${slug}'`,
+    'in `lauren` — the executor will skip implement/review/fix and retry the commit.',
+    'Alternatively, commit manually with this exact subject (so resume detects it):',
     `  ${commitSubject}`,
-    `Then press \`t\` on '${slug}' in \`lauren\` to reset it to ready.`,
   ].join('\n');
+}
+
+interface CommitRepoFailure {
+  repo: ResolvedWorkspaceRepo;
+  /** Human-readable single-line summary (e.g. "git add -A exited 1: <tail>"). */
+  detail: string;
 }
 
 /**
@@ -123,28 +155,36 @@ export function formatCommitFailureMessage(args: {
  * that actually have changes get a commit — we never create empty marker
  * commits in peer repos.
  *
+ * Returns the first failing repo (with a one-line detail) on either a
+ * staging or commit error; returns null on success. The caller wraps the
+ * failure with worktree-path + recovery instructions before pausing.
+ *
  * Partial-failure recovery: if commit succeeds in repo A and then fails in
- * repo B, A's commit is permanent (we don't rewrite history). The caller
- * throws RunFailure with a message that names B and quotes the exact commit
- * subject; the watcher pauses and the user fixes B manually using that
- * subject. The Step row is marked `failed` in the todo store, so when the user
- * presses `t` on the row in `lauren` (or restarts `lauren vibe` after a manual
- * fix) the Step re-runs — pick scopes that minimize cross-repo coupling so
- * manual recovery + retry doesn't fight a duplicate commit in repo A.
+ * repo B, A's commit is permanent (we don't rewrite history). The Step row
+ * gets `status: 'failed'` + `failed_phase: 'commit'`; pressing `t` in
+ * `lauren` reruns commit only — so pick scopes that minimize cross-repo
+ * coupling, otherwise a retry will fight a duplicate commit in repo A.
  */
 function commitAllTargetRepos(
   dirtyTargets: readonly ResolvedWorkspaceRepo[],
   message: string,
   progress?: ProgressSink,
-): { repo: ResolvedWorkspaceRepo; commit: GitCommitResult } | null {
+): CommitRepoFailure | null {
   for (const repo of dirtyTargets) {
-    gitAddAll(repo.root);
+    try {
+      gitAddAll(repo.root);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { repo, detail: msg };
+    }
     const commit = gitCommit(message, {
       capture: progress !== undefined,
       cwd: repo.root,
     });
     if (commit.code !== 0) {
-      return { repo, commit };
+      const tail = commitGitTail(commit);
+      const tailPart = tail.length > 0 ? `: ${tail}` : '';
+      return { repo, detail: `git commit exited ${commit.code}${tailPart}` };
     }
   }
   return null;
@@ -176,12 +216,30 @@ interface RunUnitArgs {
    */
   cwd: string;
   dryRun: boolean;
+  /**
+   * Resume hint from a prior failed run. When `'commit'`, the worktree
+   * still holds the implement+fix diff from before, so we skip phases 1-3
+   * and re-run the commit phase only. Any other value (or null) starts
+   * fresh from the implement phase as usual.
+   */
+  resumeFromPhase?: PhaseName | null;
   progress?: ProgressSink;
   signal?: AbortSignal;
 }
 
 async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
-  const { plan, step, planText, parentLogDir, targetRepos, cwd, dryRun, progress, signal } = args;
+  const {
+    plan,
+    step,
+    planText,
+    parentLogDir,
+    targetRepos,
+    cwd,
+    dryRun,
+    resumeFromPhase,
+    progress,
+    signal,
+  } = args;
   const repoPaths = targetRepos.map((repo) => repo.path);
 
   const itemId = step ? step.id : plan.slug;
@@ -204,6 +262,46 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
 
   await fs.mkdir(logDir, { recursive: true });
   if (!progress) banner(bannerText);
+
+  // Resume path: a prior run failed at the commit phase, so the worktree
+  // already holds the implement+fix diff. Skip phases 1-3 and re-run commit
+  // only. Bypass the dirty-before-start guard (we *expect* the worktree to
+  // be dirty here — that's the work we're preserving). If the user committed
+  // manually in the meantime, the worktree is clean and we treat the unit
+  // as alreadyDone.
+  if (resumeFromPhase === 'commit' && !dryRun) {
+    if (progress) {
+      progress.appendLog(
+        '(resuming from commit phase — implement/review/fix diff preserved from prior run)',
+      );
+      progress.endPhase(itemId, 'implement', 'skipped');
+      progress.endPhase(itemId, 'review', 'skipped');
+      progress.endPhase(itemId, 'fix', 'skipped');
+    } else {
+      process.stdout.write(`\n→ resuming ${label} at commit phase (worktree preserved)\n`);
+    }
+    if (dirtyRepos(targetRepos).length === 0) {
+      if (progress) {
+        progress.appendLog(
+          '(worktree is clean — assuming the prior commit landed manually; ' +
+            'skipping commit phase)',
+        );
+        progress.endPhase(itemId, 'commit', 'skipped');
+      } else {
+        process.stdout.write(`  worktree is clean — assuming manual commit; skipping\n`);
+      }
+      return { alreadyDone: true };
+    }
+    return runCommitPhase({
+      plan,
+      stepId,
+      itemId,
+      label,
+      targetRepos,
+      commitMessage,
+      progress,
+    });
+  }
 
   const dirtyBeforeStart = dirtyRepos(targetRepos);
   if (dirtyBeforeStart.length > 0) {
@@ -331,17 +429,13 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
   }
   const dirtyTargets = dirtyRepos(targetRepos);
   if (dirtyTargets.length === 0) {
+    // Hard failure on a first-pass run — implement+fix were supposed to
+    // produce something. (The resume path returns early above before we get
+    // here, so this only fires on a normal run.)
     progress?.endPhase(itemId, 'commit', 'failed');
-    throw new RunFailure('commit', 'no target repo has changes to commit', stepId);
+    throw new RunFailure('commit', NO_TARGET_REPO_CHANGES_TO_COMMIT, stepId);
   }
-  let failure: ReturnType<typeof commitAllTargetRepos>;
-  try {
-    failure = commitAllTargetRepos(dirtyTargets, commitMessage, progress);
-  } catch (err) {
-    progress?.endPhase(itemId, 'commit', 'failed');
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new RunFailure('commit', msg, stepId);
-  }
+  const failure = commitAllTargetRepos(dirtyTargets, commitMessage, progress);
   if (failure !== null) {
     progress?.endPhase(itemId, 'commit', 'failed');
     throw new RunFailure(
@@ -349,10 +443,52 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
       formatCommitFailureMessage({
         repoName: failure.repo.name,
         repoPath: failure.repo.path,
+        worktreePath: failure.repo.root,
         commitSubject: commitMessage,
         slug: plan.slug,
-        exitCode: failure.commit.code,
-        gitTail: commitGitTail(failure.commit),
+        detail: failure.detail,
+      }),
+      stepId,
+    );
+  }
+  progress?.endPhase(itemId, 'commit', 'done');
+  return { alreadyDone: false };
+}
+
+interface CommitOnlyArgs {
+  plan: Plan;
+  stepId: string | null;
+  itemId: string;
+  label: string;
+  targetRepos: readonly ResolvedWorkspaceRepo[];
+  commitMessage: string;
+  progress?: ProgressSink | undefined;
+}
+
+/**
+ * Resume-path commit phase. Caller has already verified that the worktree
+ * is dirty; we just stage + commit and translate failures.
+ */
+function runCommitPhase(args: CommitOnlyArgs): ExecutionUnitResult {
+  const { plan, stepId, itemId, label, targetRepos, commitMessage, progress } = args;
+  if (progress) {
+    progress.beginPhase(itemId, 'commit', `git · commit · ${label}`);
+  } else {
+    process.stdout.write(`\n→ committing ${label}\n`);
+  }
+  const dirtyTargets = dirtyRepos(targetRepos);
+  const failure = commitAllTargetRepos(dirtyTargets, commitMessage, progress);
+  if (failure !== null) {
+    progress?.endPhase(itemId, 'commit', 'failed');
+    throw new RunFailure(
+      'commit',
+      formatCommitFailureMessage({
+        repoName: failure.repo.name,
+        repoPath: failure.repo.path,
+        worktreePath: failure.repo.root,
+        commitSubject: commitMessage,
+        slug: plan.slug,
+        detail: failure.detail,
       }),
       stepId,
     );
@@ -448,6 +584,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
         targetRepos,
         cwd,
         dryRun,
+        resumeFromPhase: plan.last_failed_phase ?? null,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),
       });
@@ -494,6 +631,10 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
       continue;
     }
     const startedAt = nowIso();
+    // Resume hint persists across the pending transition: the executor
+    // reads it inside runUnit to decide whether to skip phases. Cleared
+    // again on success/failure below.
+    const resumeFromPhase: PhaseName | null = entry.failed_phase ?? null;
     steps[i] = {
       ...entry,
       status: 'pending',
@@ -514,11 +655,18 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
         targetRepos,
         cwd,
         dryRun,
+        resumeFromPhase,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),
       });
     } catch (err) {
-      steps[i] = { ...steps[i]!, status: 'failed', finished_at: nowIso() };
+      const failedPhase = resumePhaseForFailure(err);
+      steps[i] = {
+        ...steps[i]!,
+        status: 'failed',
+        finished_at: nowIso(),
+        failed_phase: failedPhase,
+      };
       await onStepUpdate?.(steps).catch(() => undefined);
       progress?.endItem(entry.id, 'failed');
       throw err;
@@ -528,6 +676,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
       status: 'done',
       finished_at: nowIso(),
       commit_subject: result.alreadyDone ? null : stepCommitMessage(plan, step),
+      failed_phase: null,
     };
     await onStepUpdate?.(steps);
     progress?.endItem(entry.id, 'done');
