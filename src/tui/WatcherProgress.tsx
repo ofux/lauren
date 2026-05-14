@@ -153,7 +153,14 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
 
 export function WatcherProgress({ runtime }: Props): React.ReactElement {
   return (
-    <Box flexDirection="column">
+    // paddingRight={1} keeps every rendered line one cell narrower than the
+    // terminal. Without it the bordered child boxes stretch to the full
+    // terminal width, which on terminals using immediate-wrap (writing the
+    // last column wraps the cursor right away) makes each line take two
+    // physical rows. log-update.eraseLines() only clears the logical line
+    // count, so one physical row leaks each tick — over a few seconds the
+    // QueuePanel's top border stacks above the live frame.
+    <Box flexDirection="column" paddingRight={1}>
       <QueuePanel runtime={runtime} />
       {runtime.idleState === 'running' && runtime.planProgress !== null ? (
         <PlanProgress state={runtime.planProgress} />

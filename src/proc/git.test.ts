@@ -71,6 +71,25 @@ describe('git worktree helpers', () => {
     ]);
   });
 
+  test('gitAddAll succeeds when .lauren is also gitignored', async () => {
+    // Regression: with `.lauren/` in .gitignore AND present in the worktree,
+    // `git add -A . :(exclude).lauren` exits 1 with "paths are ignored …"
+    // even though the exclude prevents staging. Must be tolerated.
+    await fs.writeFile(path.join(repoDir, '.gitignore'), '.lauren\n', 'utf8');
+    git(repoDir, 'add', '.gitignore');
+    git(repoDir, 'commit', '-m', 'ignore lauren');
+
+    await fs.mkdir(path.join(repoDir, '.lauren'), { recursive: true });
+    await fs.writeFile(path.join(repoDir, '.lauren', 'plans.json'), '{}\n', 'utf8');
+    await fs.writeFile(path.join(repoDir, 'feature.txt'), 'feature\n', 'utf8');
+
+    gitAddAll(repoDir);
+
+    expect(git(repoDir, 'diff', '--cached', '--name-only').split('\n').filter(Boolean)).toEqual([
+      'feature.txt',
+    ]);
+  });
+
   test('gitAddPaths only stages the listed paths, leaving other WIP unstaged', async () => {
     await fs.writeFile(path.join(repoDir, 'a.txt'), 'a\n', 'utf8');
     await fs.writeFile(path.join(repoDir, 'b.txt'), 'b\n', 'utf8');

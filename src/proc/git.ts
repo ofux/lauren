@@ -101,10 +101,19 @@ export function slugHasLaurenHistory(slug: string, cwd: string = REPO): boolean 
 }
 
 export function gitAddAll(cwd: string = REPO): void {
-  const r = runSync(['git', 'add', '-A', ...WORKTREE_PATHSPECS], cwd);
-  if (r.code !== 0) {
-    throw new Error(`git add -A exited ${r.code}: ${r.stderr.trim()}`);
+  const r = runSync(
+    ['git', '-c', 'advice.addIgnoredFile=false', 'add', '-A', ...WORKTREE_PATHSPECS],
+    cwd,
+  );
+  if (r.code === 0) return;
+  // Quirk: when a path is excluded by .gitignore AND is also covered by our
+  // `:(exclude).lauren` pathspec, git still exits 1 just because the positive
+  // pathspec `.` matched it. The file is not actually staged — the exclude
+  // does its job — so swallow this specific case.
+  if (r.code === 1 && /paths are ignored by one of your \.gitignore files/.test(r.stderr)) {
+    return;
   }
+  throw new Error(`git add -A exited ${r.code}: ${r.stderr.trim()}`);
 }
 
 /**
