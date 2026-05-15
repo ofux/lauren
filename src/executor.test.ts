@@ -34,34 +34,35 @@ describe('formatCommitFailureMessage', () => {
   const baseArgs = {
     repoName: 'backend',
     repoPath: 'apps/backend',
-    worktreePath: '/abs/path/.lauren/worktrees/feat-x/backend',
     commitSubject: 'feat-x: Step 1.2 — Add foo',
     slug: 'feat-x',
-    detail: 'git commit exited 1: pre-commit hook failed',
+    exitCode: 1,
+    gitTail: 'pre-commit hook failed',
   };
 
   test('names the repo, quotes the commit subject, and references the slug for retry', () => {
     const msg = formatCommitFailureMessage(baseArgs);
     expect(msg).toContain("repo 'backend' (apps/backend)");
     expect(msg).toContain('feat-x: Step 1.2 — Add foo');
-    expect(msg).toContain("press `t` on 'feat-x'");
+    expect(msg).toContain("press `t` on 'feat-x' in `lauren`");
   });
 
-  test('includes the detail line verbatim', () => {
+  test('includes the git tail when present', () => {
     const msg = formatCommitFailureMessage(baseArgs);
-    expect(msg).toContain('git commit exited 1: pre-commit hook failed');
+    expect(msg).toContain('git exited 1: pre-commit hook failed');
   });
 
-  test('points at the worktree path for manual recovery', () => {
-    const msg = formatCommitFailureMessage(baseArgs);
-    expect(msg).toContain('/abs/path/.lauren/worktrees/feat-x/backend');
+  test('omits the tail suffix when gitTail is empty (e.g. inherited stdio)', () => {
+    const msg = formatCommitFailureMessage({ ...baseArgs, gitTail: '' });
+    expect(msg).toContain('git exited 1');
+    expect(msg).not.toContain('git exited 1:');
   });
 
-  test('explains both recovery paths (retry-commit and manual-commit)', () => {
+  test('tells the user to pause-and-commit-manually (not auto-retry)', () => {
     const msg = formatCommitFailureMessage(baseArgs);
     expect(msg.toLowerCase()).toContain('pausing vibe');
-    expect(msg.toLowerCase()).toContain('retry the commit');
     expect(msg.toLowerCase()).toContain('commit manually');
+    expect(msg).not.toContain('restart `lauren vibe`');
   });
 });
 
@@ -446,245 +447,11 @@ describe('runPlan zero-diff already-done handling', () => {
     ).rejects.toMatchObject({
       phase: 'commit',
       stepId: '1.1',
-      // The raw add error is preserved inside the formatted failure message
-      // (which also names the worktree path so the user can `cd` in).
-      rawMessage: expect.stringContaining('git add -A exited 128: index.lock exists'),
+      rawMessage: 'git add -A exited 128: index.lock exists',
     });
 
     expect(progress.endPhase).toHaveBeenCalledWith('1.1', 'commit', 'failed');
     expect(progress.endItem).toHaveBeenCalledWith('1.1', 'failed');
     expect(gitCommit).not.toHaveBeenCalled();
-  });
-
-  test('records failed_phase on the step entry when a step fails', async () => {
-    vi.mocked(streamSubprocess).mockResolvedValue(0);
-    vi.mocked(workingTreeDirty).mockReturnValue(true);
-    vi.mocked(workingTreeDirty).mockReturnValueOnce(false);
-    vi.mocked(runCodexReview).mockResolvedValue({ code: 0, reviewText: '' });
-    vi.mocked(gitCommit).mockReturnValue({
-      code: 1,
-      stdout: '',
-      stderr: 'pre-commit hook failed',
-    });
-
-    const plan: Plan = {
-      slug: planSlug,
-      title: planSlug,
-      path: path.relative(process.cwd(), planPath),
-      target_repos: [],
-      status: 'implementing',
-      cancel_requested: false,
-      created_at: '2026-05-08T12:00:00Z',
-      started_at: '2026-05-08T12:05:00Z',
-      finished_at: null,
-      failure: null,
-      steps: [makeStep('1.1', 'Will fail at commit')],
-    };
-    const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: StepEntry[][] = [];
-
-    await expect(
-      runPlan({
-        plan,
-        dryRun: false,
-        targetRepos: [fakeRepo],
-        onStepUpdate: async (steps) => updates.push(steps.map((s) => ({ ...s }))),
-      }),
-    ).rejects.toMatchObject({ phase: 'commit', stepId: '1.1' });
-
-    const last = updates.at(-1)!;
-    expect(last[0]?.status).toBe('failed');
-    expect(last[0]?.failed_phase).toBe('commit');
-  });
-
-  test('does not record failed_phase for a zero-diff commit failure', async () => {
-    vi.mocked(streamSubprocess).mockResolvedValue(0);
-    vi.mocked(workingTreeDirty)
-      .mockReturnValueOnce(false)
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(false);
-    vi.mocked(runCodexReview).mockResolvedValue({ code: 0, reviewText: '' });
-
-    const plan: Plan = {
-      slug: planSlug,
-      title: planSlug,
-      path: path.relative(process.cwd(), planPath),
-      target_repos: [],
-      status: 'implementing',
-      cancel_requested: false,
-      created_at: '2026-05-08T12:00:00Z',
-      started_at: '2026-05-08T12:05:00Z',
-      finished_at: null,
-      failure: null,
-      steps: [makeStep('1.1', 'No diff at commit')],
-    };
-    const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: StepEntry[][] = [];
-
-    await expect(
-      runPlan({
-        plan,
-        dryRun: false,
-        targetRepos: [fakeRepo],
-        onStepUpdate: async (steps) => updates.push(steps.map((s) => ({ ...s }))),
-      }),
-    ).rejects.toMatchObject({
-      phase: 'commit',
-      stepId: '1.1',
-      rawMessage: 'no target repo has changes to commit',
-    });
-
-    const last = updates.at(-1)!;
-    expect(last[0]?.status).toBe('failed');
-    expect(last[0]?.failed_phase).toBeNull();
-  });
-
-  test('resume at commit: skips implement/review/fix, re-runs commit only', async () => {
-    // The worktree is dirty (the diff from the prior failed run is preserved).
-    // dirtyRepos is called twice in the resume path: once to check "is the
-    // worktree clean" (no → proceed), once inside the commit phase to enum
-    // dirty targets.
-    vi.mocked(workingTreeDirty).mockReturnValue(true);
-    vi.mocked(gitCommit).mockReturnValue({ code: 0, stdout: '', stderr: '' });
-
-    const failedStep: StepEntry = {
-      ...makeStep('1.1', 'Resumed at commit'),
-      status: 'failed',
-      failed_phase: 'commit',
-      started_at: '2026-05-08T12:05:00Z',
-      finished_at: '2026-05-08T12:06:00Z',
-    };
-    const plan: Plan = {
-      slug: planSlug,
-      title: planSlug,
-      path: path.relative(process.cwd(), planPath),
-      target_repos: [],
-      status: 'implementing',
-      cancel_requested: false,
-      created_at: '2026-05-08T12:00:00Z',
-      started_at: '2026-05-08T12:10:00Z',
-      finished_at: null,
-      failure: null,
-      steps: [failedStep],
-    };
-    const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: StepEntry[][] = [];
-    const progress: ProgressSink = {
-      appendLog: vi.fn(),
-      beginItem: vi.fn(),
-      endItem: vi.fn(),
-      markItemDone: vi.fn(),
-      beginPhase: vi.fn(),
-      endPhase: vi.fn(),
-    };
-
-    const result = await runPlan({
-      plan,
-      dryRun: false,
-      targetRepos: [fakeRepo],
-      progress,
-      onStepUpdate: async (steps) => updates.push(steps.map((s) => ({ ...s }))),
-    });
-
-    expect(result).toEqual({ kind: 'completed' });
-    // claude/codex never invoked — phases 1-3 were skipped.
-    expect(streamSubprocess).not.toHaveBeenCalled();
-    expect(runCodexReview).not.toHaveBeenCalled();
-    // Commit phase ran exactly once.
-    expect(gitAddAll).toHaveBeenCalledTimes(1);
-    expect(gitCommit).toHaveBeenCalledTimes(1);
-    // Phases 1-3 were marked skipped, commit done.
-    expect(progress.endPhase).toHaveBeenCalledWith('1.1', 'implement', 'skipped');
-    expect(progress.endPhase).toHaveBeenCalledWith('1.1', 'review', 'skipped');
-    expect(progress.endPhase).toHaveBeenCalledWith('1.1', 'fix', 'skipped');
-    expect(progress.endPhase).toHaveBeenCalledWith('1.1', 'commit', 'done');
-    // Step transitioned to done with failed_phase cleared.
-    const last = updates.at(-1)!;
-    expect(last[0]?.status).toBe('done');
-    expect(last[0]?.failed_phase).toBeNull();
-    expect(last[0]?.commit_subject).toBe(`${planSlug}: Step 1.1 — Resumed at commit`);
-  });
-
-  test('resume at commit: clean worktree → marks step done as alreadyDone', async () => {
-    // User committed manually before pressing `t`. The worktree is clean.
-    // We should treat the unit as alreadyDone and not invoke git at all.
-    vi.mocked(workingTreeDirty).mockReturnValue(false);
-
-    const failedStep: StepEntry = {
-      ...makeStep('1.1', 'Manually committed'),
-      status: 'failed',
-      failed_phase: 'commit',
-    };
-    const plan: Plan = {
-      slug: planSlug,
-      title: planSlug,
-      path: path.relative(process.cwd(), planPath),
-      target_repos: [],
-      status: 'implementing',
-      cancel_requested: false,
-      created_at: '2026-05-08T12:00:00Z',
-      started_at: '2026-05-08T12:10:00Z',
-      finished_at: null,
-      failure: null,
-      steps: [failedStep],
-    };
-    const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-    const updates: StepEntry[][] = [];
-
-    await runPlan({
-      plan,
-      dryRun: false,
-      targetRepos: [fakeRepo],
-      onStepUpdate: async (steps) => updates.push(steps.map((s) => ({ ...s }))),
-    });
-
-    expect(streamSubprocess).not.toHaveBeenCalled();
-    expect(runCodexReview).not.toHaveBeenCalled();
-    expect(gitAddAll).not.toHaveBeenCalled();
-    expect(gitCommit).not.toHaveBeenCalled();
-    const last = updates.at(-1)!;
-    expect(last[0]?.status).toBe('done');
-    // alreadyDone path leaves commit_subject null (same as no-diff-after-implement).
-    expect(last[0]?.commit_subject).toBeNull();
-    expect(last[0]?.failed_phase).toBeNull();
-  });
-
-  test('single-unit resume at commit: skips phases via plan.last_failed_phase', async () => {
-    // Use a single-unit plan markdown (no Step headings).
-    await fs.writeFile(
-      planPath,
-      `---\nname: ${planSlug}\ndescription: |\n  test\n---\n\n# ${planSlug}\n\nbody\n`,
-      'utf8',
-    );
-    vi.mocked(workingTreeDirty).mockReturnValue(true);
-    vi.mocked(gitCommit).mockReturnValue({ code: 0, stdout: '', stderr: '' });
-
-    const plan: Plan = {
-      slug: planSlug,
-      title: planSlug,
-      path: path.relative(process.cwd(), planPath),
-      target_repos: [],
-      status: 'implementing',
-      cancel_requested: false,
-      created_at: '2026-05-08T12:00:00Z',
-      started_at: '2026-05-08T12:10:00Z',
-      finished_at: null,
-      failure: null,
-      steps: null,
-      last_failed_phase: 'commit',
-    };
-    const fakeRepo = { name: 'main', path: '.', root: process.cwd() };
-
-    const result = await runPlan({
-      plan,
-      dryRun: false,
-      targetRepos: [fakeRepo],
-    });
-
-    expect(result).toEqual({ kind: 'completed' });
-    expect(streamSubprocess).not.toHaveBeenCalled();
-    expect(runCodexReview).not.toHaveBeenCalled();
-    expect(gitAddAll).toHaveBeenCalledTimes(1);
-    expect(gitCommit).toHaveBeenCalledTimes(1);
   });
 });

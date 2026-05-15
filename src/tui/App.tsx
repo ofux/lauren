@@ -34,14 +34,7 @@ export function App({ runtime }: Props): React.ReactElement {
     return () => clearInterval(id);
   }, []);
 
-  useInput((input, key) => {
-    // Ink keeps stdin in raw mode while `useInput` is mounted, which
-    // suppresses OS-level SIGINT on Ctrl-C. Re-raise it ourselves so
-    // the vibe daemon's SIGINT handler (graceful abort) still fires.
-    if (key.ctrl && input === 'c') {
-      process.kill(process.pid, 'SIGINT');
-      return;
-    }
+  useInput((input) => {
     const awaiting = runtime.awaitingCheckpoint;
     if (!awaiting) return;
     if (input === 'o' || input === 'O') {

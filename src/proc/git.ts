@@ -29,50 +29,12 @@ export function workingTreeDirty(cwd: string = REPO): boolean {
   return r.stdout.trim().length > 0;
 }
 
-/**
- * Subset of `paths` that have uncommitted changes (staged, unstaged, or
- * untracked) in the working tree at `cwd`. Used to recheck a 'merge_blocked'
- * pause: if none of the files git originally refused on are dirty anymore,
- * the merge can resume.
- */
-export function dirtyPaths(cwd: string, paths: readonly string[]): string[] {
-  if (paths.length === 0) return [];
-  const r = runSync(['git', 'status', '--porcelain', '--', ...paths], cwd);
-  if (r.code !== 0) {
-    throw new Error(`git status --porcelain exited ${r.code}: ${r.stderr.trim()}`);
-  }
-  const dirty: string[] = [];
-  for (const raw of r.stdout.split('\n')) {
-    if (raw.length < 4) continue;
-    // Porcelain v1 line: `XY path` (renames use `XY orig -> new`).
-    const path = raw.slice(3);
-    const renamed = path.split(' -> ');
-    dirty.push(renamed[renamed.length - 1]!);
-  }
-  return dirty;
-}
-
 export function hasUnresolvedMergeConflicts(cwd: string = REPO): boolean {
   const r = runSync(['git', 'diff', '--name-only', '--diff-filter=U', ...WORKTREE_PATHSPECS], cwd);
   if (r.code !== 0) {
     throw new Error(`git diff --name-only --diff-filter=U exited ${r.code}: ${r.stderr.trim()}`);
   }
   return r.stdout.trim().length > 0;
-}
-
-/**
- * Paths that are currently in unmerged state (conflict markers from a
- * mid-flight merge). Captured right after `git merge` returns conflicts
- * so the merger can stage only those paths after the conflict resolver
- * runs — avoiding the bug where `git add -A` would sweep in unrelated
- * WIP from the parent checkout (now allowed at merge time by option A).
- */
-export function listUnresolvedConflicts(cwd: string = REPO): string[] {
-  const r = runSync(['git', 'diff', '--name-only', '--diff-filter=U', ...WORKTREE_PATHSPECS], cwd);
-  if (r.code !== 0) {
-    throw new Error(`git diff --name-only --diff-filter=U exited ${r.code}: ${r.stderr.trim()}`);
-  }
-  return r.stdout.split('\n').filter((l) => l.length > 0);
 }
 
 export function gitLogSubjects(cwd: string = REPO): string[] {
@@ -101,32 +63,9 @@ export function slugHasLaurenHistory(slug: string, cwd: string = REPO): boolean 
 }
 
 export function gitAddAll(cwd: string = REPO): void {
-  const r = runSync(
-    ['git', '-c', 'advice.addIgnoredFile=false', 'add', '-A', ...WORKTREE_PATHSPECS],
-    cwd,
-  );
-  if (r.code === 0) return;
-  // Quirk: when a path is excluded by .gitignore AND is also covered by our
-  // `:(exclude).lauren` pathspec, git still exits 1 just because the positive
-  // pathspec `.` matched it. The file is not actually staged — the exclude
-  // does its job — so swallow this specific case.
-  if (r.code === 1 && /paths are ignored by one of your \.gitignore files/.test(r.stderr)) {
-    return;
-  }
-  throw new Error(`git add -A exited ${r.code}: ${r.stderr.trim()}`);
-}
-
-/**
- * Stage the named paths only — no `-A`, no path expansion beyond the
- * explicit list. Used by the merge conflict resolver to commit *only*
- * the files that started in conflict, leaving any unrelated WIP in the
- * working tree unstaged.
- */
-export function gitAddPaths(cwd: string, paths: readonly string[]): void {
-  if (paths.length === 0) return;
-  const r = runSync(['git', 'add', '--', ...paths], cwd);
+  const r = runSync(['git', 'add', '-A', ...WORKTREE_PATHSPECS], cwd);
   if (r.code !== 0) {
-    throw new Error(`git add -- exited ${r.code}: ${r.stderr.trim()}`);
+    throw new Error(`git add -A exited ${r.code}: ${r.stderr.trim()}`);
   }
 }
 
@@ -237,44 +176,8 @@ export function gitMergeAbort(cwd: string = REPO): RunResult {
 export function gitCheckout(branch: string, cwd: string = REPO): void {
   const r = runSync(['git', 'checkout', branch], cwd);
   if (r.code !== 0) {
-    const err = new Error(`git checkout ${branch} exited ${r.code}: ${r.stderr.trim()}`);
-    // Preserve the raw stderr so callers can parse "would be overwritten"
-    // refusals without re-parsing the wrapped message.
-    (err as Error & { gitStderr?: string }).gitStderr = r.stderr;
-    throw err;
+    throw new Error(`git checkout ${branch} exited ${r.code}: ${r.stderr.trim()}`);
   }
-}
-
-/**
- * Parse the stderr of a git merge/checkout/fast-forward that was refused
- * because it would clobber uncommitted work, and return the file list git
- * named. Covers both variants:
- *   - "Your local changes to the following files would be overwritten by ..."
- *   - "The following untracked working tree files would be overwritten by ..."
- * Returns null if the text doesn't match either pattern.
- *
- * This is the load-bearing detection for the auto-merge "merge_blocked"
- * pause: when git itself refuses on dirt overlap (the precise, narrow
- * condition we care about), the caller transitions the plan to
- * 'merge_blocked' with these files captured for both the TUI banner and
- * the auto-resume check.
- */
-export function parseDirtyMergeRefusal(text: string): { files: string[] } | null {
-  const marker =
-    /(?:Your local changes to the following files|The following untracked working tree files) would be overwritten by (?:merge|checkout):/;
-  const match = marker.exec(text);
-  if (!match) return null;
-  const after = text.slice(match.index + match[0].length);
-  const files: string[] = [];
-  for (const raw of after.split('\n')) {
-    const fileMatch = /^(?:\t| {2,})(\S.*)$/.exec(raw);
-    if (fileMatch) {
-      files.push(fileMatch[1]!.trim());
-    } else if (files.length > 0) {
-      break;
-    }
-  }
-  return { files };
 }
 
 export interface GitPushResult {

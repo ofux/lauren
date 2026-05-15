@@ -46,8 +46,6 @@ function statusColor(status: PlanStatus): string | undefined {
       return 'cyan';
     case 'merging':
       return 'blue';
-    case 'merge_blocked':
-      return 'yellow';
     case 'preparing':
       return 'magenta';
     case 'awaiting_human':

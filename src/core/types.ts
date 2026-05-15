@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { CheckpointEntry } from './checkpoints.js';
 import { assertPlanPathInsideLaurenPlans, DEFAULT_CONTEXT, type LaurenContext } from './paths.js';
-import type { StepEntry, StepPhase } from './steps.js';
+import type { StepEntry } from './steps.js';
 
 export type PlanStatus =
   | 'enqueued'
@@ -9,7 +9,6 @@ export type PlanStatus =
   | 'ready'
   | 'implementing'
   | 'merging'
-  | 'merge_blocked'
   | 'cancelling'
   | 'awaiting_human'
   | 'failed'
@@ -97,62 +96,6 @@ export interface Plan {
    * cleared when the plan finishes.
    */
   pr_urls?: Record<string, string>;
-  /**
-   * Set when status === 'merge_blocked'. Records *why* the auto-merge could
-   * not run (typically a dirty parent checkout) so the TUI can surface a
-   * human-readable banner and the watcher can re-test the same condition
-   * on each poll. Cleared when the plan is promoted back to 'merging'.
-   */
-  merge_block?: PlanMergeBlock | null;
-  /**
-   * Single-unit equivalent of {@link StepEntry.failed_phase}. Set when the
-   * plan's single execution unit failed at a known phase; survives the
-   * retry transition (unlike `failure`, which is cleared on retry) so the
-   * executor can skip phases on resume. Currently load-bearing for
-   * `'commit'`: on retry the worktree is preserved and only the commit
-   * phase is re-run. Absent / null = no resume hint.
-   */
-  last_failed_phase?: StepPhase | null;
-}
-
-/**
- * Reason the auto-merge is currently paused. Stored on the plan row in
- * 'merge_blocked' status so the watcher can poll the same precondition on
- * every tick and resume automatically once it clears.
- */
-export interface PlanMergeBlock {
-  /**
-   * Which git operation refused, and why:
-   *   - `dirty-merge` — `git merge` returned "would be overwritten".
-   *   - `dirty-checkout` — `git checkout dev_branch` returned the same.
-   *   - `dirty-fast-forward` — after a PR merged remotely, either checkout
-   *     of dev_branch or `git merge --ff-only` returned the same.
-   *
-   * Encodes the operation rather than a generic "dirty" so the banner can
-   * say *what* git refused, and so future variants (e.g. staged-index
-   * blockers, untracked-file blockers) can be distinguished if needed.
-   */
-  reason: 'dirty-merge' | 'dirty-checkout' | 'dirty-fast-forward';
-  /** Workspace repo name (or null for single-repo plans). Mirrors PlanWorktree.repo. */
-  repo: string | null;
-  /** Parent checkout path that needs to be clean before the merge can resume. */
-  parent_root: string;
-  /**
-   * Files git itself named in its refusal. The auto-resume sweep promotes
-   * the row back to 'merging' only once none of these specific paths are
-   * still dirty — unrelated WIP elsewhere in the repo doesn't keep the
-   * pause active. Empty/absent means "no specific file list available"
-   * (defensive fallback; promote unconditionally).
-   */
-  files?: string[];
-  /** ISO timestamp of when the block was first detected (UX only). */
-  detected_at: string;
-  /**
-   * Human-readable message displayed in the TUI banner. Stored so the
-   * banner text is stable across watcher restarts without having to be
-   * regenerated from {@link reason} each time.
-   */
-  message: string;
 }
 
 export interface TodoFile {

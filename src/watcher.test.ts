@@ -5,7 +5,7 @@ import { DEFAULT_CONFIG, type LaurenConfig } from './core/config.js';
 import type { PlanStore } from './core/store.js';
 import { type Plan, PlanPreconditionFailed } from './core/types.js';
 import { resolveWorkspaceRepos } from './core/workspace.js';
-import { RunFailure, runPlan } from './executor.js';
+import { runPlan } from './executor.js';
 import { finalizeMerge, mergePlanOnce } from './merger.js';
 import { processEnqueuedPlan } from './organize.js';
 import { workingTreeDirty } from './proc/git.js';
@@ -70,8 +70,6 @@ vi.mock('./worktree.js', async (importOriginal) => {
       rootCwd: `/tmp/worktree/${plan.slug}`,
       rewrittenRepos: [],
       worktrees: [],
-      commitResumeStale: false,
-      reusedWorktrees: false,
     })),
     cleanupPlanWorktrees: vi.fn(async () => undefined),
   };
@@ -90,8 +88,6 @@ afterEach(() => {
     rootCwd: `/tmp/worktree/${plan.slug}`,
     rewrittenRepos: [],
     worktrees: [],
-    commitResumeStale: false,
-    reusedWorktrees: false,
   }));
   vi.mocked(cleanupPlanWorktrees).mockResolvedValue(undefined);
   vi.mocked(mergePlanOnce).mockResolvedValue({ kind: 'done' });
@@ -696,8 +692,6 @@ describe('watcherLoop implementing cancellation', () => {
         rootCwd: worktree.path,
         rewrittenRepos: [],
         worktrees: [worktree],
-        commitResumeStale: false,
-        reusedWorktrees: false,
       });
 
       let plan = makePlan({
@@ -741,203 +735,6 @@ describe('watcherLoop implementing cancellation', () => {
       expect(runPlan).not.toHaveBeenCalled();
     } finally {
       await fs.unlink(path).catch(() => undefined);
-    }
-  });
-
-  test('does not remove reused worktrees when a ready claim loses the CAS', async () => {
-    const slug = `watcher-reused-claim-race-${Date.now()}`;
-    const path = `.lauren/plans/${slug}.md`;
-    await fs.mkdir('.lauren/plans', { recursive: true });
-    await fs.writeFile(path, '# Demo\n', 'utf8');
-
-    try {
-      const worktree = {
-        repo: null,
-        path: `/tmp/worktree/${slug}`,
-        branch: `lauren/${slug}`,
-        parentRoot: '/repo',
-      };
-      vi.mocked(setupPlanWorktrees).mockResolvedValue({
-        rootCwd: worktree.path,
-        rewrittenRepos: [],
-        worktrees: [worktree],
-        commitResumeStale: false,
-        reusedWorktrees: true,
-      });
-
-      let plan = makePlan({
-        slug,
-        path,
-        status: 'ready',
-        cancel_requested: false,
-        cancel_intent: undefined,
-        started_at: null,
-        worktrees: [worktree],
-        last_failed_phase: 'commit',
-      });
-      const controller = new AbortController();
-      const store = {
-        read: vi.fn(async () => [plan]),
-        update: vi.fn(
-          async (
-            _slug: string,
-            fields: Partial<Plan>,
-            opts?: {
-              precondition?: (p: Plan) => boolean;
-              preconditionDetail?: string;
-            },
-          ) => {
-            if (opts?.precondition) {
-              plan = { ...plan, status: 'cancelled', finished_at: '2026-05-08T12:10:00Z' };
-              controller.abort();
-              throw new PlanPreconditionFailed(plan.slug, opts.preconditionDetail ?? '');
-            }
-            plan = { ...plan, ...fields };
-            return { ...plan };
-          },
-        ),
-      } as unknown as PlanStore;
-
-      await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, makeHandles());
-
-      expect(cleanupPlanWorktrees).not.toHaveBeenCalled();
-      expect(runPlan).not.toHaveBeenCalled();
-    } finally {
-      await fs.unlink(path).catch(() => undefined);
-    }
-  });
-
-  test('scrubs commit-resume hints when setupPlanWorktrees reports a stale resume', async () => {
-    // Regression: when a commit-phase resume is claimed but the worktree
-    // directory is missing on disk, setupPlanWorktrees falls through to a
-    // fresh setup and flags commitResumeStale=true. The watcher must clear
-    // failed_phase / last_failed_phase before the executor sees the claim,
-    // otherwise the executor would take the resume path on the fresh
-    // (clean) worktree and silently mark the unit done with no commit.
-    const slug = `watcher-stale-resume-${Date.now()}`;
-    const planPath = `.lauren/plans/${slug}.md`;
-    await fs.mkdir('.lauren/plans', { recursive: true });
-    await fs.writeFile(planPath, '# Demo\n### Step 1.1 — first\n', 'utf8');
-
-    try {
-      vi.mocked(setupPlanWorktrees).mockResolvedValue({
-        rootCwd: `/tmp/worktree/${slug}`,
-        rewrittenRepos: [],
-        worktrees: [
-          {
-            repo: null,
-            path: `/tmp/worktree/${slug}`,
-            branch: `lauren/${slug}`,
-            parentRoot: '/repo',
-          },
-        ],
-        commitResumeStale: true,
-        reusedWorktrees: false,
-      });
-
-      const controller = new AbortController();
-      // Abort after the executor "runs" so the loop exits cleanly.
-      vi.mocked(runPlan).mockImplementation(async () => {
-        controller.abort();
-        return { kind: 'completed' };
-      });
-
-      let plan = makePlan({
-        slug,
-        path: planPath,
-        status: 'ready',
-        cancel_requested: false,
-        cancel_intent: undefined,
-        started_at: null,
-        worktrees: [
-          {
-            repo: null,
-            path: `/tmp/worktree/${slug}-missing`,
-            branch: `lauren/${slug}`,
-            parentRoot: '/repo',
-          },
-        ],
-        last_failed_phase: 'commit',
-        steps: [
-          {
-            id: '1.1',
-            title: 'first',
-            status: 'failed',
-            failed_phase: 'commit',
-            commit_subject: null,
-            started_at: null,
-            finished_at: null,
-          },
-        ],
-      });
-      const updates: Array<Partial<Plan>> = [];
-      const store = {
-        read: vi.fn(async () => [plan]),
-        update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
-          updates.push(fields);
-          plan = { ...plan, ...fields };
-          return { ...plan };
-        }),
-      } as unknown as PlanStore;
-
-      await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, makeHandles());
-
-      // The `implementing` transition update carries the scrubbed hints.
-      const implementingUpdate = updates.find((u) => u.status === 'implementing');
-      expect(implementingUpdate).toBeDefined();
-      expect(implementingUpdate?.last_failed_phase).toBeNull();
-      expect(implementingUpdate?.steps?.[0]?.failed_phase).toBeNull();
-      // Step status is preserved (still 'failed') — only the phase hint is
-      // cleared, so the executor reruns from implement.
-      expect(implementingUpdate?.steps?.[0]?.status).toBe('failed');
-    } finally {
-      await fs.unlink(planPath).catch(() => undefined);
-    }
-  });
-
-  test('does not persist a commit-resume hint for zero-diff commit failures', async () => {
-    const slug = `watcher-zero-diff-${Date.now()}`;
-    const planPath = `.lauren/plans/${slug}.md`;
-    await fs.mkdir('.lauren/plans', { recursive: true });
-    await fs.writeFile(planPath, '# Demo\n', 'utf8');
-
-    try {
-      const controller = new AbortController();
-      vi.mocked(runPlan).mockImplementation(async () => {
-        throw new RunFailure('commit', 'no target repo has changes to commit', null);
-      });
-
-      let plan = makePlan({
-        slug,
-        path: planPath,
-        status: 'ready',
-        cancel_requested: false,
-        cancel_intent: undefined,
-        started_at: null,
-        steps: null,
-      });
-      const updates: Array<Partial<Plan>> = [];
-      const store = {
-        read: vi.fn(async () => [plan]),
-        update: vi.fn(async (_slug: string, fields: Partial<Plan>) => {
-          updates.push(fields);
-          plan = { ...plan, ...fields };
-          if (fields.status === 'failed') controller.abort();
-          return { ...plan };
-        }),
-      } as unknown as PlanStore;
-
-      await watcherLoop(new WatcherRuntime(), store, TEST_CONFIG, controller.signal, makeHandles());
-
-      const failedUpdate = updates.find((u) => u.status === 'failed');
-      expect(failedUpdate).toBeDefined();
-      expect(failedUpdate?.failure).toMatchObject({
-        phase: 'commit',
-        message: 'no target repo has changes to commit',
-      });
-      expect(failedUpdate?.last_failed_phase).toBeNull();
-    } finally {
-      await fs.unlink(planPath).catch(() => undefined);
     }
   });
 });

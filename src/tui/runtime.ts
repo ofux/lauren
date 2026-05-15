@@ -1,7 +1,9 @@
+import { spawn } from 'node:child_process';
+
 import type { CheckpointEntry } from '../core/checkpoints.js';
 import type { MergeMode } from '../core/config.js';
 import { monotonicSeconds } from '../core/time.js';
-import type { Plan, PlanMergeBlock } from '../core/types.js';
+import type { Plan } from '../core/types.js';
 import {
   type ItemStatus,
   type PhaseName,
@@ -10,7 +12,6 @@ import {
   STEP_PHASES,
 } from '../executor.js';
 import { stripAnsi } from '../util/ansi.js';
-import { notifyUser } from '../util/notify.js';
 
 export const LOG_TAIL_LINES = 8;
 
@@ -191,12 +192,7 @@ export class WatcherRuntime implements ProgressSink {
     this.idleState = 'awaiting_human';
     this.pausedSlug = `__cp__:${plan.slug}:${checkpoint.id}`;
     this.awaitingCheckpoint = { plan, checkpoint };
-    if (isNewPause) {
-      playPauseNotification({
-        title: 'Lauren: human checkpoint',
-        message: `'${plan.slug}' — ${checkpoint.title}`,
-      });
-    }
+    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -235,12 +231,7 @@ export class WatcherRuntime implements ProgressSink {
         `  Press \`t\` on '${failedPlan.slug}' in \`lauren\` to reset it to ready, ` +
         `or cancel it from there.`;
     this.idleMessage = `PAUSED: plan '${failedPlan.slug}' failed at ${phase}.\n${indentedMsg}\n${trailer}`;
-    if (isNewPause) {
-      playPauseNotification({
-        title: 'Lauren: plan failed',
-        message: `'${failedPlan.slug}' failed at ${phase}.`,
-      });
-    }
+    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -262,44 +253,7 @@ export class WatcherRuntime implements ProgressSink {
       `  Inspect with \`git status\`, then commit/stash/discard, and set\n` +
       `  status to 'cancelled' in .lauren/plans.json to resume.\n` +
       `  ${ready} plan(s) queued behind it.`;
-    if (isNewPause) {
-      playPauseNotification({
-        title: 'Lauren: cancelling — needs cleanup',
-        message: `'${plan.slug}' has uncommitted changes; resolve and mark cancelled.`,
-      });
-    }
-    this.notify();
-  }
-
-  setPausedMergeBlocked(plans: Plan[], plan: Plan, block: PlanMergeBlock, mode: MergeMode): void {
-    const pauseKey = `__merge_blocked__:${plan.slug}:${block.parent_root}`;
-    const isNewPause = this.pausedSlug !== pauseKey;
-    this.plans = plans;
-    this.currentPlan = null;
-    this.organizingPlan = null;
-    this.organizingNote = null;
-    this.mergingPlan = null;
-    this.mergingMode = null;
-    this.planProgress = null;
-    this.idleState = 'paused';
-    this.pausedSlug = pauseKey;
-    this.awaitingCheckpoint = null;
-    const ready = plans.filter((p) => p.status === 'ready').length;
-    const repoLabel = block.repo ? `${block.repo} (${block.parent_root})` : block.parent_root;
-    const action =
-      mode === 'auto' ? 'before vibe can merge.' : 'before vibe can fast-forward the merged PR.';
-    this.idleMessage =
-      `PAUSED: merge of '${plan.slug}' is blocked — uncommitted changes in ${repoLabel}.\n` +
-      `  ${block.message}\n` +
-      `  Commit/stash/discard the changes ${action}\n` +
-      `  vibe will auto-resume on the next poll once the tree is clean.\n` +
-      `  ${ready} plan(s) queued behind it.`;
-    if (isNewPause) {
-      playPauseNotification({
-        title: 'Lauren: merge blocked',
-        message: `'${plan.slug}' — ${repoLabel} has uncommitted changes.`,
-      });
-    }
+    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -321,12 +275,7 @@ export class WatcherRuntime implements ProgressSink {
       `  Dirty repo(s): ${dirtyRepos}.\n` +
       `  Commit/stash/discard changes before vibe resumes.\n` +
       `  ${ready} plan(s) queued behind it.`;
-    if (isNewPause) {
-      playPauseNotification({
-        title: 'Lauren: workspace dirty',
-        message: `Dirty repo(s): ${dirtyRepos}. Resolve to resume.`,
-      });
-    }
+    if (isNewPause) playPauseNotification();
     this.notify();
   }
 
@@ -436,16 +385,31 @@ export function getItemElapsed(
 
 /**
  * Best-effort notification when vibe transitions into the paused state.
- * Delegates to {@link notifyUser} which handles BEL + afplay + osascript;
- * all channels are wrapped so notification failures cannot crash the
- * watcher. Set LAUREN_NO_NOTIFY=1 to silence everything, or
- * LAUREN_NO_SOUND=1 to silence bell + sound only.
+ * Always emits the terminal BEL (works in any TTY); on macOS additionally
+ * spawns `afplay` for an audible cue. Every step is wrapped in try/catch
+ * because failure to play a sound must never crash the watcher.
+ *
+ * Set LAUREN_NO_SOUND=1 to silence both.
  */
-export function playPauseNotification(args: { title: string; message: string }): void {
-  notifyUser({
-    title: args.title,
-    message: args.message,
-    sound: true,
-    stderr: false,
-  });
+export function playPauseNotification(): void {
+  if (process.env.LAUREN_NO_SOUND === '1') return;
+  try {
+    process.stdout.write('\x07');
+  } catch {
+    // Writing BEL can fail if stdout was closed — ignore.
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const child = spawn('afplay', ['/System/Library/Sounds/Glass.aiff'], {
+        stdio: 'ignore',
+        detached: true,
+      });
+      child.on('error', () => {
+        // afplay missing or failed; the BEL already fired.
+      });
+      child.unref();
+    } catch {
+      // spawn itself can throw (e.g. EMFILE) — ignore.
+    }
+  }
 }

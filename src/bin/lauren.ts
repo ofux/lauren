@@ -27,7 +27,7 @@ import { PlanStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
-import { cmdInitClaude } from '../init-claude.js';
+import { cmdInitClaude, cmdPlanPrompt } from '../init-claude.js';
 import { PLAN_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT } from '../lauren-prompts.js';
 import { runClaudeInteractive } from '../proc/claude.js';
 import { slugHasLaurenHistory } from '../proc/git.js';
@@ -388,6 +388,10 @@ async function main(): Promise<void> {
         }),
       );
     });
+
+  program.command('_plan-prompt', { hidden: true }).action(() => {
+    process.exit(cmdPlanPrompt());
+  });
 
   await program.parseAsync(process.argv);
 }

@@ -2,19 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import type { PlanStore } from './core/store.js';
 import type { Plan, PlanWorktree } from './core/types.js';
-import type { ResolvedWorkspaceRepo } from './core/workspace.js';
-import { getCurrentBranch, gitDeleteBranch, gitWorktreeRemove } from './proc/git.js';
+import { gitDeleteBranch, gitWorktreeRemove } from './proc/git.js';
 import {
+  allowsDirtyStartupRecovery,
   finalizeCancelledImplementingPlans,
   recoverImplementingPlans,
-  wrongBranchRepos,
 } from './vibe-command.js';
 
 vi.mock('./proc/git.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./proc/git.js')>();
   return {
     ...actual,
-    getCurrentBranch: vi.fn(),
     gitWorktreeRemove: vi.fn(),
     gitDeleteBranch: vi.fn(),
   };
@@ -135,102 +133,30 @@ describe('finalizeCancelledImplementingPlans', () => {
   });
 });
 
-describe('wrongBranchRepos', () => {
-  beforeEach(() => {
-    vi.mocked(getCurrentBranch).mockReset();
+describe('allowsDirtyStartupRecovery', () => {
+  test('allows dirty startup when a merge row needs crash recovery', () => {
+    expect(
+      allowsDirtyStartupRecovery([
+        makePlan({
+          status: 'merging',
+          cancel_requested: false,
+          worktrees: [worktree(null, '/repo')],
+        }),
+      ]),
+    ).toBe(true);
   });
 
-  test('reports workspace repos not on the configured dev branch', () => {
-    const repos: ResolvedWorkspaceRepo[] = [
-      { name: 'frontend', path: 'frontend', root: '/workspace/frontend' },
-      { name: 'backend', path: 'backend', root: '/workspace/backend' },
-    ];
-    vi.mocked(getCurrentBranch).mockImplementation((cwd) => {
-      return cwd === '/workspace/frontend' ? 'feature/demo' : 'main';
-    });
-
-    expect(wrongBranchRepos(repos, 'main')).toEqual([{ repo: 'frontend', branch: 'feature/demo' }]);
+  test('allows dirty startup while a cancelling row is being resolved', () => {
+    expect(allowsDirtyStartupRecovery([makePlan({ status: 'cancelling' })])).toBe(true);
   });
 
-  test('allows startup when every workspace repo is on the configured dev branch', () => {
-    const repos: ResolvedWorkspaceRepo[] = [
-      { name: 'frontend', path: 'frontend', root: '/workspace/frontend' },
-      { name: 'backend', path: 'backend', root: '/workspace/backend' },
-    ];
-    vi.mocked(getCurrentBranch).mockReturnValue('develop');
-
-    expect(wrongBranchRepos(repos, 'develop')).toEqual([]);
-  });
-
-  test('allows checkout-blocked merge recovery to start from the blocked branch', () => {
-    const repos: ResolvedWorkspaceRepo[] = [
-      { name: 'frontend', path: 'frontend', root: '/workspace/frontend' },
-      { name: 'backend', path: 'backend', root: '/workspace/backend' },
-    ];
-    vi.mocked(getCurrentBranch).mockImplementation((cwd) => {
-      return cwd === '/workspace/frontend' ? 'feature/demo' : 'main';
-    });
-    const plans = [
-      makePlan({
-        status: 'merge_blocked',
-        merge_block: {
-          reason: 'dirty-checkout',
-          repo: 'frontend',
-          parent_root: '/workspace/frontend',
-          files: ['app.ts'],
-          detected_at: '2026-05-08T12:10:00Z',
-          message: '/workspace/frontend has uncommitted changes',
-        },
-      }),
-    ];
-
-    expect(wrongBranchRepos(repos, 'main', plans)).toEqual([]);
-  });
-
-  test('allows checkout-blocked fast-forward recovery to start from the blocked branch', () => {
-    const repos: ResolvedWorkspaceRepo[] = [
-      { name: 'frontend', path: 'frontend', root: '/workspace/frontend' },
-    ];
-    vi.mocked(getCurrentBranch).mockReturnValue('feature/demo');
-    const plans = [
-      makePlan({
-        status: 'merge_blocked',
-        merge_block: {
-          reason: 'dirty-fast-forward',
-          repo: 'frontend',
-          parent_root: '/workspace/frontend',
-          files: ['app.ts'],
-          detected_at: '2026-05-08T12:10:00Z',
-          message: '/workspace/frontend has uncommitted changes',
-        },
-      }),
-    ];
-
-    expect(wrongBranchRepos(repos, 'main', plans)).toEqual([]);
-  });
-
-  test('keeps wrong-branch protection for non-checkout merge blocks', () => {
-    const repos: ResolvedWorkspaceRepo[] = [
-      { name: 'frontend', path: 'frontend', root: '/workspace/frontend' },
-    ];
-    vi.mocked(getCurrentBranch).mockReturnValue('feature/demo');
-    const plans = [
-      makePlan({
-        status: 'merge_blocked',
-        merge_block: {
-          reason: 'dirty-merge',
-          repo: 'frontend',
-          parent_root: '/workspace/frontend',
-          files: ['app.ts'],
-          detected_at: '2026-05-08T12:10:00Z',
-          message: '/workspace/frontend has uncommitted changes',
-        },
-      }),
-    ];
-
-    expect(wrongBranchRepos(repos, 'main', plans)).toEqual([
-      { repo: 'frontend', branch: 'feature/demo' },
-    ]);
+  test('keeps the dirty checkout guard for normal queue states', () => {
+    expect(
+      allowsDirtyStartupRecovery([
+        makePlan({ status: 'ready', cancel_requested: false }),
+        makePlan({ status: 'enqueued', cancel_requested: false }),
+      ]),
+    ).toBe(false);
   });
 });
 
