@@ -113,6 +113,131 @@ describe('setupPlanWorktrees', () => {
     );
   });
 
+  test('reuses existing worktree when plan.last_failed_phase === commit', async () => {
+    // Single-unit plan that failed at the commit phase. The worktree dir
+    // exists on disk and carries the implement+fix diff; setupPlanWorktrees
+    // must NOT wipe it and recreate from dev_branch.
+    const wtRoot = worktreeRootPath('worktree-path-rewrite');
+    const plan = makePlan({
+      last_failed_phase: 'commit',
+      worktrees: [
+        {
+          repo: null,
+          path: wtRoot,
+          branch: 'lauren/worktree-path-rewrite',
+          parentRoot: '/workspace/app',
+        },
+      ],
+    });
+    await fs.mkdir(wtRoot, { recursive: true });
+    await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+    await fs.writeFile(planFilePath(plan), '# Updated plan\n', 'utf8');
+    await fs.mkdir(path.join(wtRoot, '.lauren', 'plans'), { recursive: true });
+    await fs.writeFile(
+      path.join(wtRoot, '.lauren', 'plans', `${plan.slug}.md`),
+      '# Stale plan\n',
+      'utf8',
+    );
+
+    const ctx = await setupPlanWorktrees(plan, DEFAULT_CONFIG);
+
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
+    expect(gitWorktreeAdd).not.toHaveBeenCalled();
+    expect(resolveWorkspaceRepos).not.toHaveBeenCalled();
+    expect(ctx.rootCwd).toBe(wtRoot);
+    expect(ctx.worktrees).toEqual(plan.worktrees);
+    expect(ctx.rewrittenRepos).toEqual([{ name: '.', path: '.', root: wtRoot }]);
+    expect(ctx.commitResumeStale).toBe(false);
+    expect(ctx.reusedWorktrees).toBe(true);
+    await expect(
+      fs.readFile(path.join(wtRoot, '.lauren', 'plans', `${plan.slug}.md`), 'utf8'),
+    ).resolves.toBe('# Updated plan\n');
+  });
+
+  test('reuses existing worktree when any step has failed_phase === commit', async () => {
+    const wtRoot = worktreeRootPath('worktree-path-rewrite');
+    const plan = makePlan({
+      worktrees: [
+        {
+          repo: null,
+          path: wtRoot,
+          branch: 'lauren/worktree-path-rewrite',
+          parentRoot: '/workspace/app',
+        },
+      ],
+      steps: [
+        {
+          id: '1.1',
+          title: 'done step',
+          status: 'done',
+          commit_subject: 'x',
+          started_at: null,
+          finished_at: null,
+        },
+        {
+          id: '1.2',
+          title: 'failed at commit',
+          status: 'failed',
+          failed_phase: 'commit',
+          commit_subject: null,
+          started_at: null,
+          finished_at: null,
+        },
+      ],
+    });
+    await fs.mkdir(wtRoot, { recursive: true });
+    await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+    await fs.writeFile(planFilePath(plan), '# Updated plan\n', 'utf8');
+
+    const ctx = await setupPlanWorktrees(plan, DEFAULT_CONFIG);
+
+    expect(gitWorktreeRemove).not.toHaveBeenCalled();
+    expect(gitWorktreeAdd).not.toHaveBeenCalled();
+    expect(ctx.rootCwd).toBe(wtRoot);
+    expect(ctx.reusedWorktrees).toBe(true);
+  });
+
+  test('falls back to fresh setup AND flags commitResumeStale when the worktree is gone', async () => {
+    const plan = makePlan({
+      last_failed_phase: 'commit',
+      worktrees: [
+        {
+          repo: null,
+          path: worktreeRootPath('worktree-path-rewrite'),
+          branch: 'lauren/worktree-path-rewrite',
+          parentRoot: '/workspace/app',
+        },
+      ],
+    });
+    // No worktree dir on disk → reuse must fail and the normal path runs.
+    const repos: ResolvedWorkspaceRepo[] = [{ name: 'app', path: '.', root: '/workspace/app' }];
+    vi.mocked(resolveWorkspaceRepos).mockResolvedValue(repos);
+    await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+    await fs.writeFile(planFilePath(plan), '# Plan body\n', 'utf8');
+
+    const ctx = await setupPlanWorktrees(plan, DEFAULT_CONFIG);
+
+    expect(gitWorktreeAdd).toHaveBeenCalledTimes(1);
+    // Critical: caller must scrub failed_phase / last_failed_phase before
+    // flipping to `implementing`, otherwise the executor's resume path
+    // would silently mark the unit done on the new clean tree.
+    expect(ctx.commitResumeStale).toBe(true);
+    expect(ctx.reusedWorktrees).toBe(false);
+  });
+
+  test('reports commitResumeStale=false on a normal (non-resume) setup', async () => {
+    const plan = makePlan();
+    const repos: ResolvedWorkspaceRepo[] = [{ name: 'app', path: '.', root: '/workspace/app' }];
+    vi.mocked(resolveWorkspaceRepos).mockResolvedValue(repos);
+    await fs.mkdir(path.dirname(planFilePath(plan)), { recursive: true });
+    await fs.writeFile(planFilePath(plan), '# Plan body\n', 'utf8');
+
+    const ctx = await setupPlanWorktrees(plan, DEFAULT_CONFIG);
+
+    expect(ctx.commitResumeStale).toBe(false);
+    expect(ctx.reusedWorktrees).toBe(false);
+  });
+
   test('rewrites multi-repo paths to match worktree-relative directories', async () => {
     const plan = makePlan();
     const repos: ResolvedWorkspaceRepo[] = [

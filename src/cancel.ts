@@ -49,6 +49,15 @@ async function cleanupCancelledWorktrees(store: PlanStore, plan: Plan): Promise<
   }
 }
 
+function hasMergedParentBeforeBlock(plan: Plan): boolean {
+  const block = plan.merge_block;
+  if (!block) return false;
+  const blockedIndex = (plan.worktrees ?? []).findIndex(
+    (wt) => wt.parentRoot === block.parent_root,
+  );
+  return blockedIndex > 0;
+}
+
 export type CancelOutcome =
   | { kind: 'removed'; message: string }
   | { kind: 'requested'; message: string; daemonReachable: boolean }
@@ -240,6 +249,30 @@ export async function cancelPlan(args: {
     return requestDaemonCancellation(store, slug, 'merging', intent);
   }
 
+  if (plan.status === 'merge_blocked') {
+    if (plan.merge_block?.reason === 'dirty-fast-forward') {
+      return {
+        kind: 'noop',
+        message:
+          `'${slug}' already merged remotely; clean the blocked checkout ` +
+          `so vibe can finish the local fast-forward.`,
+      };
+    }
+    if (hasMergedParentBeforeBlock(plan)) {
+      return {
+        kind: 'noop',
+        message:
+          `'${slug}' already merged into an earlier parent checkout; clean the blocked checkout ` +
+          `so vibe can finish the remaining merge.`,
+      };
+    }
+    // The daemon paused before the merge ran, so there's no in-flight
+    // subprocess to abort and no partial work on the parent checkout —
+    // route through the same daemon-cancellation path as 'merging' so
+    // cancel_intent + the worktree cleanup behavior stay consistent.
+    return requestDaemonCancellation(store, slug, 'merging', intent);
+  }
+
   return { kind: 'noop', message: `'${slug}' is ${plan.status}; nothing to cancel.` };
 }
 
@@ -250,6 +283,9 @@ export function isCancellable(plan: Plan): boolean {
     plan.status === 'ready' ||
     plan.status === 'implementing' ||
     plan.status === 'awaiting_human' ||
+    (plan.status === 'merge_blocked' &&
+      plan.merge_block?.reason !== 'dirty-fast-forward' &&
+      !hasMergedParentBeforeBlock(plan)) ||
     (plan.status === 'merging' && plan.failure?.phase !== 'cleanup')
   );
 }

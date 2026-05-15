@@ -6,8 +6,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import { CLAUDE_COMMAND_BODY, CLAUDE_SKILL_BODY } from './claude-assets.js';
-import { cmdInitClaude, cmdPlanPrompt } from './init-claude.js';
-import { PLAN_SYSTEM_PROMPT } from './lauren-prompts.js';
+import { cmdInitClaude } from './init-claude.js';
 
 class StringStream {
   chunks: string[] = [];
@@ -136,22 +135,16 @@ describe('cmdInitClaude', () => {
   });
 });
 
-describe('cmdPlanPrompt', () => {
-  test('writes PLAN_SYSTEM_PROMPT to the provided stream', () => {
-    const out = new StringStream();
-    const rc = cmdPlanPrompt(out as unknown as NodeJS.WritableStream);
-    expect(rc).toBe(0);
-    expect(out.text).toContain('Session task: write an implementation plan');
-    expect(out.text).toContain('All paths in this prompt are relative to the repository root');
-    expect(out.text.startsWith(PLAN_SYSTEM_PROMPT)).toBe(true);
-  });
-});
-
 describe('Claude skill body', () => {
-  test('anchors plan writes and registration at the repo root', () => {
-    expect(CLAUDE_SKILL_BODY).toContain('repo_root="$(git rev-parse --show-toplevel');
-    expect(CLAUDE_SKILL_BODY).toContain('Do not write a plan under a');
-    expect(CLAUDE_SKILL_BODY).toContain('nested subdirectory');
+  test('inlines the full plan system prompt', () => {
+    expect(CLAUDE_SKILL_BODY).toContain('# Session task: write an implementation plan');
+    expect(CLAUDE_SKILL_BODY).toContain(
+      'All paths in this prompt are relative to the repository root',
+    );
+  });
+
+  test('does not shell out to load the prompt', () => {
+    expect(CLAUDE_SKILL_BODY).not.toContain('lauren _plan-prompt');
   });
 });
 

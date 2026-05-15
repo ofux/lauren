@@ -46,6 +46,12 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
         ⊘{' '}
       </Text>
     );
+  else if (plan.status === 'merge_blocked')
+    icon = (
+      <Text color="yellow" bold>
+        ⏸{' '}
+      </Text>
+    );
   else if (plan.status === 'awaiting_human')
     icon = (
       <Text color="magenta" bold>
@@ -58,6 +64,7 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
   const titleProps: { bold?: boolean; color?: string; dimColor?: boolean } = {};
   if (plan.status === 'implementing' || plan.status === 'merging') titleProps.bold = true;
   else if (plan.status === 'failed' || plan.status === 'cancelling') titleProps.color = 'red';
+  else if (plan.status === 'merge_blocked') titleProps.color = 'yellow';
   else if (plan.status === 'awaiting_human') titleProps.color = 'magenta';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
@@ -102,6 +109,7 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     ready: 0,
     implementing: 0,
     merging: 0,
+    merge_blocked: 0,
     cancelling: 0,
     awaiting_human: 0,
     done: 0,
@@ -128,6 +136,9 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
           <Text color="cyan">{`  ·  ${counts.implementing} running`}</Text>
         )}
         {counts.merging > 0 && <Text color="blue">{`  ·  ${counts.merging} merging`}</Text>}
+        {counts.merge_blocked > 0 && (
+          <Text color="yellow" bold>{`  ·  ${counts.merge_blocked} merge blocked`}</Text>
+        )}
         {counts.ready > 0 && <Text>{`  ·  ${counts.ready} ready`}</Text>}
         {counts.failed > 0 && <Text color="red" bold>{`  ·  ${counts.failed} failed`}</Text>}
         {counts.awaiting_human > 0 && (
@@ -142,7 +153,14 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
 
 export function WatcherProgress({ runtime }: Props): React.ReactElement {
   return (
-    <Box flexDirection="column">
+    // paddingRight={1} keeps every rendered line one cell narrower than the
+    // terminal. Without it the bordered child boxes stretch to the full
+    // terminal width, which on terminals using immediate-wrap (writing the
+    // last column wraps the cursor right away) makes each line take two
+    // physical rows. log-update.eraseLines() only clears the logical line
+    // count, so one physical row leaks each tick — over a few seconds the
+    // QueuePanel's top border stacks above the live frame.
+    <Box flexDirection="column" paddingRight={1}>
       <QueuePanel runtime={runtime} />
       {runtime.idleState === 'running' && runtime.planProgress !== null ? (
         <PlanProgress state={runtime.planProgress} />

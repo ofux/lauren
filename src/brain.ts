@@ -1,5 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { getAgent } from './agents/index.js';
+import type { CodingAgent } from './agents/types.js';
 import { type CheckpointEntry, reconcileCheckpoints } from './core/checkpoints.js';
 import { REPO } from './core/paths.js';
 import { materializeSteps, parseCheckpoints } from './core/steps.js';
@@ -13,7 +15,6 @@ import {
   planFilePath,
 } from './core/types.js';
 import { BRAIN_ORGANIZE_PROMPT, BRAIN_PLACE_PROMPT } from './lauren-prompts.js';
-import { runClaudeOneshotJson } from './proc/claude.js';
 import { parsePlanFrontmatter } from './util/planFrontmatter.js';
 
 /**
@@ -197,6 +198,7 @@ export async function brainPlacePlan(
   newPlan: Plan,
   newBody: string,
   signal?: AbortSignal,
+  agent: CodingAgent = getAgent('claude'),
 ): Promise<PlaceDecision> {
   const ready = await readReadySummaries(store);
   const others = ready.filter((p) => p.plan.slug !== newPlan.slug);
@@ -214,7 +216,7 @@ export async function brainPlacePlan(
     `${formatReadyForBrain([newSummary])}\n\n` +
     `Decide: insert at a position among the ${others.length} ready plan(s), ` +
     `or merge into one of them. Return the JSON object.`;
-  const result = await runClaudeOneshotJson({
+  const result = await agent.runJson({
     systemPrompt: BRAIN_PLACE_PROMPT,
     userPrompt,
     ...(signal !== undefined ? { signal } : {}),
@@ -225,13 +227,14 @@ export async function brainPlacePlan(
 export async function brainOrganizeQueue(
   store: PlanStore,
   signal?: AbortSignal,
+  agent: CodingAgent = getAgent('claude'),
 ): Promise<{ decision: OrganizeDecision; ready: ReadySummary[] }> {
   const ready = await readReadySummaries(store);
   const userPrompt =
     `## Ready queue (in order)\n\n` +
     `${formatReadyForBrain(ready)}\n\n` +
     `Re-think the queue and return the JSON object.`;
-  const result = await runClaudeOneshotJson({
+  const result = await agent.runJson({
     systemPrompt: BRAIN_ORGANIZE_PROMPT,
     userPrompt,
     ...(signal !== undefined ? { signal } : {}),

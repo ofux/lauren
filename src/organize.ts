@@ -1,5 +1,8 @@
 import { promises as fs } from 'node:fs';
 
+import { CodexAborted } from './agents/codex.js';
+import { getAgent } from './agents/index.js';
+import type { AgentName } from './agents/types.js';
 import { applyPlaceDecision, brainPlacePlan } from './brain.js';
 import { materializeSteps } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
@@ -36,9 +39,14 @@ export async function processEnqueuedPlan(args: {
   plan: Plan;
   store: PlanStore;
   state: BrainCancelState;
+  /**
+   * Which agent runs the brain's placement decision. Defaults to claude
+   * (preserves legacy behavior); the daemon passes `config.agents.brain`.
+   */
+  brainAgent?: AgentName;
   notify?: OrganizeNotify;
 }): Promise<void> {
-  const { plan, store, state, notify } = args;
+  const { plan, store, state, brainAgent = 'claude', notify } = args;
   const note = (level: 'info' | 'error', text: string): void => {
     notify?.({ level, text });
   };
@@ -90,13 +98,14 @@ export async function processEnqueuedPlan(args: {
 
   note('info', `placing '${plan.slug}' (${plan.title})…`);
 
+  const agent = getAgent(brainAgent);
   let decision: Awaited<ReturnType<typeof brainPlacePlan>>;
   try {
-    decision = await brainPlacePlan(store, plan, body, controller.signal);
+    decision = await brainPlacePlan(store, plan, body, controller.signal, agent);
   } catch (err) {
     state.current = null;
     state.controller = null;
-    if (err instanceof ClaudeAborted) {
+    if (err instanceof ClaudeAborted || err instanceof CodexAborted) {
       // Cancellation arrived mid-placement. Drop the row and the .md
       // file so the user sees the row disappear.
       note('info', `cancelled '${plan.slug}' during preparation.`);

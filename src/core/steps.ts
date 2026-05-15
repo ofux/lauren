@@ -22,6 +22,9 @@ export interface Step {
   title: string;
 }
 
+/** Pipeline phase inside a single step/unit. Mirrors executor.PhaseName. */
+export type StepPhase = 'implement' | 'review' | 'fix' | 'commit';
+
 export interface StepEntry {
   id: string;
   title: string;
@@ -30,6 +33,15 @@ export interface StepEntry {
   commit_subject: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /**
+   * Phase that failed when status is 'failed'. Persisted across retries
+   * (unlike Plan.failure, which is cleared on retry) so the executor can
+   * resume from the right phase. Currently load-bearing for 'commit': on
+   * retry the executor skips implement/review/fix and re-runs commit only,
+   * preserving the worktree's implement+fix diff. Other phase values are
+   * informational. Absent / null = no resume hint (start from implement).
+   */
+  failed_phase?: StepPhase | null;
 }
 
 const STEP_HEADING_RE = /^### Step (\d+\.\d+) — (.+?)\s*$/;
@@ -62,6 +74,7 @@ function freshEntry(step: Step): StepEntry {
     commit_subject: null,
     started_at: null,
     finished_at: null,
+    failed_phase: null,
   };
 }
 

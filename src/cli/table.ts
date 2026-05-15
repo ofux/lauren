@@ -16,6 +16,10 @@ function statusCell(status: PlanStatus): { plain: string; rendered: string } {
       return { plain: 'failed', rendered: `${BOLD}${RED}failed${RESET}` };
     case 'cancelling':
       return { plain: 'cancelling', rendered: `${BOLD}${RED}cancelling${RESET}` };
+    case 'merge_blocked':
+      return { plain: 'merge_blocked', rendered: `${BOLD}${YELLOW}merge_blocked${RESET}` };
+    case 'merging':
+      return { plain: 'merging', rendered: `${BOLD}${CYAN}merging${RESET}` };
     case 'implementing':
       return { plain: 'implementing', rendered: `${BOLD}${CYAN}implementing${RESET}` };
     case 'preparing':

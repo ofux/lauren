@@ -4,6 +4,8 @@ import { Box, Text, useApp, useInput } from 'ink';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import type { CodingAgent } from '../agents/index.js';
+import { getAgent } from '../agents/index.js';
 import { applyOrganizeDecision, brainOrganizeQueue, summarizeOrganizeDecision } from '../brain.js';
 import { cancelPlan, isCancellable } from '../cancel.js';
 import { acknowledgeCheckpoint, isAwaitingHuman } from '../checkpoint.js';
@@ -21,6 +23,7 @@ const POLL_INTERVAL_MS = 500;
 
 export interface TodoAppProps {
   store: PlanStore;
+  brainAgent?: CodingAgent;
 }
 
 type View =
@@ -46,6 +49,8 @@ function statusColor(status: PlanStatus): string | undefined {
       return 'cyan';
     case 'merging':
       return 'blue';
+    case 'merge_blocked':
+      return 'yellow';
     case 'preparing':
       return 'magenta';
     case 'awaiting_human':
@@ -213,7 +218,10 @@ function HelpFooter({
   );
 }
 
-export function TodoApp({ store }: TodoAppProps): React.ReactElement {
+export function TodoApp({
+  store,
+  brainAgent = getAgent('claude'),
+}: TodoAppProps): React.ReactElement {
   const { exit } = useApp();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -436,7 +444,7 @@ export function TodoApp({ store }: TodoAppProps): React.ReactElement {
       setView({ kind: 'reorganize-loading' });
       void (async () => {
         try {
-          const { decision } = await brainOrganizeQueue(store);
+          const { decision } = await brainOrganizeQueue(store, undefined, brainAgent);
           const summary = summarizeOrganizeDecision(decision);
           const reasoning = decision.reasoning.trim();
           setView({ kind: 'reorganize-confirm', decision, summary, reasoning });

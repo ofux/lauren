@@ -1,5 +1,12 @@
 import { promises as fs } from 'node:fs';
 
+import {
+  AGENT_NAMES,
+  type AgentName,
+  type AgentRoles,
+  DEFAULT_AGENTS,
+  isAgentName,
+} from '../agents/types.js';
 import { DEFAULT_CONTEXT, displayPath, type LaurenContext } from './paths.js';
 
 export type MergeMode = 'auto' | 'github-pr';
@@ -8,12 +15,14 @@ export interface LaurenConfig {
   version: 1;
   dev_branch: string;
   merge_mode: MergeMode;
+  agents: AgentRoles;
 }
 
 export const DEFAULT_CONFIG: LaurenConfig = {
   version: 1,
   dev_branch: 'main',
   merge_mode: 'auto',
+  agents: { ...DEFAULT_AGENTS },
 };
 
 export class LaurenConfigError extends Error {
@@ -27,6 +36,41 @@ function assertObject(value: unknown, label: string): asserts value is Record<st
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new LaurenConfigError(`${label} must be an object`);
   }
+}
+
+const AGENT_ROLES: readonly (keyof AgentRoles)[] = [
+  'implement',
+  'review',
+  'fix',
+  'merger',
+  'brain',
+] as const;
+
+function parseAgents(raw: unknown, label: string): AgentRoles {
+  if (raw === undefined) return { ...DEFAULT_AGENTS };
+  assertObject(raw, `${label}.agents`);
+  const known = new Set<string>(AGENT_ROLES);
+  for (const key of Object.keys(raw)) {
+    if (!known.has(key)) {
+      throw new LaurenConfigError(
+        `${label}.agents: unknown role ${JSON.stringify(key)} ` +
+          `(expected one of ${AGENT_ROLES.join(', ')})`,
+      );
+    }
+  }
+  const out: AgentRoles = { ...DEFAULT_AGENTS };
+  for (const role of AGENT_ROLES) {
+    const v = raw[role];
+    if (v === undefined) continue;
+    if (!isAgentName(v)) {
+      throw new LaurenConfigError(
+        `${label}.agents.${role}: must be one of ${AGENT_NAMES.join(', ')} ` +
+          `(got ${JSON.stringify(v)})`,
+      );
+    }
+    out[role] = v as AgentName;
+  }
+  return out;
 }
 
 function parseConfig(raw: unknown, configPath: string): LaurenConfig {
@@ -51,7 +95,9 @@ function parseConfig(raw: unknown, configPath: string): LaurenConfig {
     merge_mode = raw.merge_mode;
   }
 
-  return { version: 1, dev_branch, merge_mode };
+  const agents = parseAgents(raw.agents, label);
+
+  return { version: 1, dev_branch, merge_mode, agents };
 }
 
 /**
@@ -68,7 +114,7 @@ export async function readLaurenConfig(
     raw = await fs.readFile(configPath, 'utf8');
   } catch (err: unknown) {
     if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { ...DEFAULT_CONFIG };
+      return { ...DEFAULT_CONFIG, agents: { ...DEFAULT_AGENTS } };
     }
     throw err;
   }

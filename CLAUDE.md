@@ -20,10 +20,17 @@ Tests live next to source as `*.test.ts` (Vitest, ESM, Node `>=20`). Verify chan
 ## External binaries
 
 The runtime shells out to two CLIs that must be on `$PATH`:
-- `claude` — used both interactively (planning, spec) and one-shot with `--output-format stream-json` (implement, fix, brain JSON decisions).
-- `codex` — invoked as `codex exec review -o <file> <prompt>` for the review step.
+- `claude` — used interactively (planning, spec) and as the default agent for the implement / fix pipeline phases, brain JSON decisions, and merger conflict resolution.
+- `codex` — used as the default agent for the review pipeline phase (`codex exec review -o <file> <prompt>`).
 
-If either is missing, `lauren vibe` will fail at the corresponding step.
+Per-phase agent selection is configurable in `.lauren/config.json` under
+`agents`: each of `implement`, `review`, `fix`, `merger`, and `brain`
+independently accepts `"claude"` or `"codex"`. The adapters live in
+`src/agents/` and implement the `CodingAgent` port (`runEdit`, `runReview`,
+`runJson`) — see `src/agents/types.ts`.
+
+If a binary is missing for any role configured to use it, `lauren vibe` will
+fail at the corresponding step.
 
 ## Architecture
 

@@ -7,12 +7,8 @@ import { type LaurenConfig, LaurenConfigError, readLaurenConfig } from './core/c
 import { displayPath, LAUREN_DIR, VIBE_LOCK_PATH, VIBE_PID_PATH } from './core/paths.js';
 import { PlanStore } from './core/store.js';
 import { type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
-import {
-  formatRepoList,
-  type ResolvedWorkspaceRepo,
-  resolveWorkspaceRepos,
-} from './core/workspace.js';
-import { getCurrentBranch, workingTreeDirty } from './proc/git.js';
+import { type ResolvedWorkspaceRepo, resolveWorkspaceRepos } from './core/workspace.js';
+import { getCurrentBranch } from './proc/git.js';
 import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
 import { WatcherRuntime } from './tui/runtime.js';
@@ -57,12 +53,29 @@ export async function finalizeCancelledImplementingPlans(
   return true;
 }
 
-function dirtyRepos(repos: readonly ResolvedWorkspaceRepo[]): ResolvedWorkspaceRepo[] {
-  return repos.filter((repo) => workingTreeDirty(repo.root));
-}
+export function wrongBranchRepos(
+  repos: readonly ResolvedWorkspaceRepo[],
+  devBranch: string,
+  plans: readonly Plan[] = [],
+): { repo: string; branch: string }[] {
+  const checkoutBlockedRoots = new Set<string>();
+  for (const plan of plans) {
+    if (plan.status !== 'merge_blocked') continue;
+    const block = plan.merge_block;
+    if (!block) continue;
+    if (block.reason === 'dirty-checkout' || block.reason === 'dirty-fast-forward') {
+      checkoutBlockedRoots.add(block.parent_root);
+    }
+  }
 
-export function allowsDirtyStartupRecovery(plans: readonly Plan[]): boolean {
-  return plans.some((p) => p.status === 'cancelling' || p.status === 'merging');
+  const wrongBranch: { repo: string; branch: string }[] = [];
+  for (const repo of repos) {
+    const branch = getCurrentBranch(repo.root);
+    if (branch !== devBranch && !checkoutBlockedRoots.has(repo.root)) {
+      wrongBranch.push({ repo: repo.name, branch });
+    }
+  }
+  return wrongBranch;
 }
 
 export async function recoverImplementingPlans(
@@ -218,14 +231,12 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
   // catches the across-restart case.
   await cleanupCancelledLeftoverWorktrees(store, await store.read());
 
-  // Validate the user's main checkout: clean tree + on dev_branch, in every
-  // workspace repo. Worktrees keep partial pipeline state out of the user's
-  // tree, so a dirty main checkout means the user has their own work in
-  // progress — refuse to run rather than commit on top of it. The branch
-  // check is required for auto-merge to land where the user expects.
-  // (Cancelling rows can leave a keep-intent branch dirty; merging rows can
-  // leave an in-progress parent checkout merge after a crash.)
-  const allowDirtyStartup = allowsDirtyStartupRecovery(await store.read());
+  // Validate workspace config early so a broken `workspace_repos` setting
+  // surfaces here rather than at the first merge. Dirty-tree validation now
+  // happens per-plan at merge time, but wrong-branch validation remains a
+  // startup guard: auto-merge is allowed to switch back to dev_branch after
+  // long-running daemon drift, not silently move a user's already-wrong
+  // checkout when vibe starts.
   let workspaceRepos: ResolvedWorkspaceRepo[];
   try {
     workspaceRepos = await resolveWorkspaceRepos();
@@ -237,32 +248,15 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     return 1;
   }
 
-  if (!allowDirtyStartup) {
-    const dirty = dirtyRepos(workspaceRepos);
-    if (dirty.length > 0) {
-      await releasePidFile().catch(() => undefined);
-      await releaseVibeLock().catch(() => undefined);
-      process.stderr.write(
-        `error: working tree is dirty in ${formatRepoList(
-          dirty,
-        )}. Commit or stash changes before running lauren vibe.\n`,
-      );
-      return 1;
-    }
-  }
-
-  const wrongBranch: { repo: string; branch: string }[] = [];
-  for (const repo of workspaceRepos) {
-    try {
-      const branch = getCurrentBranch(repo.root);
-      if (branch !== config.dev_branch) wrongBranch.push({ repo: repo.name, branch });
-    } catch (err) {
-      await releasePidFile().catch(() => undefined);
-      await releaseVibeLock().catch(() => undefined);
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`error: failed to read branch in ${repo.name}: ${msg}\n`);
-      return 1;
-    }
+  let wrongBranch: ReturnType<typeof wrongBranchRepos>;
+  try {
+    wrongBranch = wrongBranchRepos(workspaceRepos, config.dev_branch, await store.read());
+  } catch (err) {
+    await releasePidFile().catch(() => undefined);
+    await releaseVibeLock().catch(() => undefined);
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`error: failed to read workspace branch: ${msg}\n`);
+    return 1;
   }
   if (wrongBranch.length > 0) {
     await releasePidFile().catch(() => undefined);
@@ -383,7 +377,9 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
 export function configureVibeCommand(command: Command): Command {
   command
     .description(
-      'Plan queue executor — drains .lauren/plans.json one plan at a time (claude → codex → claude → commit).',
+      'Plan queue executor — drains .lauren/plans.json one plan at a time ' +
+        '(implement → review → fix → commit). Each pipeline phase routes through the ' +
+        'agent configured in .lauren/config.json (defaults: claude → codex → claude).',
     )
     .allowExcessArguments(false)
     .option('--dry-run', 'print queue and exit without running anything', false)

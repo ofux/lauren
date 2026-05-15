@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 
+import { DEFAULT_AGENTS } from '../agents/types.js';
 import { DEFAULT_CONFIG, LaurenConfigError, readLaurenConfig } from './config.js';
 import type { LaurenContext } from './paths.js';
 
@@ -69,5 +70,50 @@ describe('readLaurenConfig', () => {
     await fs.writeFile(configPath, JSON.stringify({ version: 1, dev_branch: '' }));
     const cfg = await readLaurenConfig(context);
     expect(cfg.dev_branch).toBe(DEFAULT_CONFIG.dev_branch);
+  });
+
+  test('returns default agents when the agents block is missing', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1 }));
+    const cfg = await readLaurenConfig(context);
+    expect(cfg.agents).toEqual(DEFAULT_AGENTS);
+  });
+
+  test('merges a partial agents block over the defaults', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ version: 1, agents: { implement: 'codex', fix: 'codex' } }),
+    );
+    const cfg = await readLaurenConfig(context);
+    expect(cfg.agents).toEqual({
+      ...DEFAULT_AGENTS,
+      implement: 'codex',
+      fix: 'codex',
+    });
+  });
+
+  test('rejects an unknown agent name', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1, agents: { implement: 'gpt5' } }));
+    await expect(readLaurenConfig(context)).rejects.toMatchObject({
+      name: 'LaurenConfigError',
+      message: expect.stringContaining('agents.implement'),
+    });
+  });
+
+  test('rejects an unknown agents role', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1, agents: { plan: 'claude' } }));
+    await expect(readLaurenConfig(context)).rejects.toMatchObject({
+      name: 'LaurenConfigError',
+      message: expect.stringContaining('unknown role'),
+    });
+  });
+
+  test('rejects a non-object agents value', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1, agents: 'claude' }));
+    await expect(readLaurenConfig(context)).rejects.toBeInstanceOf(LaurenConfigError);
   });
 });

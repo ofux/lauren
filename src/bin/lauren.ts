@@ -6,8 +6,10 @@ import { Command } from 'commander';
 import { render } from 'ink';
 import React from 'react';
 
+import { getAgent } from '../agents/index.js';
 import { printTodoTable } from '../cli/table.js';
 import type { CheckpointEntry } from '../core/checkpoints.js';
+import { type LaurenConfig, LaurenConfigError, readLaurenConfig } from '../core/config.js';
 import {
   ARCH_PATH,
   DOCS_DIR,
@@ -27,7 +29,7 @@ import { PlanStore } from '../core/store.js';
 import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
-import { cmdInitClaude, cmdPlanPrompt } from '../init-claude.js';
+import { cmdInitClaude } from '../init-claude.js';
 import { PLAN_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT } from '../lauren-prompts.js';
 import { runClaudeInteractive } from '../proc/claude.js';
 import { slugHasLaurenHistory } from '../proc/git.js';
@@ -320,10 +322,23 @@ async function cmdTodoTui(): Promise<number> {
   }
 
   const store = new PlanStore();
+  let config: LaurenConfig;
+  try {
+    config = await readLaurenConfig();
+  } catch (err) {
+    if (err instanceof LaurenConfigError) {
+      process.stderr.write(`error: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
 
-  const inkApp = render(React.createElement(TodoApp, { store }), {
-    exitOnCtrlC: true,
-  });
+  const inkApp = render(
+    React.createElement(TodoApp, { store, brainAgent: getAgent(config.agents.brain) }),
+    {
+      exitOnCtrlC: true,
+    },
+  );
 
   await inkApp.waitUntilExit();
   return 0;
@@ -388,10 +403,6 @@ async function main(): Promise<void> {
         }),
       );
     });
-
-  program.command('_plan-prompt', { hidden: true }).action(() => {
-    process.exit(cmdPlanPrompt());
-  });
 
   await program.parseAsync(process.argv);
 }

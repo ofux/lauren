@@ -13,10 +13,14 @@ Trigger `/lauren` from Claude Code to describe what you want next. The Lauren da
 Once running, Lauren keeps looping through the TODO list and, for each task:
 
 - create an isolated git worktree;
-- ask Claude to implement the task;
-- ask Codex to review the result;
-- ask Claude to fix issues from the review;
+- ask the configured agent to implement the task (defaults to Claude);
+- ask the configured agent to review the result (defaults to Codex);
+- ask the configured agent to fix issues from the review (defaults to Claude);
 - merge the work automatically, or open a PR depending on your configuration.
+
+Each pipeline phase (and the merger conflict-resolver and brain placement
+calls) can be routed to either `claude` or `codex` independently — see
+the `agents` block in [Configuration](#configuration).
 
 In other words, Lauren is a never-ending Ralph-style loop with a live, editable plan. You keep deciding what should happen next; Lauren keeps turning the plan into code.
 
@@ -107,6 +111,31 @@ Pressing `r` in the `lauren` TUI runs the same AI pass across the whole pending
 todo as a one-shot. Use it when the queue has drifted, when several plans
 overlap, or when you want the next run to execute in a better order. It is
 disabled while `lauren vibe` is alive (the daemon owns the queue while running).
+
+## Configuration
+
+Settings live in `.lauren/config.json` in your project. All fields are optional;
+missing fields fall back to the defaults shown below:
+
+```json
+{
+  "version": 1,
+  "dev_branch": "main",
+  "merge_mode": "auto",
+  "agents": {
+    "implement": "claude",
+    "review": "codex",
+    "fix": "claude",
+    "merger": "claude",
+    "brain": "claude"
+  }
+}
+```
+
+Each `agents` role accepts `"claude"` or `"codex"` and can be configured
+independently. The three pipeline phases (`implement`, `review`, `fix`) cover
+the per-plan run; `merger` is invoked only when an auto-merge hits conflicts;
+`brain` runs the JSON placement / reorganize decisions over the queue.
 
 ## Commands
 

@@ -4,13 +4,14 @@ import lockfile from 'proper-lockfile';
 
 import type { LaurenConfig } from './core/config.js';
 import { VIBE_LOCK_PATH } from './core/paths.js';
-import { materializeSteps, type StepEntry } from './core/steps.js';
+import { materializeSteps, type StepEntry, type StepPhase } from './core/steps.js';
 import type { PlanStore } from './core/store.js';
 import { nowIso } from './core/time.js';
 import {
   ImplementingLocked,
   type Plan,
   type PlanFailure,
+  type PlanMergeBlock,
   PlanNotFound,
   PlanPreconditionFailed,
   planFilePath,
@@ -20,10 +21,10 @@ import {
   type ResolvedWorkspaceRepo,
   resolveWorkspaceRepos,
 } from './core/workspace.js';
-import { RunFailure, runPlan } from './executor.js';
+import { RunFailure, resumePhaseForFailure, runPlan } from './executor.js';
 import { finalizeMerge, mergePlanOnce, PR_POLL_INTERVAL_MS } from './merger.js';
 import { type BrainCancelState, processEnqueuedPlan } from './organize.js';
-import { workingTreeDirty } from './proc/git.js';
+import { dirtyPaths, workingTreeDirty } from './proc/git.js';
 import { newPlanRuntimeState, type PlanItem, type WatcherRuntime } from './tui/runtime.js';
 import { cleanupPlanWorktrees, setupPlanWorktrees } from './worktree.js';
 
@@ -84,6 +85,12 @@ function runtimeItemsForPlan(plan: Plan): PlanItem[] {
       .map((step) => ({ id: step.id, title: step.title }));
   }
   return [{ id: plan.slug, title: plan.title }];
+}
+
+const STEP_PHASE_SET: ReadonlySet<string> = new Set(['implement', 'review', 'fix', 'commit']);
+
+function isStepPhase(phase: string): phase is StepPhase {
+  return STEP_PHASE_SET.has(phase);
 }
 
 function failureFromError(err: unknown): PlanFailure {
@@ -236,6 +243,7 @@ export interface WatcherLoopHandles {
 async function drainEnqueued(
   runtime: WatcherRuntime,
   store: PlanStore,
+  config: LaurenConfig,
   signal: AbortSignal,
   handles: WatcherLoopHandles,
 ): Promise<void> {
@@ -252,6 +260,7 @@ async function drainEnqueued(
         plan: next,
         store,
         state: handles.brainState,
+        brainAgent: config.agents.brain,
         notify: ({ level, text }) => {
           if (level === 'error') {
             process.stderr.write(`brain: ${text}\n`);
@@ -340,6 +349,98 @@ async function applyMergingCancellation(args: {
   return { persistedCleanupFailure: false };
 }
 
+/**
+ * Persist a 'merge_blocked' transition: stamp the block info on the row
+ * and surface the pause to the TUI (which fires the user notification).
+ * Swallows ImplementingLocked/PlanNotFound the same way markPlanFinal
+ * does, so a concurrent cancel between the merge attempt and this write
+ * doesn't propagate.
+ */
+async function stampMergeBlocked(
+  store: PlanStore,
+  runtime: WatcherRuntime,
+  plan: Plan,
+  block: PlanMergeBlock,
+  mode: 'auto' | 'github-pr',
+): Promise<void> {
+  try {
+    const updated = await store.update(
+      plan.slug,
+      { status: 'merge_blocked', merge_block: block },
+      { allowMerging: true },
+    );
+    runtime.setPausedMergeBlocked(await store.read(), updated, block, mode);
+  } catch (err) {
+    if (!(err instanceof ImplementingLocked) && !(err instanceof PlanNotFound)) throw err;
+  }
+}
+
+/**
+ * Sweep every 'merge_blocked' row and check whether its parent checkout
+ * is now clean. If so, clear the block and promote back to 'merging' —
+ * the next drainMerging tick picks it up and retries autoMerge from the
+ * top. Best-effort: per-row failures log and continue (a leaked block is
+ * just slow, not catastrophic).
+ */
+async function promoteUnblockedMerges(store: PlanStore, plans: readonly Plan[]): Promise<boolean> {
+  let promotedAny = false;
+  for (const plan of plans) {
+    if (plan.status !== 'merge_blocked') continue;
+    const block = plan.merge_block;
+    if (!block) {
+      // Defensive: a merge_blocked row without merge_block is malformed.
+      // Clear the status so the daemon doesn't get stuck. Treat as
+      // returning to 'merging' — autoMerge will re-detect any block.
+      try {
+        await store.update(plan.slug, { status: 'merging' });
+        promotedAny = true;
+      } catch (err) {
+        if (!(err instanceof PlanNotFound)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`warning: failed to clear merge_block on '${plan.slug}': ${msg}\n`);
+        }
+      }
+      continue;
+    }
+    if (!plan.cancel_requested) {
+      // Recheck only the specific files git named in its refusal. Unrelated
+      // WIP elsewhere in the repo doesn't keep the pause active — that's
+      // the whole point of letting git decide what counts as a conflict.
+      // If block.files is empty/missing (defensive fallback), promote
+      // unconditionally; the next autoMerge attempt will re-stamp if git
+      // still refuses.
+      if (block.files && block.files.length > 0) {
+        let stillDirty: string[];
+        try {
+          stillDirty = dirtyPaths(block.parent_root, block.files);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `warning: failed to recheck dirty paths for '${plan.slug}' at ${block.parent_root}: ${msg}\n`,
+          );
+          continue;
+        }
+        if (stillDirty.length > 0) continue;
+      }
+    }
+    // Either the named files are clean again, or the user cancelled —
+    // promote back to 'merging' so drainMerging picks it up and either
+    // retries the merge or honors the cancel (intent=keep/revert).
+    try {
+      await store.update(plan.slug, { status: 'merging', merge_block: null });
+      promotedAny = true;
+    } catch (err) {
+      if (!(err instanceof PlanNotFound)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `warning: failed to promote merge_blocked '${plan.slug}' to merging: ${msg}\n`,
+        );
+      }
+    }
+  }
+  return promotedAny;
+}
+
 async function drainMerging(
   runtime: WatcherRuntime,
   store: PlanStore,
@@ -414,6 +515,17 @@ async function drainMerging(
       await finalizeMerge(store, merging.slug, result);
       resetMergeHandles(handles);
       continue;
+    }
+
+    if (result.kind === 'paused') {
+      // Auto-merge precondition (clean parent checkout) failed. Demote to
+      // 'merge_blocked' and bail out of drainMerging so the outer loop can
+      // pause-and-poll until the user resolves the dirty tree. The watcher
+      // will promote merge_blocked → merging once the precondition clears
+      // (see promoteUnblockedMerges below).
+      await stampMergeBlocked(store, runtime, merging, result.block, config.merge_mode);
+      resetMergeHandles(handles);
+      return;
     }
 
     if (result.kind === 'cleanup_failed') {
@@ -492,6 +604,10 @@ export async function watcherLoop(
   let cancelledSlug: string | null = null;
   let requireCleanWorkspaceAfterCancelling = false;
   while (!signal.aborted) {
+    // Promote any 'merge_blocked' rows whose parent checkout has been
+    // cleaned up by the user (back to 'merging'), then drain merging.
+    await promoteUnblockedMerges(store, await store.read());
+
     // Drain any in-flight merge before touching the rest of the queue.
     // For github-pr mode this polls every PR_POLL_INTERVAL_MS until the PR
     // resolves; the daemon does no other work in the meantime.
@@ -499,6 +615,23 @@ export async function watcherLoop(
     if (signal.aborted) break;
 
     const beforeDrain = await store.read();
+
+    // A 'merge_blocked' row at the front of the queue: surface the pause
+    // banner and poll. The merger emits this when autoMerge can't proceed
+    // on a dirty parent checkout; promoteUnblockedMerges (top of loop)
+    // resumes it once the user commits/stashes. Out-of-order completion
+    // is avoided by short-circuiting the rest of the queue here.
+    const merge_blocked = beforeDrain.find((p) => p.status === 'merge_blocked');
+    if (merge_blocked) {
+      const block = merge_blocked.merge_block;
+      if (block) {
+        runtime.setPausedMergeBlocked(beforeDrain, merge_blocked, block, config.merge_mode);
+      } else {
+        runtime.setIdle(beforeDrain);
+      }
+      await sleep(IDLE_POLL_SECONDS * 1000, signal);
+      continue;
+    }
 
     // A 'cancelling' row means the user cancelled an implementing plan with
     // intent='keep'. The working tree still has the partial work; vibe must
@@ -529,7 +662,7 @@ export async function watcherLoop(
 
     // Phase A: drain every enqueued plan before touching the ready queue.
     // New plans landing mid-implement will be placed on the next iteration.
-    await drainEnqueued(runtime, store, signal, handles);
+    await drainEnqueued(runtime, store, config, signal, handles);
     if (signal.aborted) break;
 
     const plans = await store.read();
@@ -613,7 +746,7 @@ export async function watcherLoop(
     // Re-parse Steps from the (possibly-edited) plan file and reconcile with
     // stored state. This is the only place per-step state is materialized at
     // execution time — everything downstream trusts `claimed.steps`.
-    const reconciledSteps = materializeSteps(planText, next.steps);
+    let reconciledSteps = materializeSteps(planText, next.steps);
 
     // Provision worktrees BEFORE flipping the row to `implementing` so that
     // a crash between status-flip and worktree-create can't leave us with
@@ -635,6 +768,20 @@ export async function watcherLoop(
       continue;
     }
 
+    // commitResumeStale: a prior run's worktree was missing on disk so we
+    // had to recreate it. The implement+fix diff is gone — scrub the
+    // commit-resume hints so the executor reruns from implement instead of
+    // taking the "clean tree = manual commit" shortcut on the fresh tree.
+    let nextLastFailedPhase: Plan['last_failed_phase'] = next.last_failed_phase ?? null;
+    if (execCtx.commitResumeStale) {
+      if (reconciledSteps !== null) {
+        reconciledSteps = reconciledSteps.map((entry) =>
+          entry.failed_phase === 'commit' ? { ...entry, failed_phase: null } : entry,
+        );
+      }
+      nextLastFailedPhase = null;
+    }
+
     let claimed: Plan;
     try {
       // Require the row to still be `ready` at lock time. Without this CAS,
@@ -650,6 +797,7 @@ export async function watcherLoop(
           failure: null,
           steps: reconciledSteps,
           worktrees: execCtx.worktrees,
+          last_failed_phase: nextLastFailedPhase,
         },
         {
           precondition: (p) => p.status === 'ready',
@@ -657,11 +805,14 @@ export async function watcherLoop(
         },
       );
     } catch (err) {
-      // Roll back worktree allocation if the claim failed.
-      await cleanupPlanWorktrees(
-        { ...next, worktrees: execCtx.worktrees },
-        { keepBranches: true },
-      ).catch(() => undefined);
+      // Roll back only worktrees allocated for this claim. Reused
+      // commit-resume worktrees may contain preserved uncommitted diffs.
+      if (!execCtx.reusedWorktrees) {
+        await cleanupPlanWorktrees(
+          { ...next, worktrees: execCtx.worktrees },
+          { keepBranches: true },
+        ).catch(() => undefined);
+      }
       if (
         err instanceof ImplementingLocked ||
         err instanceof PlanNotFound ||
@@ -703,6 +854,7 @@ export async function watcherLoop(
         dryRun: false,
         targetRepos: execCtx.rewrittenRepos,
         cwd: execCtx.rootCwd,
+        agents: config.agents,
         progress: runtime,
         signal: merged,
         onStepUpdate,
@@ -734,9 +886,18 @@ export async function watcherLoop(
       if (signal.aborted) {
         return { inFlight, cancelledSlug };
       }
+      const resumePhase = resumePhaseForFailure(err);
+      const failure = failureFromError(err);
+      // Persist the failed phase for resume hints. Multi-step plans already
+      // got per-step `failed_phase` written by the executor's onStepUpdate
+      // callback before the throw; the plan-level field handles the
+      // single-unit case. Hard zero-diff commit failures intentionally get
+      // no hint because there is no preserved diff to commit on retry.
+      const planFailedPhase = resumePhase !== null && isStepPhase(resumePhase) ? resumePhase : null;
       await markPlanFinal(store, claimed.slug, {
         status: 'failed',
-        failure: failureFromError(err),
+        failure,
+        last_failed_phase: planFailedPhase,
       });
       inFlight = null;
       continue;
