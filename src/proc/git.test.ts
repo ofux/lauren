@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
+  getCurrentBranch,
   gitAddAll,
   gitAddPaths,
   gitBranchHasDiff,
   gitCommit,
+  hasAnyCommits,
   hasUnresolvedMergeConflicts,
   listUnresolvedConflicts,
   parseDirtyMergeRefusal,
@@ -188,6 +190,20 @@ describe('git worktree helpers', () => {
     expect(slugHasLaurenHistory('single-plan', repoDir)).toBe(true);
   });
 
+  test('getCurrentBranch returns the branch name on a normal repo', () => {
+    expect(getCurrentBranch(repoDir)).toBe('main');
+  });
+
+  test('hasAnyCommits is true once at least one commit exists', () => {
+    expect(hasAnyCommits(repoDir)).toBe(true);
+  });
+
+  test('getCurrentBranch returns "HEAD" on a detached checkout', () => {
+    const sha = git(repoDir, 'rev-parse', 'HEAD').trim();
+    git(repoDir, 'checkout', '-q', '--detach', sha);
+    expect(getCurrentBranch(repoDir)).toBe('HEAD');
+  });
+
   test('gitCommit honors cwd and captures output', async () => {
     await fs.writeFile(path.join(repoDir, 'feature.txt'), 'feature\n', 'utf8');
     gitAddAll(repoDir);
@@ -196,6 +212,31 @@ describe('git worktree helpers', () => {
 
     expect(result.code).toBe(0);
     expect(git(repoDir, 'log', '-1', '--pretty=%s').trim()).toBe('feature commit');
+  });
+});
+
+describe('getCurrentBranch on an unborn branch', () => {
+  let repoDir: string;
+
+  beforeEach(async () => {
+    repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lauren-git-unborn-'));
+    git(repoDir, 'init', '-q', '-b', 'main');
+  });
+
+  afterEach(async () => {
+    await fs.rm(repoDir, { recursive: true, force: true });
+  });
+
+  test('returns the branch name when the repo has no commits yet', () => {
+    // Regression: `git rev-parse --abbrev-ref HEAD` fails with exit 128 on an
+    // unborn branch ("fatal: ambiguous argument 'HEAD'"), which surfaced as
+    // "error: failed to read workspace branch" when `lauren vibe` ran in a
+    // freshly initialized repo.
+    expect(getCurrentBranch(repoDir)).toBe('main');
+  });
+
+  test('hasAnyCommits is false on an unborn branch', () => {
+    expect(hasAnyCommits(repoDir)).toBe(false);
   });
 });
 

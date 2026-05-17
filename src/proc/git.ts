@@ -131,11 +131,28 @@ export function gitAddPaths(cwd: string, paths: readonly string[]): void {
 }
 
 export function getCurrentBranch(cwd: string = REPO): string {
+  // symbolic-ref returns the branch name on an unborn branch (fresh `git init`
+  // with no commits yet), where `rev-parse --abbrev-ref HEAD` fails with
+  // "ambiguous argument 'HEAD'". Fall back to rev-parse only for detached HEAD,
+  // where symbolic-ref doesn't work and rev-parse returns the literal 'HEAD'.
+  const sym = runSync(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], cwd);
+  if (sym.code === 0) return sym.stdout.trim();
   const r = runSync(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd);
   if (r.code !== 0) {
     throw new Error(`git rev-parse --abbrev-ref HEAD exited ${r.code}: ${r.stderr.trim()}`);
   }
   return r.stdout.trim();
+}
+
+/**
+ * True iff `cwd` is a git repo with at least one commit (HEAD resolves).
+ * Returns false on an unborn branch (`git init` with no commits yet);
+ * callers that need to distinguish "not a git repo" from "no commits"
+ * should validate the `.git` entry separately.
+ */
+export function hasAnyCommits(cwd: string = REPO): boolean {
+  const r = runSync(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], cwd);
+  return r.code === 0;
 }
 
 export function gitBranchExists(branch: string, cwd: string = REPO): boolean {

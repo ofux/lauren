@@ -8,6 +8,7 @@ import { displayPath, LAUREN_DIR, VIBE_LOCK_PATH, VIBE_PID_PATH } from './core/p
 import { PlanStore } from './core/store.js';
 import { type Plan, PlanNotFound, PreparingLocked } from './core/types.js';
 import { type ResolvedWorkspaceRepo, resolveWorkspaceRepos } from './core/workspace.js';
+import { ensureInitialCommit } from './init-repo.js';
 import { getCurrentBranch } from './proc/git.js';
 import { writePidFile } from './proc/pid.js';
 import { App } from './tui/App.js';
@@ -246,6 +247,27 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`error: ${msg}\n`);
     return 1;
+  }
+
+  // Bootstrap empty repos so the rest of the pipeline (branch lookup,
+  // worktree creation, commits) has a HEAD to anchor to. Only touches
+  // repos on an unborn branch — no-op otherwise.
+  for (const repo of workspaceRepos) {
+    try {
+      const created = await ensureInitialCommit(repo.root);
+      if (created) {
+        const label = workspaceRepos.length > 1 ? `${repo.name}: ` : '';
+        process.stdout.write(
+          `${label}created initial commit ('.gitignore' with '.lauren/') to bootstrap empty repo.\n`,
+        );
+      }
+    } catch (err) {
+      await releasePidFile().catch(() => undefined);
+      await releaseVibeLock().catch(() => undefined);
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`error: failed to bootstrap '${repo.name}': ${msg}\n`);
+      return 1;
+    }
   }
 
   let wrongBranch: ReturnType<typeof wrongBranchRepos>;
