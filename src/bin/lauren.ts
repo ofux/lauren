@@ -30,6 +30,7 @@ import { nowIso } from '../core/time.js';
 import { type Plan, planFilePath, SlugCollision } from '../core/types.js';
 import { formatRepoList, resolveWorkspaceRepos, WorkspaceConfigError } from '../core/workspace.js';
 import { cmdInitClaude } from '../init-claude.js';
+import { cmdInitCodex } from '../init-codex.js';
 import { PLAN_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT } from '../lauren-prompts.js';
 import { runClaudeInteractive } from '../proc/claude.js';
 import { slugHasLaurenHistory } from '../proc/git.js';
@@ -390,16 +391,51 @@ async function main(): Promise<void> {
       );
     });
 
-  program
+  type InitOpts = { global?: boolean; force?: boolean };
+  const init = program
     .command('init')
-    .description('install the `lauren` skill and /lauren slash command for Claude Code')
-    .option('--global', 'install to ~/.claude/ instead of ./.claude/')
+    .description(
+      'install the `lauren` skill (and /lauren slash command for Claude Code) for Claude Code and Codex',
+    )
+    .option('--global', 'install to ~/.claude/ and ~/.agents/ instead of project-local')
     .option('--force', 'overwrite existing files')
-    .action(async (opts: { global?: boolean; force?: boolean }) => {
+    .action(async (_opts: InitOpts, cmd: Command) => {
+      // Use optsWithGlobals so the same flags work whether they come before or
+      // after a subcommand name on the CLI.
+      const merged = cmd.optsWithGlobals() as InitOpts;
+      const global = merged.global ?? false;
+      const force = merged.force ?? false;
+      const claudeRc = await cmdInitClaude({ global, force });
+      const codexRc = await cmdInitCodex({ global, force });
+      process.exit(claudeRc || codexRc);
+    });
+
+  init
+    .command('claude')
+    .description('install Claude Code assets only')
+    .option('--global', 'install to ~/.claude/ instead of project-local')
+    .option('--force', 'overwrite existing files')
+    .action(async (_opts: InitOpts, cmd: Command) => {
+      const merged = cmd.optsWithGlobals() as InitOpts;
       process.exit(
         await cmdInitClaude({
-          global: opts.global ?? false,
-          force: opts.force ?? false,
+          global: merged.global ?? false,
+          force: merged.force ?? false,
+        }),
+      );
+    });
+
+  init
+    .command('codex')
+    .description('install Codex assets only')
+    .option('--global', 'install to ~/.agents/ instead of project-local')
+    .option('--force', 'overwrite existing files')
+    .action(async (_opts: InitOpts, cmd: Command) => {
+      const merged = cmd.optsWithGlobals() as InitOpts;
+      process.exit(
+        await cmdInitCodex({
+          global: merged.global ?? false,
+          force: merged.force ?? false,
         }),
       );
     });

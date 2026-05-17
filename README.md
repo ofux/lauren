@@ -71,11 +71,13 @@ This will help you create a solid (but simple) initial spec for your project.
 
 ### Init
 
-In the repository you want Lauren to modify, initialize Lauren to install required SKILLs:
+In the repository you want Lauren to modify, initialize Lauren to install the required skills (and Claude Code `/lauren` slash command):
 
 ```sh
 lauren init
 ```
+
+This installs both the Claude Code skill + `/lauren` slash command (under `.claude/`) and the Codex skill (under `.agents/skills/lauren/SKILL.md`). Add `--global` to install to `~/.claude/` and `~/.agents/` instead. To install only one side, use `lauren init claude` or `lauren init codex`.
 
 ### Start
 
