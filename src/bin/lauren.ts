@@ -349,7 +349,7 @@ async function main(): Promise<void> {
   program
     .name('lauren')
     .description('Queue-driven plan/vibe lifecycle runner.')
-    .version('0.1.0')
+    .version('0.1.1')
     .allowExcessArguments(false)
     .option('--list', 'print a static table and exit (no TUI)', false)
     .action(async (opts: { list: boolean }) => {

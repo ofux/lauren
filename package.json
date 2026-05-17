@@ -1,6 +1,6 @@
 {
-  "name": "lauren",
-  "version": "0.1.0",
+  "name": "@ofux/lauren",
+  "version": "0.1.1",
   "description": "Queue-driven plan/vibe lifecycle runner",
   "type": "module",
   "license": "MIT",
@@ -15,6 +15,23 @@
     "!dist/bin/vibe.js",
     "!dist/bin/vibe.js.map"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ofux/lauren.git"
+  },
+  "homepage": "https://github.com/ofux/lauren#readme",
+  "bugs": {
+    "url": "https://github.com/ofux/lauren/issues"
+  },
+  "keywords": [
+    "claude",
+    "codex",
+    "agent",
+    "automation",
+    "cli",
+    "queue",
+    "ralph"
+  ],
   "scripts": {
     "build": "tsc && chmod +x dist/bin/lauren.js",
     "watch": "tsc --watch",
@@ -24,7 +41,8 @@
     "lint": "biome lint",
     "check": "biome check --write",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run clean && npm run build && npm test"
   },
   "dependencies": {
     "commander": "^12.1.0",

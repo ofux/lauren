@@ -34,6 +34,10 @@ Run `lauren` from inside the project you want to change, not from the lauren ins
 
 ## Install
 
+```sh
+npm install -g @ofux/lauren
+```
+
 From source:
 
 ```sh
