@@ -34,6 +34,15 @@ function PlanRowInner({ plan, age }: { plan: Plan; age: string }): React.ReactEl
         <Text> </Text>
       </>
     );
+  else if (plan.status === 'preparing')
+    // The brain is actively placing this plan; mirror the organizing panel's
+    // spinner so the in-flight queue row is obvious at a glance.
+    icon = (
+      <>
+        <Spinner />
+        <Text> </Text>
+      </>
+    );
   else if (plan.status === 'failed')
     icon = (
       <Text color="red" bold>
@@ -58,6 +67,18 @@ function PlanRowInner({ plan, age }: { plan: Plan; age: string }): React.ReactEl
         🚦{' '}
       </Text>
     );
+  else if (plan.status === 'enqueued')
+    icon = (
+      <Text color="yellow" bold>
+        ·{' '}
+      </Text>
+    );
+  else if (plan.status === 'ready')
+    icon = (
+      <Text color="green" bold>
+        ·{' '}
+      </Text>
+    );
   else if (plan.status === 'cancelled') icon = <Text dimColor>⊘ </Text>;
   else icon = <Text dimColor>· </Text>;
 
@@ -65,7 +86,10 @@ function PlanRowInner({ plan, age }: { plan: Plan; age: string }): React.ReactEl
   if (plan.status === 'implementing' || plan.status === 'merging') titleProps.bold = true;
   else if (plan.status === 'failed' || plan.status === 'cancelling') titleProps.color = 'red';
   else if (plan.status === 'merge_blocked') titleProps.color = 'yellow';
-  else if (plan.status === 'awaiting_human') titleProps.color = 'magenta';
+  else if (plan.status === 'awaiting_human' || plan.status === 'preparing')
+    titleProps.color = 'magenta';
+  else if (plan.status === 'enqueued') titleProps.color = 'yellow';
+  else if (plan.status === 'ready') titleProps.color = 'green';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
   return (
@@ -86,7 +110,11 @@ function PlanRowInner({ plan, age }: { plan: Plan; age: string }): React.ReactEl
 // primitive snapshot from the parent; computing it inside the comparator would
 // produce the same "now" value for both sides and freeze labels such as `59s`
 // on otherwise-static rows.
-const ANIMATED_PLAN_STATUSES: ReadonlySet<PlanStatus> = new Set(['implementing', 'merging']);
+const ANIMATED_PLAN_STATUSES: ReadonlySet<PlanStatus> = new Set([
+  'implementing',
+  'merging',
+  'preparing',
+]);
 
 const PlanRow = React.memo(PlanRowInner, (prev, next) => {
   if (ANIMATED_PLAN_STATUSES.has(next.plan.status)) return false;
@@ -157,7 +185,11 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
         {counts.merge_blocked > 0 && (
           <Text color="yellow" bold>{`  ·  ${counts.merge_blocked} merge blocked`}</Text>
         )}
-        {counts.ready > 0 && <Text>{`  ·  ${counts.ready} ready`}</Text>}
+        {counts.preparing > 0 && (
+          <Text color="magenta">{`  ·  ${counts.preparing} preparing`}</Text>
+        )}
+        {counts.ready > 0 && <Text color="green">{`  ·  ${counts.ready} ready`}</Text>}
+        {counts.enqueued > 0 && <Text color="yellow">{`  ·  ${counts.enqueued} enqueued`}</Text>}
         {counts.failed > 0 && <Text color="red" bold>{`  ·  ${counts.failed} failed`}</Text>}
         {counts.awaiting_human > 0 && (
           <Text color="magenta" bold>{`  ·  ${counts.awaiting_human} awaiting human`}</Text>

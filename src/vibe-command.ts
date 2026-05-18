@@ -302,7 +302,7 @@ async function cmdVibe(opts: { dryRun: boolean }): Promise<number> {
     brainState: { current: null, controller: null },
   };
 
-  const inkApp = render(React.createElement(App, { runtime }), {
+  const inkApp = render(React.createElement(App, { runtime, store }), {
     exitOnCtrlC: false,
   });
 

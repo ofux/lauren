@@ -11,6 +11,7 @@ import { WatcherProgress } from './WatcherProgress.js';
 
 interface Props {
   runtime: WatcherRuntime;
+  store: PlanStore;
 }
 
 // Single render budget for both sources of updates (animation timer + runtime
@@ -20,7 +21,13 @@ interface Props {
 // coalesced through `schedule()` so React never re-renders more than ~10×/sec.
 const TICK_INTERVAL_MS = 100;
 
-export function App({ runtime }: Props): React.ReactElement {
+// Cadence for re-reading the plan store so newly enqueued plans surface in
+// the queue panel even while the watcher loop is blocked in a long-running
+// phase (e.g. implementing, sleeping between iterations). Matches
+// `TodoApp.POLL_INTERVAL_MS` so both TUIs feel equally fresh.
+const PLAN_POLL_INTERVAL_MS = 500;
+
+export function App({ runtime, store }: Props): React.ReactElement {
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -49,6 +56,26 @@ export function App({ runtime }: Props): React.ReactElement {
       if (pendingTimer !== null) clearTimeout(pendingTimer);
     };
   }, [runtime]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async (): Promise<void> => {
+      try {
+        const plans = await store.read();
+        if (!cancelled) runtime.refreshPlans(plans);
+      } catch {
+        // Best-effort: the watcher loop is the authoritative reader and
+        // will surface real store errors.
+      }
+    };
+    const handle = setInterval(() => {
+      void poll();
+    }, PLAN_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [runtime, store]);
 
   useInput((input, key) => {
     // Ink keeps stdin in raw mode while `useInput` is mounted, which
