@@ -13,26 +13,42 @@ interface Props {
   runtime: WatcherRuntime;
 }
 
-const TICK_INTERVAL_MS = 80; // ~12 Hz, matches Python's Live(refresh_per_second=12)
+// Single render budget for both sources of updates (animation timer + runtime
+// notifications). 100ms matches the spinner cadence in `spinnerFrame()`; any
+// faster just redraws identical frames and shows up as flicker on most
+// terminals. Both the heartbeat and bursty notify()-driven updates are
+// coalesced through `schedule()` so React never re-renders more than ~10×/sec.
+const TICK_INTERVAL_MS = 100;
 
 export function App({ runtime }: Props): React.ReactElement {
   const [, setTick] = useState(0);
 
   useEffect(() => {
-    const unsubscribe = runtime.subscribe(() => {
-      setTick((t) => (t + 1) | 0);
-    });
-    return unsubscribe;
-  }, [runtime]);
+    let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastRenderAt = 0;
 
-  // Animation tick — drives spinners and elapsed-time displays. Always
-  // running (idle/running/paused) so spinners animate when idle too.
-  useEffect(() => {
-    const id = setInterval(() => {
-      setTick((t) => (t + 1) | 0);
-    }, TICK_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, []);
+    const schedule = (): void => {
+      if (pendingTimer !== null) return;
+      const elapsed = performance.now() - lastRenderAt;
+      const delay = elapsed >= TICK_INTERVAL_MS ? 0 : TICK_INTERVAL_MS - elapsed;
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        lastRenderAt = performance.now();
+        setTick((t) => (t + 1) | 0);
+      }, delay);
+    };
+
+    const unsubscribe = runtime.subscribe(schedule);
+    // Heartbeat so spinners and elapsed-time displays keep moving while idle
+    // (no notify() calls to drive them).
+    const heartbeat = setInterval(schedule, TICK_INTERVAL_MS);
+
+    return () => {
+      unsubscribe();
+      clearInterval(heartbeat);
+      if (pendingTimer !== null) clearTimeout(pendingTimer);
+    };
+  }, [runtime]);
 
   useInput((input, key) => {
     // Ink keeps stdin in raw mode while `useInput` is mounted, which

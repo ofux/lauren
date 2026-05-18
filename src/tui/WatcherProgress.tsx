@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import type React from 'react';
+import React from 'react';
 
 import { fmtAge, fmtDuration, monotonicSeconds } from '../core/time.js';
 import type { Plan, PlanStatus } from '../core/types.js';
@@ -12,7 +12,7 @@ interface Props {
   runtime: WatcherRuntime;
 }
 
-function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
+function PlanRowInner({ plan, age }: { plan: Plan; age: string }): React.ReactElement {
   let icon: React.ReactNode;
   if (plan.status === 'done')
     icon = (
@@ -68,7 +68,6 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
   else if (plan.status === 'awaiting_human') titleProps.color = 'magenta';
   else if (plan.status === 'done' || plan.status === 'cancelled') titleProps.dimColor = true;
 
-  const age = fmtAge(plan.created_at);
   return (
     <Box>
       {icon}
@@ -79,6 +78,25 @@ function PlanRow({ plan }: { plan: Plan }): React.ReactElement {
     </Box>
   );
 }
+
+// PlanStore.read() returns fresh objects each refresh, so plan references
+// always differ between renders — default shallow memo would never skip.
+// Compare just the fields we display. Animated statuses (with spinners) must
+// re-render every tick so the spinner glyph advances. Age is passed as a
+// primitive snapshot from the parent; computing it inside the comparator would
+// produce the same "now" value for both sides and freeze labels such as `59s`
+// on otherwise-static rows.
+const ANIMATED_PLAN_STATUSES: ReadonlySet<PlanStatus> = new Set(['implementing', 'merging']);
+
+const PlanRow = React.memo(PlanRowInner, (prev, next) => {
+  if (ANIMATED_PLAN_STATUSES.has(next.plan.status)) return false;
+  return (
+    prev.plan.status === next.plan.status &&
+    prev.plan.slug === next.plan.slug &&
+    prev.plan.title === next.plan.title &&
+    prev.age === next.age
+  );
+});
 
 function QueuePanel({ runtime }: Props): React.ReactElement {
   const { plans } = runtime;
@@ -93,7 +111,7 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
       >
         <Box marginBottom={1}>
           <Text color="magenta" bold>
-            ✨ vibe — queue
+            ✦ vibe — queue
           </Text>
         </Box>
         <Text dimColor italic>
@@ -124,11 +142,11 @@ function QueuePanel({ runtime }: Props): React.ReactElement {
     <Box flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={2} paddingY={1}>
       <Box marginBottom={1}>
         <Text color="magenta" bold>
-          ✨ vibe — queue
+          ✦ vibe — queue
         </Text>
       </Box>
       {plans.map((p) => (
-        <PlanRow key={p.slug} plan={p} />
+        <PlanRow key={p.slug} plan={p} age={fmtAge(p.created_at)} />
       ))}
       <Box marginTop={1}>
         <Text bold>{`${counts.done}/${total} done`}</Text>

@@ -1,5 +1,5 @@
 import { Box, Text } from 'ink';
-import type React from 'react';
+import React from 'react';
 
 import { fmtDuration, monotonicSeconds } from '../core/time.js';
 import { type PhaseName, STEP_PHASES } from '../executor.js';
@@ -18,16 +18,17 @@ interface Props {
   state: PlanRuntimeState;
 }
 
-function ItemLine({
+function ItemLineInner({
   state,
   itemId,
   itemTitle,
+  status,
 }: {
   state: PlanRuntimeState;
   itemId: string;
   itemTitle: string;
+  status: ItemDisplayStatus;
 }): React.ReactElement {
-  const status: ItemDisplayStatus = state.itemStatus.get(itemId) ?? 'pending';
   const now = monotonicSeconds();
   const elapsed = getItemElapsed(state, itemId, now);
 
@@ -74,16 +75,17 @@ function ItemLine({
   );
 }
 
-function PhaseLine({
+function PhaseLineInner({
   state,
   itemId,
   phase,
+  status,
 }: {
   state: PlanRuntimeState;
   itemId: string;
   phase: PhaseName;
+  status: PhaseDisplayStatus;
 }): React.ReactElement {
-  const status: PhaseDisplayStatus = getPhaseStatus(state, itemId, phase);
   const now = monotonicSeconds();
   const elapsed = getPhaseElapsed(state, itemId, phase, now);
 
@@ -140,6 +142,25 @@ function PhaseLine({
   );
 }
 
+// The runtime mutates `state` in place and reuses the same object across
+// renders, so default shallow memo would always skip. Compare the fields we
+// actually read. `status` is passed as a primitive snapshot because re-reading
+// it from `state` here would observe the already-mutated map on both sides of
+// the comparison and hide transitions such as running → done. Running rows
+// must re-render every tick so the spinner glyph and live elapsed timer keep
+// advancing.
+const ItemLine = React.memo(ItemLineInner, (prev, next) => {
+  if (prev.itemId !== next.itemId || prev.itemTitle !== next.itemTitle) return false;
+  if (next.status === 'running') return false;
+  return prev.status === next.status;
+});
+
+const PhaseLine = React.memo(PhaseLineInner, (prev, next) => {
+  if (prev.itemId !== next.itemId || prev.phase !== next.phase) return false;
+  if (next.status === 'running') return false;
+  return prev.status === next.status;
+});
+
 function _PanelHeader({
   title,
   borderColor,
@@ -168,14 +189,24 @@ export function PlanProgress({ state }: Props): React.ReactElement {
           <Text color="cyan" bold>{`running · ${state.planTitle}`}</Text>
         </Box>
         {state.items.map(({ id, title }) => {
-          const isRunning = state.itemStatus.get(id) === 'running';
+          const itemStatus = state.itemStatus.get(id) ?? 'pending';
+          const isRunning = itemStatus === 'running';
           return (
             <Box key={id} flexDirection="column">
-              <ItemLine state={state} itemId={id} itemTitle={title} />
+              <ItemLine state={state} itemId={id} itemTitle={title} status={itemStatus} />
               {isRunning &&
-                STEP_PHASES.map((phase) => (
-                  <PhaseLine key={`${id}:${phase}`} state={state} itemId={id} phase={phase} />
-                ))}
+                STEP_PHASES.map((phase) => {
+                  const phaseStatus = getPhaseStatus(state, id, phase);
+                  return (
+                    <PhaseLine
+                      key={`${id}:${phase}`}
+                      state={state}
+                      itemId={id}
+                      phase={phase}
+                      status={phaseStatus}
+                    />
+                  );
+                })}
             </Box>
           );
         })}
