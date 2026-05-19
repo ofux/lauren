@@ -11,7 +11,7 @@ import {
 import { nextPendingCheckpointAfter } from './core/checkpoints.js';
 import { displayPath } from './core/paths.js';
 import type { Step, StepEntry } from './core/steps.js';
-import { type Plan, planFilePath, planLogDir } from './core/types.js';
+import { type Plan, planFilePath, planLogDir, planNotesPath } from './core/types.js';
 import {
   type ResolvedWorkspaceRepo,
   resolveWorkspaceRepos,
@@ -228,6 +228,11 @@ interface RunUnitArgs {
    * fresh from the implement phase as usual.
    */
   resumeFromPhase?: PhaseName | null;
+  /**
+   * Absolute path to the plan's implementation-notes HTML file when notes
+   * are enabled, or null to suppress the prompt instruction entirely.
+   */
+  notesPath: string | null;
   progress?: ProgressSink;
   signal?: AbortSignal;
 }
@@ -243,6 +248,7 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
     dryRun,
     agents,
     resumeFromPhase,
+    notesPath,
     progress,
     signal,
   } = args;
@@ -255,13 +261,13 @@ async function runUnit(args: RunUnitArgs): Promise<ExecutionUnitResult> {
   const logDir = step ? stepLogDir(parentLogDir, step) : parentLogDir;
   const commitMessage = step ? stepCommitMessage(plan, step) : planCommitMessage(plan);
   const implementText = step
-    ? implementPrompt(step, plan.path, repoPaths)
-    : implementPlanPrompt(plan, planText ?? '', repoPaths);
+    ? implementPrompt(step, plan.path, repoPaths, notesPath)
+    : implementPlanPrompt(plan, planText ?? '', repoPaths, notesPath);
   const reviewText0 = step
     ? reviewPrompt(step, plan.path, repoPaths)
     : reviewPlanPrompt(plan, repoPaths);
   const buildFixPrompt = (reviewText: string): string =>
-    step ? fixPrompt(step, reviewText) : fixPlanPrompt(plan, reviewText);
+    step ? fixPrompt(step, reviewText, notesPath) : fixPlanPrompt(plan, reviewText, notesPath);
 
   await fs.mkdir(logDir, { recursive: true });
   if (!progress) banner(bannerText);
@@ -530,6 +536,13 @@ export interface RunPlanOptions {
    * `allowImplementing: true`. Omit in dry-run paths.
    */
   onStepUpdate?: (steps: StepEntry[]) => Promise<void>;
+  /**
+   * When true (the default), the implement and fix prompts instruct the
+   * agent to keep a running HTML notes file at `.lauren/notes/<slug>.notes.html`
+   * with decisions, deviations, and tradeoffs. Set to false to suppress
+   * the instruction entirely.
+   */
+  notesEnabled?: boolean;
 }
 
 /**
@@ -583,6 +596,12 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
   const planText = await fs.readFile(planFilePath(plan), 'utf8');
   const parentLogDir = planLogDir(plan);
   await fs.mkdir(parentLogDir, { recursive: true });
+  const notesEnabled = opts.notesEnabled ?? true;
+  let notesPath: string | null = null;
+  if (notesEnabled && !dryRun) {
+    notesPath = planNotesPath(plan);
+    await fs.mkdir(path.dirname(notesPath), { recursive: true });
+  }
 
   const storedSteps = plan.steps;
   if (storedSteps === null || storedSteps.length === 0) {
@@ -601,6 +620,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
         dryRun,
         agents,
         resumeFromPhase: plan.last_failed_phase ?? null,
+        notesPath,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),
       });
@@ -673,6 +693,7 @@ export async function runPlan(opts: RunPlanOptions): Promise<RunPlanResult> {
         dryRun,
         agents,
         resumeFromPhase,
+        notesPath,
         ...(progress !== undefined ? { progress } : {}),
         ...(signal !== undefined ? { signal } : {}),
       });

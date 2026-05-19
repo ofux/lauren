@@ -12,6 +12,7 @@ import {
   resolvePlanSidecarPath,
   resolveRepoRoot,
 } from './paths.js';
+import { type Plan, planNotesPath } from './types.js';
 
 describe('displayPath', () => {
   test('strips a REPO prefix and returns the relative path', () => {
@@ -35,7 +36,9 @@ describe('LaurenContext', () => {
     laurenDir,
     logRoot: path.join(laurenDir, 'logs'),
     plansDir: path.join(laurenDir, 'plans'),
+    notesDir: path.join(laurenDir, 'notes'),
     worktreesRoot: path.join(laurenDir, 'worktrees'),
+    configPath: path.join(laurenDir, 'config.json'),
     plansStatePath: path.join(laurenDir, 'plans.json'),
     plansStateLockPath: path.join(laurenDir, 'plans.json.lock'),
     vibeLockPath: path.join(laurenDir, 'vibe.lock'),
@@ -53,6 +56,11 @@ describe('LaurenContext', () => {
     expect(normalizePlanPath(path.join(context.plansDir, 'demo.md'), context)).toBe(
       path.join('.lauren', 'plans', 'demo.md'),
     );
+  });
+
+  test('planNotesPath resolves under notesDir keyed by slug', () => {
+    const plan = { slug: 'demo' } as unknown as Plan;
+    expect(planNotesPath(plan, context)).toBe(path.join(context.notesDir, 'demo.notes.html'));
   });
 });
 

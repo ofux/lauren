@@ -855,6 +855,7 @@ export async function watcherLoop(
         targetRepos: execCtx.rewrittenRepos,
         cwd: execCtx.rootCwd,
         agents: config.agents,
+        notesEnabled: config.notes_enabled,
         progress: runtime,
         signal: merged,
         onStepUpdate,

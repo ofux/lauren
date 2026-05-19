@@ -16,6 +16,7 @@ export interface LaurenConfig {
   dev_branch: string;
   merge_mode: MergeMode;
   agents: AgentRoles;
+  notes_enabled: boolean;
 }
 
 export const DEFAULT_CONFIG: LaurenConfig = {
@@ -23,6 +24,7 @@ export const DEFAULT_CONFIG: LaurenConfig = {
   dev_branch: 'main',
   merge_mode: 'auto',
   agents: { ...DEFAULT_AGENTS },
+  notes_enabled: true,
 };
 
 export class LaurenConfigError extends Error {
@@ -97,7 +99,17 @@ function parseConfig(raw: unknown, configPath: string): LaurenConfig {
 
   const agents = parseAgents(raw.agents, label);
 
-  return { version: 1, dev_branch, merge_mode, agents };
+  let notes_enabled: boolean = DEFAULT_CONFIG.notes_enabled;
+  if (raw.notes_enabled !== undefined) {
+    if (typeof raw.notes_enabled !== 'boolean') {
+      throw new LaurenConfigError(
+        `${label}: notes_enabled must be a boolean (got ${JSON.stringify(raw.notes_enabled)})`,
+      );
+    }
+    notes_enabled = raw.notes_enabled;
+  }
+
+  return { version: 1, dev_branch, merge_mode, agents, notes_enabled };
 }
 
 /**

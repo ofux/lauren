@@ -170,6 +170,10 @@ export function planLogDir(plan: Plan, context: LaurenContext = DEFAULT_CONTEXT)
   return path.join(context.logRoot, plan.slug);
 }
 
+export function planNotesPath(plan: Plan, context: LaurenContext = DEFAULT_CONTEXT): string {
+  return path.join(context.notesDir, `${plan.slug}.notes.html`);
+}
+
 export class SlugCollision extends Error {
   readonly slug: string;
   constructor(slug: string) {

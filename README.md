@@ -37,6 +37,21 @@ Each pipeline phase (and the merger conflict-resolver and brain placement
 calls) can be routed to either `claude` or `codex` independently — see
 the `agents` block in [Configuration](#configuration).
 
+### Implementation notes
+
+(Idea credit: [@trq212](https://x.com/trq212/status/2056415973125796184?s=20).)
+
+While implementing (and addressing review feedback), the agent keeps a
+running HTML file at `.lauren/notes/<slug>.notes.html` capturing the
+decisions it had to make that weren't in the spec, anything it changed
+from what the spec said, tradeoffs, and other things you should know.
+
+In the `lauren` TUI, plans that have notes show a `· notes` marker next
+to the row; press `n` to open the file in your browser.
+
+Notes generation is on by default. To turn it off, set
+`"notes_enabled": false` in `.lauren/config.json`.
+
 ## Requirements
 
 - A clean Git working tree before running `lauren vibe`
@@ -131,6 +146,7 @@ missing fields fall back to the defaults shown below:
   "version": 1,
   "dev_branch": "main",
   "merge_mode": "auto",
+  "notes_enabled": true,
   "agents": {
     "implement": "claude",
     "review": "codex",

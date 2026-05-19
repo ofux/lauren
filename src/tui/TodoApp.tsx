@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { Box, Text, useApp, useInput } from 'ink';
 import type React from 'react';
@@ -12,7 +12,7 @@ import { acknowledgeCheckpoint, isAwaitingHuman } from '../checkpoint.js';
 import { REPO, VIBE_PID_PATH } from '../core/paths.js';
 import type { PlanStore } from '../core/store.js';
 import { fmtAge } from '../core/time.js';
-import { type Plan, type PlanStatus, planFilePath } from '../core/types.js';
+import { type Plan, type PlanStatus, planFilePath, planNotesPath } from '../core/types.js';
 import { readLivePid } from '../proc/pid.js';
 import { isRetryable, retryPlan } from '../retry.js';
 import { openInBrowser } from '../util/openInBrowser.js';
@@ -75,9 +75,11 @@ function pad(s: string, width: number): string {
 function PlanTable({
   plans,
   selectedIndex,
+  slugsWithNotes,
 }: {
   plans: Plan[];
   selectedIndex: number;
+  slugsWithNotes: ReadonlySet<string>;
 }): React.ReactElement {
   const widths = useMemo(() => {
     const slug = Math.max(4, ...plans.map((p) => p.slug.length));
@@ -100,6 +102,7 @@ function PlanTable({
         const dim = statusIsDim(plan.status);
         const cursor = selected ? '▶ ' : '  ';
         const age = fmtAge(plan.created_at);
+        const hasNotes = slugsWithNotes.has(plan.slug);
         const rowProps: { backgroundColor?: string } = selected ? { backgroundColor: 'gray' } : {};
         return (
           <Box key={plan.slug} {...rowProps}>
@@ -116,6 +119,7 @@ function PlanTable({
             <Text> </Text>
             <Text dimColor={dim}>{pad(plan.title, widths.title)}</Text>
             <Text dimColor>{`  ${age}`}</Text>
+            {hasNotes && <Text dimColor>{'  · notes'}</Text>}
           </Box>
         );
       })}
@@ -190,12 +194,14 @@ function HelpFooter({
   selectedCancellable,
   selectedRetryable,
   selectedAwaitingHuman,
+  selectedHasNotes,
   canReorganize,
 }: {
   hasPlans: boolean;
   selectedCancellable: boolean;
   selectedRetryable: boolean;
   selectedAwaitingHuman: boolean;
+  selectedHasNotes: boolean;
   canReorganize: boolean;
 }): React.ReactElement {
   if (!hasPlans) {
@@ -207,6 +213,7 @@ function HelpFooter({
   }
   const hints: string[] = ['↑/↓ navigate'];
   if (selectedAwaitingHuman) hints.push('o open instructions', 'd mark done');
+  if (selectedHasNotes) hints.push('n open notes');
   if (selectedCancellable) hints.push('Enter or c cancel');
   if (selectedRetryable) hints.push('t reset to ready');
   if (canReorganize) hints.push('r reorganize');
@@ -258,6 +265,17 @@ export function TodoApp({
 
   const readyCount = useMemo(() => plans.filter((p) => p.status === 'ready').length, [plans]);
   const canReorganize = !vibeRunning && readyCount >= 2;
+
+  // The agent only writes a notes file once it's actually noted something
+  // (the prompt tells it to skip empty sections). Probe each plan's path
+  // synchronously — the queue is small and the result drives a UI hint.
+  const slugsWithNotes = useMemo(() => {
+    const out = new Set<string>();
+    for (const plan of plans) {
+      if (existsSync(planNotesPath(plan))) out.add(plan.slug);
+    }
+    return out;
+  }, [plans]);
 
   useInput((input, key) => {
     if (view.kind === 'confirm-cancel') {
@@ -424,6 +442,20 @@ export function TodoApp({
       openInBrowser(target);
       return;
     }
+    if (input === 'n' || input === 'N') {
+      const plan = plans[selectedIndex];
+      if (!plan) return;
+      const target = planNotesPath(plan);
+      if (!existsSync(target)) {
+        setView({
+          kind: 'message',
+          message: `no implementation-notes file yet for '${plan.slug}' — the agent may not have written any.`,
+        });
+        return;
+      }
+      openInBrowser(target);
+      return;
+    }
     if (input === 'd' || input === 'D') {
       const plan = plans[selectedIndex];
       if (!plan || !isAwaitingHuman(plan)) return;
@@ -470,6 +502,7 @@ export function TodoApp({
   const selectedCancellable = current ? isCancellable(current) : false;
   const selectedRetryable = current ? isRetryable(current) : false;
   const selectedAwaitingHuman = current ? isAwaitingHuman(current) : false;
+  const selectedHasNotes = current ? slugsWithNotes.has(current.slug) : false;
 
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -489,7 +522,7 @@ export function TodoApp({
           (empty queue)
         </Text>
       ) : (
-        <PlanTable plans={plans} selectedIndex={selectedIndex} />
+        <PlanTable plans={plans} selectedIndex={selectedIndex} slugsWithNotes={slugsWithNotes} />
       )}
       {current && <DescriptionPanel plan={current} />}
       <HelpFooter
@@ -497,6 +530,7 @@ export function TodoApp({
         selectedCancellable={selectedCancellable}
         selectedRetryable={selectedRetryable}
         selectedAwaitingHuman={selectedAwaitingHuman}
+        selectedHasNotes={selectedHasNotes}
         canReorganize={canReorganize}
       />
       {view.kind === 'confirm-cancel' &&

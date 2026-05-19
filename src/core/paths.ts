@@ -18,6 +18,7 @@ export interface LaurenContext {
   laurenDir: string;
   logRoot: string;
   plansDir: string;
+  notesDir: string;
   worktreesRoot: string;
   configPath: string;
   plansStatePath: string;
@@ -39,6 +40,7 @@ export function createLaurenContext(cwd: string = process.cwd()): LaurenContext 
     laurenDir,
     logRoot: path.join(laurenDir, 'logs'),
     plansDir: path.join(laurenDir, 'plans'),
+    notesDir: path.join(laurenDir, 'notes'),
     worktreesRoot: path.join(laurenDir, 'worktrees'),
     configPath: path.join(laurenDir, 'config.json'),
     plansStatePath: path.join(laurenDir, 'plans.json'),
@@ -59,6 +61,7 @@ export const REPO = DEFAULT_CONTEXT.repo;
 export const LAUREN_DIR = DEFAULT_CONTEXT.laurenDir;
 export const LOG_ROOT = DEFAULT_CONTEXT.logRoot;
 export const PLANS_DIR = DEFAULT_CONTEXT.plansDir;
+export const NOTES_DIR = DEFAULT_CONTEXT.notesDir;
 export const WORKTREES_ROOT = DEFAULT_CONTEXT.worktreesRoot;
 export const CONFIG_PATH = DEFAULT_CONTEXT.configPath;
 export const VIBE_LOCK_PATH = DEFAULT_CONTEXT.vibeLockPath;

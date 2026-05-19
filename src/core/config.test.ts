@@ -15,6 +15,7 @@ async function makeContext(): Promise<{ context: LaurenContext; configPath: stri
     laurenDir: dir,
     logRoot: dir,
     plansDir: dir,
+    notesDir: dir,
     worktreesRoot: dir,
     configPath,
     plansStatePath: dir,
@@ -114,6 +115,26 @@ describe('readLaurenConfig', () => {
   test('rejects a non-object agents value', async () => {
     const { context, configPath } = await makeContext();
     await fs.writeFile(configPath, JSON.stringify({ version: 1, agents: 'claude' }));
+    await expect(readLaurenConfig(context)).rejects.toBeInstanceOf(LaurenConfigError);
+  });
+
+  test('notes_enabled defaults to true when missing', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1 }));
+    const cfg = await readLaurenConfig(context);
+    expect(cfg.notes_enabled).toBe(true);
+  });
+
+  test('notes_enabled honors an explicit false', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1, notes_enabled: false }));
+    const cfg = await readLaurenConfig(context);
+    expect(cfg.notes_enabled).toBe(false);
+  });
+
+  test('rejects a non-boolean notes_enabled', async () => {
+    const { context, configPath } = await makeContext();
+    await fs.writeFile(configPath, JSON.stringify({ version: 1, notes_enabled: 'yes' }));
     await expect(readLaurenConfig(context)).rejects.toBeInstanceOf(LaurenConfigError);
   });
 });
