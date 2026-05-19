@@ -1,6 +1,6 @@
 {
   "name": "@ofux/lauren",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Queue-driven plan/vibe lifecycle runner",
   "type": "module",
   "license": "MIT",
